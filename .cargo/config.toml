@@ -1,0 +1,6 @@
+[target.aarch64-apple-darwin]
+rustflags = [
+    "-C", "link-args=-F/Library/Frameworks",
+    "-C", "link-args=-rpath", "-C", "link-args=/opt/homebrew/lib", # 添加 libusb 的库路径
+    "-C", "link-args=-rpath", "-C", "link-args=/Library/Frameworks",  # 添加框架路径
+]

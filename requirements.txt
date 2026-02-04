@@ -1,0 +1,17 @@
+# Python 依赖 - 频谱可视化
+
+# 基础可视化（开发阶段）
+matplotlib>=3.5.0
+numpy>=1.21.0
+
+# 高性能可视化（推荐用于实时）
+# pyqtgraph>=0.12.0
+# PyQt5>=5.15.0  # pyqtgraph 的依赖
+
+# 高性能消息传递（可选，性能优化后使用）
+# pyzmq>=25.0.0
+# msgpack>=1.0.0
+
+# Web 可视化（可选）
+# flask>=2.0.0
+# flask-socketio>=5.0.0
