@@ -11,6 +11,7 @@ use midori_plugin::{PluginEvent, PluginHost};
 
 pub struct PluginSink {
     host: Arc<Mutex<Box<dyn PluginHost>>>,
+    dropped: u64,
 }
 
 #[derive(Clone)]
@@ -23,6 +24,7 @@ pub fn plugin_sink(host: Box<dyn PluginHost>) -> (PluginSink, PluginHandle) {
     (
         PluginSink {
             host: Arc::clone(&host),
+            dropped: 0,
         },
         PluginHandle { host },
     )
@@ -38,7 +40,13 @@ impl Sink for PluginSink {
             .lock()
             .map_err(|error| anyhow!("plugin lock poisoned: {error}"))?;
         if let Err(error) = host.send_frame(frame) {
-            eprintln!("[plugin] frame dropped: {error}");
+            if self.dropped == 0 || self.dropped.is_multiple_of(100) {
+                eprintln!(
+                    "[plugin] frame dropped ({error}); total {}",
+                    self.dropped + 1
+                );
+            }
+            self.dropped += 1;
         }
         Ok(())
     }
