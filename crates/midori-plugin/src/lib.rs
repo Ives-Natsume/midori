@@ -13,6 +13,11 @@ use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
+pub mod sidecar;
+pub mod wire;
+
+pub use sidecar::SidecarPlugin;
+
 /// What a plugin wants to receive from the engine.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

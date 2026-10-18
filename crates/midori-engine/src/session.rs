@@ -207,8 +207,11 @@ mod tests {
                 timestamp_ns: iq.timestamp_ns,
                 sample_rate_hz: 48_000.0,
                 center_freq_hz: iq.spec.center_freq_hz,
+                nominal_freq_hz: iq.spec.center_freq_hz,
                 bandwidth_hz: 4_000.0,
                 vfo_id: Some(self.config.id),
+                doppler_hz: 0.0,
+                doppler_rate_hz_s: 0.0,
                 flags: iq.flags,
             };
             out.push(Frame::new(

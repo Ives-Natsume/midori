@@ -3,10 +3,12 @@
 //! The engine stays platform-agnostic: it owns a source, digital VFO channels,
 //! and sinks. Audio devices and egui live in the application crate.
 
+pub mod plugin;
 pub mod recorder;
 pub mod session;
 pub mod vfo;
 
+pub use plugin::{PluginHandle, PluginSink, plugin_sink};
 pub use recorder::{RecorderHandle, RecorderSink, RecordingInfo};
 pub use session::LiveSession;
 pub use vfo::VfoChannel;

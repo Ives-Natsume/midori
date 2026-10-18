@@ -16,7 +16,11 @@ use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
 
 use midori_core::{DemodMode, Session, Sink, SourceConfig, StreamSpec, VfoConfig};
-use midori_engine::{LiveSession, RecorderSink, VfoChannel};
+use midori_engine::{LiveSession, PluginHandle, PluginSink, RecorderSink, VfoChannel, plugin_sink};
+use midori_plugin::{
+    DisplayUpdate, InputSpec, Manifest, OutputKind, PROTOCOL_VERSION, PluginEvent, PluginHost,
+    SidecarPlugin,
+};
 use midori_source_libiio::LibiioSource;
 
 use crate::audio::{AudioOutput, AudioSink};
@@ -61,6 +65,7 @@ enum WorkerEvent {
         samples: u64,
         seconds: f64,
     },
+    Plugin(PluginEvent),
 }
 
 // ---------------------------------------------------------------------------
@@ -96,6 +101,9 @@ pub struct MidoriApp {
     is_connected: bool,
     is_connecting: bool,
     is_recording: bool,
+    cw_enabled: bool,
+    cw_text: String,
+    cw_status: String,
     auto_connect: bool,
     recording_path: Option<PathBuf>,
     status_msg: String,
@@ -122,6 +130,9 @@ impl Default for MidoriApp {
             is_connected: false,
             is_connecting: false,
             is_recording: false,
+            cw_enabled: std::env::var_os("MIDORI_CW").is_some(),
+            cw_text: String::new(),
+            cw_status: "idle".to_string(),
             auto_connect: std::env::var_os("MIDORI_AUTOCONNECT").is_some(),
             recording_path: None,
             status_msg: "Not connected".to_string(),
@@ -186,11 +197,21 @@ impl MidoriApp {
         let (cmd_tx, cmd_rx) = bounded(16);
         let stop_flag = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop_flag);
+        let cw_enabled = self.cw_enabled;
 
         match thread::Builder::new()
             .name("sdr-worker".into())
-            .spawn(move || run_worker(config, vfo, data_tx, event_tx, cmd_rx, worker_stop))
-        {
+            .spawn(move || {
+                run_worker(
+                    config,
+                    vfo,
+                    data_tx,
+                    event_tx,
+                    cmd_rx,
+                    worker_stop,
+                    cw_enabled,
+                )
+            }) {
             Ok(handle) => {
                 self.worker = Some(handle);
                 self.data_rx = Some(data_rx);
@@ -307,8 +328,16 @@ impl MidoriApp {
     // -----------------------------------------------------------------------
 
     fn poll_events(&mut self) {
-        let Some(rx) = &self.event_rx else { return };
-        while let Ok(event) = rx.try_recv() {
+        let events: Vec<WorkerEvent> = {
+            let Some(rx) = &self.event_rx else { return };
+            let mut events = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                events.push(event);
+            }
+            events
+        };
+
+        for event in events {
             match event {
                 WorkerEvent::Connected(spec) => {
                     self.is_connecting = false;
@@ -358,7 +387,42 @@ impl MidoriApp {
                         samples
                     );
                 }
+                WorkerEvent::Plugin(event) => self.handle_plugin_event(event),
             }
+        }
+    }
+
+    fn handle_plugin_event(&mut self, event: PluginEvent) {
+        match event {
+            PluginEvent::Display { update } => match update {
+                DisplayUpdate::Text { lines, .. } => {
+                    self.cw_text = lines.join("\n");
+                }
+                DisplayUpdate::Table { columns, rows, .. } => {
+                    let mut text = columns.join(" | ");
+                    for row in rows {
+                        text.push('\n');
+                        text.push_str(&row.join(" | "));
+                    }
+                    self.cw_text = text;
+                }
+                DisplayUpdate::Progress { title, fraction } => {
+                    self.cw_status = format!("{title}: {:.0}%", fraction * 100.0);
+                }
+                DisplayUpdate::Image { .. } => {}
+            },
+            PluginEvent::Status { message, .. } => {
+                self.cw_status = message;
+            }
+            PluginEvent::Error { message, fatal } => {
+                self.cw_status = if fatal {
+                    format!("fatal: {message}")
+                } else {
+                    message.clone()
+                };
+                self.error_msg = Some(message);
+            }
+            PluginEvent::Packet { .. } => {}
         }
     }
 
@@ -464,6 +528,26 @@ impl MidoriApp {
         });
     }
 
+    fn draw_decoder_panel(&self, ctx: &egui::Context) {
+        if !self.cw_enabled && self.cw_text.is_empty() {
+            return;
+        }
+        egui::TopBottomPanel::bottom("decoder_panel")
+            .resizable(true)
+            .default_height(120.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("CW");
+                    ui.label(&self.cw_status);
+                });
+                egui::ScrollArea::vertical()
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        ui.monospace(&self.cw_text);
+                    });
+            });
+    }
+
     fn draw_control_panel(&mut self, ctx: &egui::Context) {
         egui::SidePanel::right("control_panel")
             .min_width(230.0)
@@ -513,6 +597,13 @@ impl MidoriApp {
                 });
                 if self.demod_mode != previous_demod && (self.is_connected || self.is_connecting) {
                     self.status_msg = "Reconnect to apply demod mode".to_string();
+                }
+
+                ui.add_space(6.0);
+                let previous_cw = self.cw_enabled;
+                ui.checkbox(&mut self.cw_enabled, "CW decoder (700 Hz)");
+                if self.cw_enabled != previous_cw && (self.is_connected || self.is_connecting) {
+                    self.status_msg = "Reconnect to apply CW decoder".to_string();
                 }
 
                 ui.add_space(8.0);
@@ -725,6 +816,7 @@ impl eframe::App for MidoriApp {
 
         self.draw_top_panel(ctx);
         self.draw_bottom_bar(ctx);
+        self.draw_decoder_panel(ctx);
         self.draw_control_panel(ctx);
 
         egui::CentralPanel::default().show(ctx, |ui| match self.view_mode {
@@ -744,6 +836,63 @@ impl Drop for MidoriApp {
 // Worker
 // ---------------------------------------------------------------------------
 
+fn cw_plugin_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("MIDORI_CW_PLUGIN") {
+        return Some(PathBuf::from(path));
+    }
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let name = if cfg!(windows) {
+        "midori-plugin-cw.exe"
+    } else {
+        "midori-plugin-cw"
+    };
+    let path = dir.join(name);
+    path.exists().then_some(path)
+}
+
+fn start_cw_plugin(event_tx: &Sender<WorkerEvent>) -> Option<(PluginSink, PluginHandle)> {
+    let Some(path) = cw_plugin_path() else {
+        let _ = event_tx.try_send(WorkerEvent::Error(
+            "CW plugin binary not found; build the workspace first".to_string(),
+        ));
+        return None;
+    };
+
+    let manifest = Manifest {
+        name: "cw".to_string(),
+        version: "0.1.0".to_string(),
+        protocol: PROTOCOL_VERSION,
+        command: vec![path.display().to_string()],
+        input: InputSpec::Audio {
+            sample_rate_hz: 48_000.0,
+            channels: 1,
+        },
+        outputs: vec![OutputKind::Display, OutputKind::Packets],
+        params: vec![],
+    };
+
+    let mut plugin = match SidecarPlugin::new(manifest) {
+        Ok(plugin) => plugin,
+        Err(error) => {
+            let _ = event_tx.try_send(WorkerEvent::Error(format!("CW plugin manifest: {error}")));
+            return None;
+        }
+    };
+    if let Err(error) = plugin.start() {
+        let _ = event_tx.try_send(WorkerEvent::Error(format!("CW plugin start: {error}")));
+        return None;
+    }
+    if let Err(error) = plugin.configure(&serde_json::json!({"tone_hz": 700.0})) {
+        let _ = plugin.stop();
+        let _ = event_tx.try_send(WorkerEvent::Error(format!("CW plugin configure: {error}")));
+        return None;
+    }
+
+    let (sink, handle) = plugin_sink(Box::new(plugin));
+    Some((sink, handle))
+}
+
 fn run_worker(
     config: SourceConfig,
     mut vfo: VfoConfig,
@@ -751,6 +900,7 @@ fn run_worker(
     event_tx: Sender<WorkerEvent>,
     cmd_rx: Receiver<WorkerCommand>,
     stop: Arc<AtomicBool>,
+    cw_enabled: bool,
 ) {
     let source = match LibiioSource::open(None) {
         Ok(source) => source,
@@ -781,11 +931,23 @@ fn run_worker(
         );
     }
 
+    let (plugin_sink, plugin_handle) = if cw_enabled {
+        match start_cw_plugin(&event_tx) {
+            Some((sink, handle)) => (Some(sink), Some(handle)),
+            None => (None, None),
+        }
+    } else {
+        (None, None)
+    };
+
     let (recorder_sink, recorder_handle) = RecorderSink::new();
     let mut sinks: Vec<Box<dyn Sink>> = vec![
         Box::new(SpectrumSink::new(FFT_SIZE, data_tx)),
         Box::new(recorder_sink),
     ];
+    if let Some(sink) = plugin_sink {
+        sinks.push(Box::new(sink));
+    }
     if let Some(producer) = audio_producer {
         sinks.push(Box::new(AudioSink::new(producer)));
     }
@@ -816,6 +978,7 @@ fn run_worker(
     );
     let _ = event_tx.try_send(WorkerEvent::Connected(spec));
 
+    let mut plugin_events = 0u64;
     while !stop.load(Ordering::SeqCst) {
         while let Ok(command) = cmd_rx.try_recv() {
             match command {
@@ -890,8 +1053,30 @@ fn run_worker(
         if let Some(error) = recorder_handle.take_error() {
             let _ = event_tx.try_send(WorkerEvent::RecordingError(error));
         }
+
+        if let Some(handle) = &plugin_handle {
+            loop {
+                match handle.try_recv() {
+                    Ok(Some(event)) => {
+                        if plugin_events == 0 {
+                            eprintln!("[plugin] first event");
+                        }
+                        plugin_events += 1;
+                        let _ = event_tx.try_send(WorkerEvent::Plugin(event));
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        let _ = event_tx.try_send(WorkerEvent::Error(format!("plugin: {error}")));
+                        break;
+                    }
+                }
+            }
+        }
     }
 
+    if let Some(handle) = &plugin_handle {
+        let _ = handle.stop();
+    }
     if let Ok(Some(info)) = recorder_handle.stop() {
         let _ = event_tx.try_send(WorkerEvent::RecordingStopped {
             path: info.path,

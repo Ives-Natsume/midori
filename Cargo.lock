@@ -1919,7 +1919,9 @@ dependencies = [
  "midori-core",
  "midori-dsp",
  "midori-engine",
+ "midori-plugin",
  "midori-source-libiio",
+ "serde_json",
 ]
 
 [[package]]
@@ -1959,6 +1961,7 @@ dependencies = [
  "anyhow",
  "midori-core",
  "midori-dsp",
+ "midori-plugin",
  "midori-sigmf",
 ]
 
@@ -1967,8 +1970,19 @@ name = "midori-plugin"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "crossbeam-channel",
  "midori-core",
  "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "midori-plugin-cw"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "midori-core",
+ "midori-plugin",
  "serde_json",
 ]
 

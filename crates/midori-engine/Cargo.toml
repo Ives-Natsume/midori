@@ -9,4 +9,5 @@ repository.workspace = true
 anyhow.workspace = true
 midori-core.workspace = true
 midori-dsp.workspace = true
+midori-plugin.workspace = true
 midori-sigmf.workspace = true

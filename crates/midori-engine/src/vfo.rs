@@ -90,8 +90,11 @@ impl Channel for VfoChannel {
             timestamp_ns: iq.timestamp_ns,
             sample_rate_hz: self.config.audio_rate_hz,
             center_freq_hz: iq.spec.center_freq_hz + self.config.offset_hz,
+            nominal_freq_hz: iq.spec.center_freq_hz + self.config.offset_hz,
             bandwidth_hz: self.config.audio_bandwidth_hz,
             vfo_id: Some(self.config.id),
+            doppler_hz: 0.0,
+            doppler_rate_hz_s: 0.0,
             flags: iq.flags,
         };
         self.seq += 1;

@@ -96,8 +96,11 @@ impl IqBlock {
             timestamp_ns: self.timestamp_ns,
             sample_rate_hz: self.spec.sample_rate_hz,
             center_freq_hz: self.spec.center_freq_hz,
+            nominal_freq_hz: self.spec.center_freq_hz,
             bandwidth_hz: self.spec.bandwidth_hz,
             vfo_id: None,
+            doppler_hz: 0.0,
+            doppler_rate_hz_s: 0.0,
             flags: self.flags,
         }
     }
@@ -125,8 +128,17 @@ pub struct FrameMeta {
     pub sample_rate_hz: f64,
     pub center_freq_hz: f64,
     pub bandwidth_hz: f64,
+    /// Nominal (un-Doppler-shifted) frequency the user/preset asked for.
+    #[serde(default)]
+    pub nominal_freq_hz: f64,
     /// Which digital VFO produced this frame, if any.
     pub vfo_id: Option<VfoId>,
+    /// Current Doppler correction added to the VFO offset.
+    #[serde(default)]
+    pub doppler_hz: f64,
+    /// Current Doppler rate, Hz/s.
+    #[serde(default)]
+    pub doppler_rate_hz_s: f64,
     pub flags: BlockFlags,
 }
 
@@ -232,6 +244,40 @@ impl VfoConfig {
             audio_bandwidth_hz: 15_000.0,
             deemphasis_us: 50.0,
         }
+    }
+}
+
+/// Orbital tracking parameters. The actual SGP4 implementation will live in
+/// `midori-orbit`; this type is the core-side contract used by presets.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrackingConfig {
+    pub norad_id: u32,
+    pub downlink_hz: f64,
+    pub uplink_hz: Option<f64>,
+    /// TLE lines, if already fetched. A service can refresh them later.
+    pub tle: Option<String>,
+}
+
+/// Supplies a Doppler correction for a given UTC time.
+pub trait DopplerSource: Send {
+    /// Correction to add to the VFO offset. Positive means the observed
+    /// signal is higher than the nominal frequency.
+    fn offset_hz(&self, utc_ns: u64) -> f64;
+
+    fn rate_hz_s(&self, _utc_ns: u64) -> f64 {
+        0.0
+    }
+}
+
+/// A fixed Doppler offset, useful for tests and manual operation.
+#[derive(Debug, Clone, Copy)]
+pub struct FixedDoppler {
+    pub offset_hz: f64,
+}
+
+impl DopplerSource for FixedDoppler {
+    fn offset_hz(&self, _utc_ns: u64) -> f64 {
+        self.offset_hz
     }
 }
 

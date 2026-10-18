@@ -183,8 +183,11 @@ mod tests {
             timestamp_ns: None,
             sample_rate_hz: spec.sample_rate_hz,
             center_freq_hz: spec.center_freq_hz,
+            nominal_freq_hz: spec.center_freq_hz,
             bandwidth_hz: spec.bandwidth_hz,
             vfo_id: None,
+            doppler_hz: 0.0,
+            doppler_rate_hz_s: 0.0,
             flags: BlockFlags::default(),
         };
         sink.on_frame(Frame::new(meta, StreamData::Iq(samples)))

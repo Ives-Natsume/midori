@@ -1,0 +1,22 @@
+[package]
+name = "midori-plugin-cw"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "midori_plugin_cw"
+path = "src/lib.rs"
+
+[[bin]]
+name = "midori-plugin-cw"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+midori-plugin.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+midori-core.workspace = true

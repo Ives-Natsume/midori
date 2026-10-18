@@ -29,8 +29,12 @@ Doppler correction, recording, and plugins for SSTV/SSDV/FT4/CW.
   selection, and one-click SigMF recording.
 - Core contracts for frames, digital VFOs, channels, sinks, sessions, and
   out-of-process decoder plugins.
+- Out-of-process sidecar host with a length-prefixed JSON/binary protocol.
+- Reference CW plugin with adaptive tone detection and Morse decoding.
+- Doppler metadata and `DopplerSource`/`TrackingConfig` contracts (SGP4
+  implementation is the next step).
 - Unit tests for the spectrum analyser, AM/FM demodulators, SigMF round-trip,
-  and plugin manifest parsing.
+  plugin manifest parsing, sidecar framing, engine fan-out, and CW decoding.
 
 ## Build
 
@@ -121,6 +125,8 @@ crates/
   midori-engine/         # LiveSession, VFO channel, recorder sink
   midori-cli/            # `midori` command-line tool
   midori-app/            # egui desktop UI (`midori-gui`)
+plugins/
+  midori-plugin-cw/      # reference CW decoder sidecar
 ```
 
 The old Python audio-loopback experiment and the original `pluto_rs`
@@ -149,13 +155,33 @@ prototype are stored as sibling directories outside the repository
 - **The core has no UI dependency.** The CLI and egui app are both consumers;
   a remote or Tauri client can use the same engine later.
 
+## Plugins
+
+Decoders run as separate processes. The host sends typed audio/soft-bit/byte
+frames over stdin/stdout and receives JSON events (`packet`, `display`,
+`status`, `error`) back. Plugins never link egui and never control hardware.
+
+The CW plugin is the reference implementation:
+
+```bash
+cargo build --release --workspace
+MIDORI_AUTOCONNECT=1 MIDORI_CW=1 ./target/release/midori-gui
+```
+
+It assumes a 700 Hz CW tone and writes decoded text into the CW panel. Enable
+the **CW decoder** checkbox before connecting; changing it while connected
+requires a reconnect.
+
+The plugin protocol and sidecar ABI are documented in
+[`plugins/README.md`](plugins/README.md).
+
 ## Roadmap
 
-1. Decoder sidecar supervisor and the first plugin (CW or APT).
+1. `midori-orbit`: TLE/SGP4, pass prediction, Doppler-driven VFO updates.
 2. SSB/CW voice demodulation, squelch, and filter controls.
-3. Click-to-tune digital VFOs and TLE/SGP4 Doppler tracking.
-4. Pass scheduling and shareable presets.
-5. SigMF browse/playback, plugin display panels, and packaging.
+3. Click-to-tune digital VFOs and shareable presets.
+4. APT/SSTV/SSDV plugins and plugin parameter UI.
+5. SigMF browse/playback, packaging, and cross-platform audio.
 
 ## License
 
