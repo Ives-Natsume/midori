@@ -1530,6 +1530,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 
 [[package]]
+name = "hound"
+version = "3.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62adaabb884c94955b19907d60019f4e145d091c75345379e70d1ee696f7854f"
+
+[[package]]
 name = "iana-time-zone"
 version = "0.1.65"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1962,6 +1968,7 @@ dependencies = [
  "midori-orbit",
  "midori-plugin",
  "midori-source-libiio",
+ "png",
  "serde_json",
 ]
 
@@ -2047,6 +2054,21 @@ dependencies = [
  "midori-core",
  "midori-plugin",
  "serde_json",
+]
+
+[[package]]
+name = "midori-plugin-sstv"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hound",
+ "midori-core",
+ "midori-dsp",
+ "midori-plugin",
+ "png",
+ "rasterwave",
+ "serde_json",
+ "slowrx",
 ]
 
 [[package]]
@@ -2837,6 +2859,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ca45419789ae5a7899559e9512e58ca889e41f04f1f2445e9f4b290ceccd1d08"
 
 [[package]]
+name = "rasterwave"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5ae1952f5affabf6ea85171e7fe49d0e96ed0c5ad522c8dc482340b3fa4d5c55"
+dependencies = [
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "raw-window-handle"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3142,6 +3173,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bdd58c3c93c3d278ca835519292445cb4b0d4dc59ccfdf7ceadaab3f8aeb4038"
 dependencies = [
  "version_check",
+]
+
+[[package]]
+name = "slowrx"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "553f6d8e7607ca042e43e914db6c3fd0cf6909e68c7e50dbc4e240ea18d2fd68"
+dependencies = [
+ "rustfft",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

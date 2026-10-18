@@ -27,6 +27,11 @@ Doppler correction, recording, and plugins for SSTV/SSDV/FT4/CW.
 - FM channel demodulation (channelizer + polar discriminator + de-emphasis +
   audio low-pass + resample) to 16-bit PCM WAV.
 - CW product demodulation with a 700 Hz BFO, feeding the CW decoder plugin.
+- SSTV decoding sidecar (slowrx) for PD-120, PD-180, Robot 36/72, Robot 24,
+  Martin 1/2, and Scottie 1/2/DX; images are shown in the SSTV tab and saved as
+  PNG. PD-120 and Robot 36 are the primary validated modes.
+- Offline SSTV decoding from WAV (`midori-sstv-decode`) for testing without a
+  transmitter.
 - Live FM/AM/CW audio through `cpal`, driven by the same `VfoChannel` used for
   offline captures, with a simple AGC.
 - egui desktop UI with a fixed three-column layout, stacked spectrum/waterfall,
@@ -131,8 +136,9 @@ The desktop UI uses a fixed three-column layout:
   satellite summary.
 - **Centre — Spectrum + waterfall**: stacked view with a draggable splitter.
   Click either view to retune; the VFO and passband are overlaid.
-- **Right — Decoders**: CW control, plugin list, decoder dock visibility.
-- **Bottom dock**: `CW` output, `Passes` planner, and `Log`.
+- **Right — Decoders**: CW and SSTV controls, plugin list, decoder dock
+  visibility.
+- **Bottom dock**: `CW`, `SSTV`, `Passes` planner, and `Log`.
 
 The Passes tab loads a TLE file, converts a Maidenhead locator, and predicts
 the next 24 hours of passes with SGP4. The placeholder grid is `PM95`; pass
@@ -187,6 +193,7 @@ crates/
   midori-app/            # egui desktop UI (`midori-gui`)
 plugins/
   midori-plugin-cw/      # reference CW decoder sidecar
+  midori-plugin-sstv/    # SSTV sidecar + offline WAV decoder
 ```
 
 The old Python audio-loopback experiment is archived at
@@ -234,12 +241,30 @@ requires a reconnect. For real CW, select the **CW** demod, tune the hardware
 LO to the carrier, and leave the VFO at zero offset; the core BFO places the
 carrier at 700 Hz.
 
+The SSTV sidecar uses [slowrx](https://github.com/jasonherald/slowrx.rs):
+
+```bash
+MIDORI_AUTOCONNECT=1 MIDORI_SSTV=1 ./target/release/midori-gui
+```
+
+Select the **SSTV** demod (FM, 15 kHz channel, 3 kHz audio, no de-emphasis),
+enable the **SSTV decoder**, and tune an FM SSTV signal. VIS is detected
+automatically. PD-120 and Robot 36 are the primary test modes; PD-180 and
+Martin 1/2 are also covered by the offline tests. Images appear in the SSTV
+tab and are written to `captures/sstv_<timestamp>_<mode>.png`.
+
+Without a transmitter or radio, decode a WAV recording offline:
+
+```bash
+./target/release/midori-sstv-decode recording.wav --out-dir captures
+```
+
 The plugin protocol and sidecar ABI are documented in
 [`plugins/README.md`](plugins/README.md).
 
 ## Roadmap
 
-1. SSTV decoder sidecar, then SSDV/APT.
+1. SSTV live preview, real ARISS regression recordings, then SSDV/APT.
 2. Pass Arm/AOS/LOS automation and automatic Doppler arming.
 3. SSB/CW voice demodulation, squelch, and filter controls.
 4. Click-to-tune digital VFOs and shareable presets.

@@ -57,7 +57,7 @@ impl Channel for VfoChannel {
     fn configure(&mut self, spec: &StreamSpec) -> Result<()> {
         let offset_hz = self.current_offset_hz();
         let demod = match self.config.demod {
-            DemodMode::Fm => Demod::Fm(FmDemod::new(FmDemodConfig {
+            DemodMode::Fm | DemodMode::Sstv => Demod::Fm(FmDemod::new(FmDemodConfig {
                 input_rate_hz: spec.sample_rate_hz,
                 channel_rate_hz: self.config.channel_rate_hz,
                 output_rate_hz: self.config.audio_rate_hz,
@@ -289,5 +289,40 @@ mod tests {
             .filter(|window| (window[0] < 0.0) != (window[1] < 0.0))
             .count();
         crossings as f64 / 2.0 / (samples.len() as f64 / 48_000.0)
+    }
+
+    #[test]
+    fn sstv_mode_uses_the_fm_demodulator() {
+        let spec = StreamSpec {
+            sample_rate_hz: 2_400_000.0,
+            center_freq_hz: 145_800_000.0,
+            bandwidth_hz: 2_000_000.0,
+            format: SampleFormat::Cf32Le,
+            full_scale: 1.0,
+        };
+        let samples: Vec<Sample> = vec![Sample::new(0.5, 0.0); 24_000];
+        let iq = IqBlock {
+            samples: Arc::from(samples.into_boxed_slice()),
+            spec,
+            start_sample: 0,
+            timestamp_ns: None,
+            flags: BlockFlags::default(),
+        };
+        let mut channel = VfoChannel::new(VfoConfig {
+            id: 2,
+            offset_hz: 0.0,
+            bandwidth_hz: 15_000.0,
+            demod: DemodMode::Sstv,
+            audio_rate_hz: 48_000.0,
+            channel_rate_hz: 48_000.0,
+            audio_bandwidth_hz: 3_000.0,
+            deemphasis_us: 0.0,
+            bfo_hz: 700.0,
+        });
+        channel.configure(&spec).unwrap();
+        let mut frames = Vec::new();
+        channel.process(&iq, &mut frames).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].meta.vfo_id, Some(2));
     }
 }

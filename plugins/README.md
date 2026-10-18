@@ -110,6 +110,26 @@ A plugin can emit:
 - `packet` with a `FrameMeta` and bytes
 - `error` with `fatal: bool`
 
+Image updates carry dimensions so RGBA payloads can be uploaded directly:
+
+```json
+{
+  "type": "display",
+  "update": {
+    "kind": "image",
+    "title": "SSTV PD-120",
+    "format": "png",
+    "width": 640,
+    "height": 496,
+    "bytes": [137, 80, 78, 71]
+  }
+}
+```
+
+`format` is `png`, `jpeg`, or `rgba8`. PNG/JPEG carry their own dimensions;
+`width`/`height` are still sent and are required for `rgba8`. Older plugins that
+omit the fields deserialize with zero dimensions.
+
 The engine/UI renders display events generically; plugins do not link egui.
 
 ## Reference plugin: CW
@@ -123,6 +143,38 @@ whole sidecar boundary.
 cargo test -p midori-plugin-cw
 cargo build --release --workspace
 MIDORI_CW=1 MIDORI_AUTOCONNECT=1 ./target/release/midori-gui
+```
+
+## Reference plugin: SSTV
+
+`plugins/midori-plugin-sstv` wraps the pure-Rust
+[slowrx](https://github.com/jasonherald/slowrx.rs) decoder. It accepts mono
+audio at the device rate (48 kHz by default), detects VIS automatically,
+reports progress per image line, and emits a PNG when an image completes.
+Completed images are also written to `captures/` by the sidecar.
+
+Primary test modes are **PD-120** (ARISS) and **Robot 36**. The underlying
+library also supports PD-180/240, Robot 24/72, Martin 1/2, and Scottie 1/2/DX;
+Scottie and Martin have no real-radio reference corpus upstream yet.
+
+Run the fast tests (VIS detection and PNG encoding):
+
+```bash
+cargo test -p midori-plugin-sstv
+```
+
+Full-image decodes are CPU-heavy in debug builds and are marked ignored. Run
+them in release:
+
+```bash
+cargo test -p midori-plugin-sstv --release -- --ignored
+```
+
+Decode a WAV without hardware:
+
+```bash
+cargo run --release -p midori-plugin-sstv --bin midori-sstv-decode -- \
+  recording.wav --out-dir captures
 ```
 
 ## Writing a plugin

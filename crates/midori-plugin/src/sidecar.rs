@@ -126,7 +126,7 @@ impl SidecarPlugin {
     }
 
     fn spawn_reader(stdout: ChildStdout) -> (Receiver<WireMessage>, JoinHandle<()>) {
-        let (tx, rx) = bounded::<WireMessage>(64);
+        let (tx, rx) = bounded::<WireMessage>(512);
         let handle = thread::Builder::new()
             .name("plugin-reader".to_string())
             .spawn(move || {

@@ -1,0 +1,19 @@
+[package]
+name = "midori-plugin-sstv"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+hound.workspace = true
+midori-plugin = { path = "../../crates/midori-plugin" }
+png.workspace = true
+serde_json.workspace = true
+slowrx.workspace = true
+
+[dev-dependencies]
+midori-core = { path = "../../crates/midori-core" }
+midori-dsp = { path = "../../crates/midori-dsp" }
+rasterwave.workspace = true

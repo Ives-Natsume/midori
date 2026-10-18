@@ -233,6 +233,9 @@ pub enum DemodMode {
     Usb,
     Lsb,
     Cw,
+    /// FM demodulation with settings tuned for SSTV (narrow audio passband,
+    /// no de-emphasis). The actual image decoding happens in a sidecar.
+    Sstv,
 }
 
 impl VfoConfig {

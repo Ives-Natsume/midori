@@ -43,8 +43,17 @@ audio_bandwidth_hz = 2_000
 deemphasis_us = 0
 bfo_hz = 700
 
+[demod.sstv]
+bandwidth_hz = 15_000
+channel_rate_hz = 48_000
+audio_rate_hz = 48_000
+audio_bandwidth_hz = 3_000
+deemphasis_us = 0
+bfo_hz = 700
+
 [decoder]
 cw_enabled = false
+sstv_enabled = false
 
 [ui]
 spectrum_ratio = 0.55

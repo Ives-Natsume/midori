@@ -22,8 +22,8 @@ use midori_dsp::median;
 use midori_engine::{LiveSession, PluginHandle, PluginSink, RecorderSink, VfoChannel, plugin_sink};
 use midori_orbit::{GridSquare, Pass, PassPredictor, Sgp4Doppler, Tle};
 use midori_plugin::{
-    DisplayUpdate, InputSpec, Manifest, OutputKind, PROTOCOL_VERSION, PluginEvent, PluginHost,
-    SidecarPlugin,
+    DisplayUpdate, ImageFormat, InputSpec, Manifest, OutputKind, PROTOCOL_VERSION, PluginEvent,
+    PluginHost, SidecarPlugin,
 };
 use midori_source_libiio::LibiioSource;
 
@@ -52,9 +52,17 @@ enum WorkerCommand {
 struct WorkerOptions {
     cw_enabled: bool,
     cw_tone_hz: f64,
+    sstv_enabled: bool,
+    sstv_output_dir: PathBuf,
     source_uri: String,
     fft_size: usize,
     doppler: Option<DopplerOptions>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PluginSource {
+    Cw,
+    Sstv,
 }
 
 struct DopplerOptions {
@@ -72,6 +80,10 @@ enum WorkerEvent {
         offset_hz: f64,
         rate_hz_s: f64,
     },
+    Plugin {
+        source: PluginSource,
+        event: PluginEvent,
+    },
     RecordingStarted(PathBuf),
     RecordingError(String),
     RecordingStopped {
@@ -79,7 +91,6 @@ enum WorkerEvent {
         samples: u64,
         seconds: f64,
     },
-    Plugin(PluginEvent),
 }
 
 // ---------------------------------------------------------------------------
@@ -119,6 +130,12 @@ pub struct MidoriApp {
     cw_enabled: bool,
     cw_text: String,
     cw_status: String,
+    sstv_enabled: bool,
+    sstv_status: String,
+    sstv_progress: f32,
+    sstv_image_title: String,
+    sstv_image_png: Option<Vec<u8>>,
+    sstv_texture: Option<egui::TextureHandle>,
 
     tle_path: String,
     grid_input: String,
@@ -162,6 +179,7 @@ impl Default for MidoriApp {
         let grid_input = config.satellite.grid.clone();
         let min_elev_input = format!("{:.1}", config.satellite.min_elevation_deg);
         let cw_enabled = config.decoder.cw_enabled;
+        let sstv_enabled = config.decoder.sstv_enabled;
         let doppler_tracking =
             std::env::var_os("MIDORI_DOPPLER").is_some() || config.satellite.doppler_tracking;
 
@@ -193,6 +211,12 @@ impl Default for MidoriApp {
             cw_enabled: std::env::var_os("MIDORI_CW").is_some() || cw_enabled,
             cw_text: String::new(),
             cw_status: "idle".to_string(),
+            sstv_enabled: std::env::var_os("MIDORI_SSTV").is_some() || sstv_enabled,
+            sstv_status: "idle".to_string(),
+            sstv_progress: 0.0,
+            sstv_image_title: String::new(),
+            sstv_image_png: None,
+            sstv_texture: None,
             tle_path,
             grid_input,
             min_elev_input,
@@ -273,6 +297,10 @@ impl MidoriApp {
         let source_uri = source.uri.clone();
         let fft_size = self.config.ui.fft_size;
         let cw_enabled = self.cw_enabled;
+        let sstv_enabled = self.sstv_enabled;
+        let sstv_output_dir = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("captures");
         let doppler = self.doppler_tracking.then(|| DopplerOptions {
             tle_path: PathBuf::from(&self.tle_path),
             grid: self.grid_input.clone(),
@@ -287,6 +315,8 @@ impl MidoriApp {
         let options = WorkerOptions {
             cw_enabled,
             cw_tone_hz,
+            sstv_enabled,
+            sstv_output_dir,
             source_uri,
             fft_size,
             doppler,
@@ -432,6 +462,7 @@ impl MidoriApp {
 
         self.config.demod.mode = self.demod_mode;
         self.config.decoder.cw_enabled = self.cw_enabled;
+        self.config.decoder.sstv_enabled = self.sstv_enabled;
         self.config.ui.spectrum_ratio = self.spectrum_ratio;
         self.config.ui.decoder_tab = self.decoder_tab;
         self.config.ui.decoder_dock_open = self.decoder_dock_open;
@@ -472,6 +503,7 @@ impl MidoriApp {
         self.sample_rate_hz = config.source.sample_rate_hz;
         self.demod_mode = config.demod.mode;
         self.cw_enabled = config.decoder.cw_enabled;
+        self.sstv_enabled = config.decoder.sstv_enabled;
         self.spectrum_ratio = config.ui.spectrum_ratio;
         self.decoder_tab = config.ui.decoder_tab;
         self.decoder_dock_open = config.ui.decoder_dock_open;
@@ -576,7 +608,7 @@ impl MidoriApp {
     // Data polling
     // -----------------------------------------------------------------------
 
-    fn poll_events(&mut self) {
+    fn poll_events(&mut self, ctx: &egui::Context) {
         let events: Vec<WorkerEvent> = {
             let Some(rx) = &self.event_rx else { return };
             let mut events = Vec::new();
@@ -652,12 +684,26 @@ impl MidoriApp {
                     );
                     self.push_log(self.status_msg.clone());
                 }
-                WorkerEvent::Plugin(event) => self.handle_plugin_event(event),
+                WorkerEvent::Plugin { source, event } => {
+                    self.handle_plugin_event(source, event, ctx)
+                }
             }
         }
     }
 
-    fn handle_plugin_event(&mut self, event: PluginEvent) {
+    fn handle_plugin_event(
+        &mut self,
+        source: PluginSource,
+        event: PluginEvent,
+        ctx: &egui::Context,
+    ) {
+        match source {
+            PluginSource::Cw => self.handle_cw_plugin_event(event),
+            PluginSource::Sstv => self.handle_sstv_plugin_event(event, ctx),
+        }
+    }
+
+    fn handle_cw_plugin_event(&mut self, event: PluginEvent) {
         match event {
             PluginEvent::Display { update } => match update {
                 DisplayUpdate::Text { lines, .. } => {
@@ -686,6 +732,68 @@ impl MidoriApp {
                     message.clone()
                 };
                 self.push_log(format!("plugin: {message}"));
+                self.error_msg = Some(message);
+            }
+            PluginEvent::Packet { .. } => {}
+        }
+    }
+
+    fn handle_sstv_plugin_event(&mut self, event: PluginEvent, ctx: &egui::Context) {
+        match event {
+            PluginEvent::Display { update } => match update {
+                DisplayUpdate::Image {
+                    title,
+                    format,
+                    width,
+                    height,
+                    bytes,
+                } => match decode_image_update(format, width, height, &bytes) {
+                    Ok(image) => {
+                        self.sstv_texture = Some(ctx.load_texture(
+                            format!("sstv-{title}"),
+                            image,
+                            egui::TextureOptions::LINEAR,
+                        ));
+                        self.sstv_image_png = (format == ImageFormat::Png).then_some(bytes);
+                        self.sstv_image_title = title.clone();
+                        self.sstv_status = format!("{title}: image ready");
+                        self.sstv_progress = 1.0;
+                        self.decoder_tab = DecoderTab::Sstv;
+                        self.decoder_dock_open = true;
+                        self.push_log(format!("SSTV image decoded: {title}"));
+                    }
+                    Err(error) => {
+                        self.sstv_status = format!("image decode failed: {error}");
+                        self.push_log(self.sstv_status.clone());
+                    }
+                },
+                DisplayUpdate::Progress { title, fraction } => {
+                    self.sstv_progress = fraction.clamp(0.0, 1.0);
+                    self.sstv_status = format!("{title} ({:.0}%)", fraction * 100.0);
+                }
+                DisplayUpdate::Text { lines, .. } => {
+                    self.sstv_status = lines.join(" ");
+                }
+                DisplayUpdate::Table { columns, rows, .. } => {
+                    self.sstv_status = format!("{} ({} rows)", columns.join(" | "), rows.len());
+                }
+            },
+            PluginEvent::Status { message, .. } => {
+                self.sstv_status = message.clone();
+                if message.contains("VIS") {
+                    self.sstv_progress = 0.0;
+                    self.push_log(format!("SSTV: {message}"));
+                } else if message.contains("audio rate") {
+                    self.push_log(format!("SSTV: {message}"));
+                }
+            }
+            PluginEvent::Error { message, fatal } => {
+                self.sstv_status = if fatal {
+                    format!("fatal: {message}")
+                } else {
+                    message.clone()
+                };
+                self.push_log(format!("SSTV plugin: {message}"));
                 self.error_msg = Some(message);
             }
             PluginEvent::Packet { .. } => {}
@@ -767,6 +875,7 @@ impl MidoriApp {
             DemodMode::Fm => 200_000.0,
             DemodMode::Am => 6_000.0,
             DemodMode::Cw => 500.0,
+            DemodMode::Sstv => 15_000.0,
             _ => 15_000.0,
         }
     }
@@ -776,6 +885,7 @@ impl MidoriApp {
             DemodMode::Fm => "FM",
             DemodMode::Am => "AM",
             DemodMode::Cw => "CW",
+            DemodMode::Sstv => "SSTV",
             _ => "?",
         }
     }
@@ -811,6 +921,7 @@ impl MidoriApp {
                 ui.selectable_value(&mut self.demod_mode, DemodMode::Fm, "FM");
                 ui.selectable_value(&mut self.demod_mode, DemodMode::Am, "AM");
                 ui.selectable_value(&mut self.demod_mode, DemodMode::Cw, "CW");
+                ui.selectable_value(&mut self.demod_mode, DemodMode::Sstv, "SSTV");
                 if self.demod_mode != previous_demod && (self.is_connected || self.is_connecting) {
                     self.status_msg = "Reconnect to apply demod mode".to_string();
                 }
@@ -978,6 +1089,7 @@ impl MidoriApp {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.decoder_tab, DecoderTab::Cw, "CW");
+                    ui.selectable_value(&mut self.decoder_tab, DecoderTab::Sstv, "SSTV");
                     ui.selectable_value(&mut self.decoder_tab, DecoderTab::Passes, "Passes");
                     ui.selectable_value(&mut self.decoder_tab, DecoderTab::Log, "Log");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -991,6 +1103,7 @@ impl MidoriApp {
 
                 match self.decoder_tab {
                     DecoderTab::Cw => self.draw_cw_tab(ui),
+                    DecoderTab::Sstv => self.draw_sstv_tab(ui),
                     DecoderTab::Passes => self.draw_passes_tab(ui),
                     DecoderTab::Log => self.draw_log_tab(ui),
                 }
@@ -1017,6 +1130,87 @@ impl MidoriApp {
                     ui.monospace(&self.cw_text);
                 }
             });
+    }
+
+    fn draw_sstv_tab(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("SSTV");
+            ui.label(&self.sstv_status);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_enabled(self.sstv_image_png.is_some(), egui::Button::new("Save PNG"))
+                    .clicked()
+                {
+                    self.save_sstv_png();
+                }
+                if self.sstv_texture.is_some() && ui.small_button("Clear").clicked() {
+                    self.sstv_texture = None;
+                    self.sstv_image_png = None;
+                    self.sstv_image_title.clear();
+                    self.sstv_progress = 0.0;
+                }
+            });
+        });
+        if self.sstv_progress > 0.0 && self.sstv_progress < 1.0 {
+            ui.add(
+                egui::ProgressBar::new(self.sstv_progress)
+                    .desired_height(8.0)
+                    .show_percentage(),
+            );
+        }
+        ui.separator();
+
+        let Some(texture) = &self.sstv_texture else {
+            ui.label(
+                egui::RichText::new(
+                    "Enable the SSTV decoder, select the SSTV demod, then tune an FM SSTV signal.\n\
+                     PD-120 and Robot 36 are the primary test modes. Images are saved to captures/.",
+                )
+                .weak(),
+            );
+            return;
+        };
+
+        let available = ui.available_size();
+        let original = texture.size_vec2();
+        let scale = (available.x / original.x)
+            .min(available.y / original.y)
+            .clamp(0.05, 1.0);
+        let size = original * scale;
+        let image = egui::Image::new(egui::load::SizedTexture::new(texture.id(), size));
+        ui.add(image).on_hover_text(&self.sstv_image_title);
+    }
+
+    fn save_sstv_png(&mut self) {
+        let Some(bytes) = &self.sstv_image_png else {
+            return;
+        };
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        let path = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("captures")
+            .join(format!("sstv_manual_{stamp}.png"));
+        if let Some(parent) = path.parent()
+            && let Err(error) = std::fs::create_dir_all(parent)
+        {
+            self.sstv_status = format!("creating {}: {error}", parent.display());
+            return;
+        }
+        match std::fs::write(&path, bytes) {
+            Ok(()) => {
+                self.sstv_status = format!("saved {}", path.display());
+                self.push_log(self.sstv_status.clone());
+            }
+            Err(error) => {
+                let message = format!("saving {}: {error}", path.display());
+                self.sstv_status = message.clone();
+                self.push_log(message.clone());
+                self.error_msg = Some(message);
+            }
+        }
     }
 
     fn draw_passes_tab(&mut self, ui: &mut egui::Ui) {
@@ -1190,6 +1384,7 @@ impl MidoriApp {
                                         self.config.demod.params(self.demod_mode).deemphasis_us
                                     )
                                 }
+                                DemodMode::Sstv => "FM · 3 kHz audio · no de-emphasis".to_string(),
                                 DemodMode::Cw => format!(
                                     "BFO {:.0} Hz",
                                     self.config.demod.params(self.demod_mode).bfo_hz
@@ -1338,6 +1533,29 @@ impl MidoriApp {
                         ui.label(egui::RichText::new("output in the bottom CW tab").weak());
                     });
 
+                egui::CollapsingHeader::new("SSTV")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        let previous = self.sstv_enabled;
+                        ui.checkbox(&mut self.sstv_enabled, "SSTV decoder (PD-120 / Robot 36)");
+                        if self.sstv_enabled != previous
+                            && (self.is_connected || self.is_connecting)
+                        {
+                            self.status_msg = "Reconnect to apply SSTV decoder".to_string();
+                        }
+                        ui.label(format!("Status: {}", self.sstv_status));
+                        if self.sstv_enabled && self.demod_mode != DemodMode::Sstv {
+                            ui.label(
+                                egui::RichText::new("select the SSTV demod for 3 kHz audio")
+                                    .color(egui::Color32::from_rgb(220, 180, 90)),
+                            );
+                        }
+                        ui.label(
+                            egui::RichText::new("slowrx sidecar · images saved to captures/")
+                                .weak(),
+                        );
+                    });
+
                 egui::CollapsingHeader::new("Plugins")
                     .default_open(true)
                     .show(ui, |ui| {
@@ -1349,7 +1567,15 @@ impl MidoriApp {
                                 "disabled"
                             }
                         ));
-                        ui.label(egui::RichText::new("more: APT · SSTV · SSDV · FT4").weak());
+                        ui.label(format!(
+                            "SSTV: {}",
+                            if self.sstv_enabled {
+                                "enabled"
+                            } else {
+                                "disabled"
+                            }
+                        ));
+                        ui.label(egui::RichText::new("more: APT · SSDV · FT4").weak());
                     });
 
                 ui.add_space(6.0);
@@ -1564,7 +1790,7 @@ impl eframe::App for MidoriApp {
             self.connect();
         }
 
-        self.poll_events();
+        self.poll_events(ctx);
         self.poll_data(ctx);
         self.handle_keyboard(ctx);
 
@@ -1644,6 +1870,70 @@ fn start_cw_plugin(
     if let Err(error) = plugin.configure(&serde_json::json!({"tone_hz": tone_hz})) {
         let _ = plugin.stop();
         let _ = event_tx.try_send(WorkerEvent::Error(format!("CW plugin configure: {error}")));
+        return None;
+    }
+
+    let (sink, handle) = plugin_sink(Box::new(plugin));
+    Some((sink, handle))
+}
+
+fn sstv_plugin_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("MIDORI_SSTV_PLUGIN") {
+        return Some(PathBuf::from(path));
+    }
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let name = if cfg!(windows) {
+        "midori-plugin-sstv.exe"
+    } else {
+        "midori-plugin-sstv"
+    };
+    let path = dir.join(name);
+    path.exists().then_some(path)
+}
+
+fn start_sstv_plugin(
+    event_tx: &Sender<WorkerEvent>,
+    output_dir: &Path,
+) -> Option<(PluginSink, PluginHandle)> {
+    let Some(path) = sstv_plugin_path() else {
+        let _ = event_tx.try_send(WorkerEvent::Error(
+            "SSTV plugin binary not found; build the workspace first".to_string(),
+        ));
+        return None;
+    };
+
+    let manifest = Manifest {
+        name: "sstv".to_string(),
+        version: "0.1.0".to_string(),
+        protocol: PROTOCOL_VERSION,
+        command: vec![path.display().to_string()],
+        input: InputSpec::Audio {
+            sample_rate_hz: 48_000.0,
+            channels: 1,
+        },
+        outputs: vec![OutputKind::Display],
+        params: vec![],
+    };
+
+    let mut plugin = match SidecarPlugin::new(manifest) {
+        Ok(plugin) => plugin,
+        Err(error) => {
+            let _ = event_tx.try_send(WorkerEvent::Error(format!("SSTV plugin manifest: {error}")));
+            return None;
+        }
+    };
+    if let Err(error) = plugin.start() {
+        let _ = event_tx.try_send(WorkerEvent::Error(format!("SSTV plugin start: {error}")));
+        return None;
+    }
+    if let Err(error) = plugin.configure(&serde_json::json!({
+        "output_dir": output_dir.display().to_string(),
+    })) {
+        let _ = plugin.stop();
+        let _ = event_tx.try_send(WorkerEvent::Error(format!(
+            "SSTV plugin configure: {error}"
+        )));
         return None;
     }
 
@@ -1738,21 +2028,28 @@ fn run_worker(
         );
     }
 
-    let (plugin_sink, plugin_handle) = if options.cw_enabled {
-        match start_cw_plugin(&event_tx, options.cw_tone_hz) {
-            Some((sink, handle)) => (Some(sink), Some(handle)),
-            None => (None, None),
-        }
-    } else {
-        (None, None)
-    };
+    let mut plugin_handles: Vec<(PluginSource, PluginHandle)> = Vec::new();
+    let mut plugin_sinks: Vec<PluginSink> = Vec::new();
+    if options.cw_enabled
+        && let Some((sink, handle)) = start_cw_plugin(&event_tx, options.cw_tone_hz)
+    {
+        plugin_sinks.push(sink);
+        plugin_handles.push((PluginSource::Cw, handle));
+    }
+    if options.sstv_enabled
+        && let Some((sink, handle)) =
+            start_sstv_plugin(&event_tx, options.sstv_output_dir.as_path())
+    {
+        plugin_sinks.push(sink);
+        plugin_handles.push((PluginSource::Sstv, handle));
+    }
 
     let (recorder_sink, recorder_handle) = RecorderSink::new();
     let mut sinks: Vec<Box<dyn Sink>> = vec![
         Box::new(SpectrumSink::new(options.fft_size, data_tx)),
         Box::new(recorder_sink),
     ];
-    if let Some(sink) = plugin_sink {
+    for sink in plugin_sinks {
         sinks.push(Box::new(sink));
     }
     if let Some(producer) = audio_producer {
@@ -1877,7 +2174,7 @@ fn run_worker(
             let _ = event_tx.try_send(WorkerEvent::RecordingError(error));
         }
 
-        if let Some(handle) = &plugin_handle {
+        for (source, handle) in &plugin_handles {
             loop {
                 match handle.try_recv() {
                     Ok(Some(event)) => {
@@ -1885,11 +2182,15 @@ fn run_worker(
                             eprintln!("[plugin] first event");
                         }
                         plugin_events += 1;
-                        let _ = event_tx.try_send(WorkerEvent::Plugin(event));
+                        let _ = event_tx.try_send(WorkerEvent::Plugin {
+                            source: *source,
+                            event,
+                        });
                     }
                     Ok(None) => break,
                     Err(error) => {
-                        let _ = event_tx.try_send(WorkerEvent::Error(format!("plugin: {error}")));
+                        let _ = event_tx
+                            .try_send(WorkerEvent::Error(format!("plugin {source:?}: {error}")));
                         break;
                     }
                 }
@@ -1897,7 +2198,7 @@ fn run_worker(
         }
     }
 
-    if let Some(handle) = &plugin_handle {
+    for (_, handle) in &plugin_handles {
         let _ = handle.stop();
     }
     if let Ok(Some(info)) = recorder_handle.stop() {
@@ -1945,6 +2246,75 @@ fn format_bandwidth(hz: f64) -> String {
     } else {
         format!("{hz:.0} Hz")
     }
+}
+
+/// Convert a plugin image event into an egui texture source.
+fn decode_image_update(
+    format: ImageFormat,
+    width: u32,
+    height: u32,
+    bytes: &[u8],
+) -> Result<egui::ColorImage, String> {
+    match format {
+        ImageFormat::Png => decode_png(bytes),
+        ImageFormat::Rgba8 => {
+            if width == 0 || height == 0 {
+                return Err("RGBA image has no dimensions".to_string());
+            }
+            let expected = width as usize * height as usize * 4;
+            if bytes.len() != expected {
+                return Err(format!(
+                    "RGBA buffer is {} bytes, expected {expected}",
+                    bytes.len()
+                ));
+            }
+            Ok(egui::ColorImage::from_rgba_unmultiplied(
+                [width as usize, height as usize],
+                bytes,
+            ))
+        }
+        ImageFormat::Jpeg => Err("JPEG display is not supported yet".to_string()),
+    }
+}
+
+fn decode_png(bytes: &[u8]) -> Result<egui::ColorImage, String> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::ALPHA);
+    let mut reader = decoder.read_info().map_err(|error| error.to_string())?;
+    let size = reader
+        .output_buffer_size()
+        .ok_or_else(|| "PNG is too large to decode".to_string())?;
+    let mut buffer = vec![0u8; size];
+    let info = reader
+        .next_frame(&mut buffer)
+        .map_err(|error| error.to_string())?;
+    let data = &buffer[..info.buffer_size()];
+    let width = info.width as usize;
+    let height = info.height as usize;
+
+    let rgba: Vec<u8> = match info.color_type {
+        png::ColorType::Rgba => data.to_vec(),
+        png::ColorType::Rgb => data
+            .chunks_exact(3)
+            .flat_map(|pixel| [pixel[0], pixel[1], pixel[2], 255])
+            .collect(),
+        png::ColorType::Grayscale => data
+            .iter()
+            .flat_map(|&value| [value, value, value, 255])
+            .collect(),
+        png::ColorType::GrayscaleAlpha => data
+            .chunks_exact(2)
+            .flat_map(|pixel| [pixel[0], pixel[0], pixel[0], pixel[1]])
+            .collect(),
+        png::ColorType::Indexed => {
+            return Err("indexed PNG was not expanded".to_string());
+        }
+    };
+
+    Ok(egui::ColorImage::from_rgba_unmultiplied(
+        [width, height],
+        &rgba,
+    ))
 }
 
 fn downsample(input: &[f32], width: usize) -> Vec<f32> {
@@ -2036,4 +2406,45 @@ fn turbo_color(t: f32) -> egui::Color32 {
 #[inline]
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_png() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, 2, 1);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&[255, 0, 0, 0, 255, 0]).unwrap();
+        }
+        bytes
+    }
+
+    #[test]
+    fn decodes_png_display_update() {
+        let png = test_png();
+        let image = decode_image_update(ImageFormat::Png, 2, 1, &png).unwrap();
+        assert_eq!(image.size, [2, 1]);
+        assert_eq!(image.pixels[0], egui::Color32::from_rgb(255, 0, 0));
+        assert_eq!(image.pixels[1], egui::Color32::from_rgb(0, 255, 0));
+    }
+
+    #[test]
+    fn decodes_rgba8_display_update() {
+        let image =
+            decode_image_update(ImageFormat::Rgba8, 2, 1, &[255, 0, 0, 255, 0, 255, 0, 255])
+                .unwrap();
+        assert_eq!(image.size, [2, 1]);
+        assert_eq!(image.pixels[0], egui::Color32::from_rgb(255, 0, 0));
+        assert_eq!(image.pixels[1], egui::Color32::from_rgb(0, 255, 0));
+    }
+
+    #[test]
+    fn rejects_bad_rgba8_length() {
+        assert!(decode_image_update(ImageFormat::Rgba8, 2, 1, &[0; 4]).is_err());
+    }
 }

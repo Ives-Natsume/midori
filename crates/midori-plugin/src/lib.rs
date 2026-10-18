@@ -167,6 +167,13 @@ pub enum DisplayUpdate {
     Image {
         title: String,
         format: ImageFormat,
+        /// Image width in pixels. Zero for formats that carry their own
+        /// dimensions (PNG/JPEG).
+        #[serde(default)]
+        width: u32,
+        /// Image height in pixels.
+        #[serde(default)]
+        height: u32,
         bytes: Vec<u8>,
     },
     Table {
@@ -262,5 +269,57 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         let decoded: PluginEvent = serde_json::from_str(&json).unwrap();
         assert!(matches!(decoded, PluginEvent::Display { .. }));
+    }
+
+    #[test]
+    fn image_event_carries_dimensions_and_defaults_them() {
+        let event = PluginEvent::Display {
+            update: DisplayUpdate::Image {
+                title: "SSTV".to_string(),
+                format: ImageFormat::Png,
+                width: 640,
+                height: 496,
+                bytes: vec![1, 2, 3],
+            },
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        let decoded: PluginEvent = serde_json::from_value(value).unwrap();
+        match decoded {
+            PluginEvent::Display {
+                update:
+                    DisplayUpdate::Image {
+                        width,
+                        height,
+                        bytes,
+                        ..
+                    },
+            } => {
+                assert_eq!((width, height), (640, 496));
+                assert_eq!(bytes, vec![1, 2, 3]);
+            }
+            other => panic!("expected image, got {other:?}"),
+        }
+
+        // Events from older plugins without dimensions still deserialize.
+        let legacy = serde_json::json!({
+            "type": "display",
+            "update": {
+                "kind": "image",
+                "title": "old",
+                "format": "png",
+                "bytes": [1, 2]
+            }
+        });
+        let decoded: PluginEvent = serde_json::from_value(legacy).unwrap();
+        assert!(matches!(
+            decoded,
+            PluginEvent::Display {
+                update: DisplayUpdate::Image {
+                    width: 0,
+                    height: 0,
+                    ..
+                }
+            }
+        ));
     }
 }

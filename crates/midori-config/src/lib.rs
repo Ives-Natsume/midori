@@ -37,6 +37,7 @@ pub enum Colormap {
 #[serde(rename_all = "snake_case")]
 pub enum DecoderTab {
     Cw,
+    Sstv,
     #[default]
     Passes,
     Log,
@@ -114,6 +115,17 @@ impl DemodParams {
             bfo_hz: 700.0,
         }
     }
+
+    fn sstv() -> Self {
+        Self {
+            bandwidth_hz: 15_000.0,
+            channel_rate_hz: 48_000.0,
+            audio_rate_hz: 48_000.0,
+            audio_bandwidth_hz: 3_000.0,
+            deemphasis_us: 0.0,
+            bfo_hz: 700.0,
+        }
+    }
 }
 
 impl Default for DemodParams {
@@ -129,6 +141,7 @@ pub struct DemodSettings {
     pub fm: DemodParams,
     pub am: DemodParams,
     pub cw: DemodParams,
+    pub sstv: DemodParams,
 }
 
 impl Default for DemodSettings {
@@ -138,6 +151,7 @@ impl Default for DemodSettings {
             fm: DemodParams::fm(),
             am: DemodParams::am(),
             cw: DemodParams::cw(),
+            sstv: DemodParams::sstv(),
         }
     }
 }
@@ -147,6 +161,7 @@ impl DemodSettings {
         match mode {
             DemodMode::Am => &self.am,
             DemodMode::Cw => &self.cw,
+            DemodMode::Sstv => &self.sstv,
             _ => &self.fm,
         }
     }
@@ -156,6 +171,7 @@ impl DemodSettings {
 #[serde(default)]
 pub struct DecoderSettings {
     pub cw_enabled: bool,
+    pub sstv_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -344,7 +360,12 @@ impl AppConfig {
             self.source.rf_port = "A_BALANCED".to_string();
         }
 
-        for params in [&mut self.demod.fm, &mut self.demod.am, &mut self.demod.cw] {
+        for params in [
+            &mut self.demod.fm,
+            &mut self.demod.am,
+            &mut self.demod.cw,
+            &mut self.demod.sstv,
+        ] {
             params.bandwidth_hz = params.bandwidth_hz.clamp(100.0, 2_000_000.0);
             params.channel_rate_hz = params.channel_rate_hz.clamp(8_000.0, 61_440_000.0);
             params.audio_rate_hz = params.audio_rate_hz.clamp(8_000.0, 192_000.0);
