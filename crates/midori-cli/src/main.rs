@@ -11,11 +11,13 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Duration, Utc};
 use midori_core::{GainMode, IqSource, SourceConfig};
 use midori_dsp::{
     AmDemod, AmDemodConfig, FmDemod, FmDemodConfig, SpectrumAnalyzer, fftshift, frequency_axis,
     median, top_peaks,
 };
+use midori_orbit::{GridSquare, PassPredictor, Tle};
 use midori_sigmf::{SigMfReader, SigMfWriter};
 use midori_source_libiio::LibiioSource;
 
@@ -105,6 +107,7 @@ fn main() -> Result<()> {
         Some("spectrum") => cmd_spectrum(&args),
         Some("am") => cmd_am(&args),
         Some("fm") => cmd_fm(&args),
+        Some("pass") => cmd_pass(&args),
         Some("help") | Some("--help") | None => {
             print_help();
             Ok(())
@@ -126,6 +129,7 @@ USAGE:
   midori spectrum <capture>       Print the averaged spectrum and top peaks
   midori am       <capture>       Demodulate an AM channel to a WAV file
   midori fm       <capture>       Demodulate an FM channel to a WAV file
+  midori pass     --tle <file>    Predict satellite passes from a TLE
 
 RECORD OPTIONS:
   --freq <MHz>       Centre frequency (default 120.0)
@@ -160,11 +164,20 @@ FM OPTIONS:
   --rate <Hz>        Audio sample rate (default 48000)
   --out <wav>        Output WAV path (default: <capture>.wav)
 
+PASS OPTIONS:
+  --tle <file>       Two- or three-line TLE file (required)
+  --grid <locator>   Maidenhead locator, e.g. PM95 (required)
+  --alt <m>          Observer altitude in metres (default 0)
+  --hours <h>        Prediction window (default 24)
+  --min-elev <deg>   Minimum elevation (default 5)
+  --from <rfc3339>   Start time (default now)
+
 EXAMPLES:
   midori record --freq 120.0 --gain 40 --seconds 30 --out captures/airband_120m
   midori spectrum captures/airband_120m --top 20
   midori am captures/airband_120m --freq 120.0 --out captures/airband_120m.wav
   midori fm captures/fm_91.6 --freq 91.6 --bw 200000 --out captures/fm_91.6.wav
+  midori pass --tle iss.tle --grid PM95 --hours 24 --min-elev 10
 "#
     );
 }
@@ -508,6 +521,77 @@ fn cmd_fm(args: &Args) -> Result<()> {
         peak,
         rms
     );
+    Ok(())
+}
+
+fn cmd_pass(args: &Args) -> Result<()> {
+    let tle_path = args
+        .optional_str("tle")
+        .ok_or_else(|| anyhow::anyhow!("pass requires --tle <file>"))?;
+    let grid_text = args
+        .optional_str("grid")
+        .ok_or_else(|| anyhow::anyhow!("pass requires --grid <locator>"))?;
+    let tle = Tle::from_file(Path::new(&tle_path))?;
+    let grid = GridSquare::parse(&grid_text)?;
+    let altitude_m = args.f64("alt", 0.0)?;
+    let hours = args.f64("hours", 24.0)?;
+    let min_elevation = args.f64("min-elev", 5.0)?;
+    if hours <= 0.0 {
+        bail!("--hours must be positive");
+    }
+    if !(0.0..=90.0).contains(&min_elevation) {
+        bail!("--min-elev must be between 0 and 90 degrees");
+    }
+
+    let observer = grid.observer(altitude_m);
+    let predictor = PassPredictor::new(&tle, observer)?;
+    let start = match args.optional_str("from") {
+        Some(value) => DateTime::parse_from_rfc3339(&value)
+            .with_context(|| format!("parsing --from '{value}'"))?
+            .with_timezone(&Utc),
+        None => Utc::now(),
+    };
+    let end = start + Duration::seconds((hours * 3600.0) as i64);
+    let passes = predictor.predict(start, end, min_elevation)?;
+
+    println!(
+        "{} ({})  TLE epoch {}",
+        tle.name.as_deref().unwrap_or("unknown satellite"),
+        tle.norad_id,
+        tle.epoch.format("%Y-%m-%d %H:%M:%S UTC")
+    );
+    println!(
+        "observer {}  {:.4}°, {:.4}°, {:.0} m",
+        grid_text.to_uppercase(),
+        observer.lat_deg,
+        observer.lon_deg,
+        observer.altitude_m
+    );
+    println!(
+        "window {} .. {}  (min elevation {:.1}°)",
+        start.format("%Y-%m-%d %H:%M:%S UTC"),
+        end.format("%Y-%m-%d %H:%M:%S UTC"),
+        min_elevation
+    );
+
+    if passes.is_empty() {
+        println!("no passes above the elevation threshold");
+        return Ok(());
+    }
+
+    for (index, pass) in passes.iter().enumerate() {
+        println!(
+            "{:>2}. AOS {}  az {:5.1}°   TCA {}  max el {:5.1}°   LOS {}  az {:5.1}°   ({:.1} min)",
+            index + 1,
+            pass.aos.format("%m-%d %H:%M:%S"),
+            pass.aos_azimuth_deg,
+            pass.tca.format("%m-%d %H:%M:%S"),
+            pass.max_elevation_deg,
+            pass.los.format("%m-%d %H:%M:%S"),
+            pass.los_azimuth_deg,
+            (pass.los - pass.aos).num_seconds() as f64 / 60.0
+        );
+    }
     Ok(())
 }
 

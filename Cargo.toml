@@ -7,6 +7,7 @@ members = [
     "crates/midori-sigmf",
     "crates/midori-plugin",
     "crates/midori-engine",
+    "crates/midori-orbit",
     "crates/midori-cli",
     "crates/midori-app",
     "plugins/midori-plugin-cw",
@@ -20,6 +21,7 @@ repository = "https://github.com/Ives-Natsume/midori"
 
 [workspace.dependencies]
 anyhow = "1.0.100"
+chrono = { version = "0.4", features = ["clock"] }
 cpal = "0.15"
 crossbeam-channel = "0.5.15"
 eframe = "0.33"
@@ -34,6 +36,7 @@ serde_json = "1.0.149"
 midori-core = { path = "crates/midori-core" }
 midori-dsp = { path = "crates/midori-dsp" }
 midori-engine = { path = "crates/midori-engine" }
+midori-orbit = { path = "crates/midori-orbit" }
 midori-plugin = { path = "crates/midori-plugin" }
 midori-sigmf = { path = "crates/midori-sigmf" }
 midori-source-libiio = { path = "crates/midori-source-libiio" }

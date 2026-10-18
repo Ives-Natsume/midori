@@ -11,8 +11,10 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+chrono.workspace = true
 midori-core.workspace = true
 midori-dsp.workspace = true
+midori-orbit.workspace = true
 midori-sigmf.workspace = true
 midori-source-libiio.workspace = true
 num-complex.workspace = true

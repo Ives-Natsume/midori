@@ -32,8 +32,11 @@ Doppler correction, recording, and plugins for SSTV/SSDV/FT4/CW.
   out-of-process decoder plugins.
 - Out-of-process sidecar host with a length-prefixed JSON/binary protocol.
 - Reference CW plugin with adaptive tone detection and Morse decoding.
-- Doppler metadata and `DopplerSource`/`TrackingConfig` contracts (SGP4
-  implementation is the next step).
+- Sidecar handshake/I/O timeouts and bounded queues so a hung or slow plugin
+  cannot block the SDR worker.
+- TLE parsing with checksums, Maidenhead grid conversion, SGP4 pass
+  prediction, and Doppler range-rate calculation.
+- Doppler metadata and `DopplerSource`/`TrackingConfig` contracts.
 - Unit tests for the spectrum analyser, AM/FM demodulators, SigMF round-trip,
   plugin manifest parsing, sidecar framing, engine fan-out, and CW decoding.
 
@@ -106,6 +109,13 @@ Demodulate a broadcast FM channel (mono L+R):
 For narrowband FM voice, use `--bw 15000 --audio-bw 3000` and optionally
 `--deemph 0`.
 
+Predict ISS passes for a Maidenhead locator:
+
+```bash
+./target/release/midori pass --tle captures/iss.tle \
+  --grid PM95 --hours 24 --min-elev 5
+```
+
 `midori help` lists all options. Pass a capture base path; a trailing
 `.sigmf` is accepted and normalised. The CLI adds the `.sigmf-data` /
 `.sigmf-meta` suffixes.
@@ -124,6 +134,7 @@ crates/
   midori-sigmf/          # SigMF writer/reader
   midori-plugin/         # plugin manifest, events, host trait
   midori-engine/         # LiveSession, VFO channel, recorder sink
+  midori-orbit/          # TLE, Maidenhead, SGP4 passes, Doppler
   midori-cli/            # `midori` command-line tool
   midori-app/            # egui desktop UI (`midori-gui`)
 plugins/
@@ -180,7 +191,7 @@ The plugin protocol and sidecar ABI are documented in
 
 ## Roadmap
 
-1. `midori-orbit`: TLE/SGP4, pass prediction, Doppler-driven VFO updates.
+1. Wire `Sgp4Doppler` into `LiveSession`/VFO and pass scheduling.
 2. SSB/CW voice demodulation, squelch, and filter controls.
 3. Click-to-tune digital VFOs and shareable presets.
 4. APT/SSTV/SSDV plugins and plugin parameter UI.
