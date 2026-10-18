@@ -9,8 +9,11 @@ and aviation-band work on a Mac: waterfall, VFO, AM/SSB/FM demodulation,
 Doppler correction, recording, and plugins for SSTV/SSDV/FT4/CW.
 
 > Status: early prototype. The core, CLI, and egui application live in
-> `crates/`. The old Python audio loopback and the original `pluto_rs`
-> prototype have been archived outside this repository.
+> `crates/`. The old Python audio loopback is archived outside this
+> repository; the original nested `pluto_rs` prototype was removed.
+>
+> **Handover/status:** see [`HANDOVER.md`](HANDOVER.md) for the current state,
+> known limitations, and next engineering steps.
 
 ## Current capabilities
 
@@ -179,9 +182,9 @@ plugins/
   midori-plugin-cw/      # reference CW decoder sidecar
 ```
 
-The old Python audio-loopback experiment and the original `pluto_rs`
-prototype are stored as sibling directories outside the repository
-(`../midori-audio-loopback/` and `../midori-pluto-rs-legacy/`).
+The old Python audio-loopback experiment is archived at
+`../midori-audio-loopback/` outside this repository. The original nested
+`pluto_rs` prototype and its Git metadata were removed.
 
 ## Design notes
 
