@@ -240,6 +240,7 @@ impl SigMfReader {
         StreamSpec {
             sample_rate_hz: self.info.sample_rate_hz,
             center_freq_hz: self.info.center_freq_hz,
+            bandwidth_hz: self.info.sample_rate_hz,
             format: if self.info.datatype == "cf32_le" {
                 SampleFormat::Cf32Le
             } else {

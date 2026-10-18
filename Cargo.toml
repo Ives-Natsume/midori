@@ -5,6 +5,7 @@ members = [
     "crates/midori-source-libiio",
     "crates/midori-dsp",
     "crates/midori-sigmf",
+    "crates/midori-plugin",
     "crates/midori-cli",
     "crates/midori-app",
 ]

@@ -8,3 +8,4 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 num-complex.workspace = true
+serde.workspace = true

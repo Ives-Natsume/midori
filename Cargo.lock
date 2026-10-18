@@ -1769,6 +1769,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "num-complex",
+ "serde",
 ]
 
 [[package]]
@@ -1778,6 +1779,16 @@ dependencies = [
  "midori-core",
  "num-complex",
  "rustfft",
+]
+
+[[package]]
+name = "midori-plugin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "midori-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

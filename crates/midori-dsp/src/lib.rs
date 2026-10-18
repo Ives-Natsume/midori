@@ -387,6 +387,267 @@ impl AmDemod {
     }
 }
 
+// ---------------------------------------------------------------------------
+// FM demodulator
+// ---------------------------------------------------------------------------
+
+/// Numerically controlled oscillator that mixes a channel to baseband.
+#[derive(Debug, Clone)]
+pub struct Nco {
+    phase: f64,
+    phase_inc: f64,
+}
+
+impl Nco {
+    pub fn new(sample_rate_hz: f64, offset_hz: f64) -> Self {
+        Self {
+            phase: 0.0,
+            phase_inc: std::f64::consts::TAU * offset_hz / sample_rate_hz,
+        }
+    }
+
+    pub fn set_offset(&mut self, sample_rate_hz: f64, offset_hz: f64) {
+        self.phase_inc = std::f64::consts::TAU * offset_hz / sample_rate_hz;
+    }
+
+    /// Mix one sample by `exp(-j * phase)`.
+    #[inline]
+    pub fn mix(&mut self, sample: Complex32) -> Complex32 {
+        let (sin, cos) = self.phase.sin_cos();
+        let i = sample.re as f64 * cos + sample.im as f64 * sin;
+        let q = sample.im as f64 * cos - sample.re as f64 * sin;
+
+        self.phase += self.phase_inc;
+        if self.phase > std::f64::consts::TAU {
+            self.phase -= std::f64::consts::TAU;
+        }
+        Complex32::new(i as f32, q as f32)
+    }
+
+    pub fn reset(&mut self) {
+        self.phase = 0.0;
+    }
+}
+
+/// Mix a channel to baseband, low-pass it, and decimate it.
+///
+/// This is the digital VFO primitive used by AM/FM/SSB/CW and by decoder
+/// channels. It deliberately does not know about demodulation.
+pub struct ComplexChannelizer {
+    nco: Nco,
+    lp_i: Lowpass4,
+    lp_q: Lowpass4,
+    decimation: usize,
+    count: usize,
+    output_rate_hz: f64,
+}
+
+impl ComplexChannelizer {
+    pub fn new(input_rate_hz: f64, output_rate_hz: f64, offset_hz: f64, bandwidth_hz: f64) -> Self {
+        let ratio = (input_rate_hz / output_rate_hz).max(1.0);
+        let decimation = ratio.round().max(1.0) as usize;
+        let actual_output_rate = input_rate_hz / decimation as f64;
+        let cutoff = (bandwidth_hz / 2.0).clamp(100.0, input_rate_hz * 0.45);
+
+        Self {
+            nco: Nco::new(input_rate_hz, offset_hz),
+            lp_i: Lowpass4::new(input_rate_hz, cutoff),
+            lp_q: Lowpass4::new(input_rate_hz, cutoff),
+            decimation,
+            count: 0,
+            output_rate_hz: actual_output_rate,
+        }
+    }
+
+    pub fn output_rate_hz(&self) -> f64 {
+        self.output_rate_hz
+    }
+
+    pub fn set_offset(&mut self, input_rate_hz: f64, offset_hz: f64) {
+        self.nco.set_offset(input_rate_hz, offset_hz);
+    }
+
+    /// Append decimated complex baseband samples to `output`.
+    pub fn process(&mut self, input: &[Sample], output: &mut Vec<Complex32>) {
+        for &sample in input {
+            let mixed = self.nco.mix(sample);
+            let i = self.lp_i.process(mixed.re as f64);
+            let q = self.lp_q.process(mixed.im as f64);
+
+            self.count += 1;
+            if self.count >= self.decimation {
+                self.count = 0;
+                output.push(Complex32::new(i as f32, q as f32));
+            }
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.nco.reset();
+        self.lp_i.reset();
+        self.lp_q.reset();
+        self.count = 0;
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FmDemodConfig {
+    pub input_rate_hz: f64,
+    /// Intermediate rate after channel selection. 240 kHz is a good default
+    /// for broadcast FM; 48 kHz is enough for narrowband voice.
+    pub channel_rate_hz: f64,
+    pub output_rate_hz: f64,
+    /// Channel offset relative to the capture centre.
+    pub offset_hz: f64,
+    /// RF bandwidth of the FM channel.
+    pub channel_bandwidth_hz: f64,
+    /// De-emphasis time constant: 50 us (Europe/China), 75 us (Americas), or 0.
+    pub deemphasis_us: f64,
+    pub audio_bandwidth_hz: f64,
+}
+
+impl Default for FmDemodConfig {
+    fn default() -> Self {
+        Self {
+            input_rate_hz: 2_400_000.0,
+            channel_rate_hz: 240_000.0,
+            output_rate_hz: 48_000.0,
+            offset_hz: 0.0,
+            channel_bandwidth_hz: 200_000.0,
+            deemphasis_us: 50.0,
+            audio_bandwidth_hz: 15_000.0,
+        }
+    }
+}
+
+/// One-pole low-pass used for de-emphasis.
+#[derive(Debug, Clone, Copy)]
+struct OnePoleLowpass {
+    alpha: f64,
+    state: f64,
+}
+
+impl OnePoleLowpass {
+    fn from_time_constant(sample_rate_hz: f64, tau_s: f64) -> Self {
+        let dt = 1.0 / sample_rate_hz;
+        Self {
+            alpha: (dt / (tau_s + dt)).clamp(0.0, 1.0),
+            state: 0.0,
+        }
+    }
+
+    #[inline]
+    fn process(&mut self, x: f64) -> f64 {
+        self.state += self.alpha * (x - self.state);
+        self.state
+    }
+
+    fn reset(&mut self) {
+        self.state = 0.0;
+    }
+}
+
+/// FM channel demodulator: channelize -> discriminator -> de-emphasis ->
+/// audio low-pass -> resample.
+pub struct FmDemod {
+    channelizer: ComplexChannelizer,
+    channel_rate_hz: f64,
+    previous: Option<Complex32>,
+    deemph: Option<OnePoleLowpass>,
+    audio_lp: Lowpass4,
+    baseband: Vec<Complex32>,
+    resample_next: f64,
+    resample_step: f64,
+    input_index: f64,
+    previous_audio: f64,
+}
+
+impl FmDemod {
+    pub fn new(config: FmDemodConfig) -> Self {
+        let channelizer = ComplexChannelizer::new(
+            config.input_rate_hz,
+            config.channel_rate_hz,
+            config.offset_hz,
+            config.channel_bandwidth_hz,
+        );
+        let channel_rate_hz = channelizer.output_rate_hz();
+        let audio_bandwidth = config
+            .audio_bandwidth_hz
+            .clamp(100.0, channel_rate_hz * 0.45);
+        let deemph = if config.deemphasis_us > 0.0 {
+            Some(OnePoleLowpass::from_time_constant(
+                channel_rate_hz,
+                config.deemphasis_us * 1e-6,
+            ))
+        } else {
+            None
+        };
+
+        Self {
+            channelizer,
+            channel_rate_hz,
+            previous: None,
+            deemph,
+            audio_lp: Lowpass4::new(channel_rate_hz, audio_bandwidth),
+            baseband: Vec::new(),
+            resample_next: 1.0,
+            resample_step: channel_rate_hz / config.output_rate_hz,
+            input_index: 0.0,
+            previous_audio: 0.0,
+        }
+    }
+
+    pub fn output_rate_hz(&self) -> f64 {
+        self.channel_rate_hz / self.resample_step
+    }
+
+    /// Append demodulated audio to `output`.
+    pub fn process(&mut self, input: &[Sample], output: &mut Vec<f32>) {
+        self.baseband.clear();
+        self.channelizer.process(input, &mut self.baseband);
+
+        for index in 0..self.baseband.len() {
+            let sample = self.baseband[index];
+            let Some(previous) = self.previous else {
+                self.previous = Some(sample);
+                continue;
+            };
+
+            let product = sample * previous.conj();
+            let dphi = product.im.atan2(product.re) as f64;
+            let mut audio = dphi * self.channel_rate_hz / std::f64::consts::TAU;
+
+            if let Some(deemphasis) = &mut self.deemph {
+                audio = deemphasis.process(audio);
+            }
+            audio = self.audio_lp.process(audio);
+
+            self.input_index += 1.0;
+            while self.resample_next <= self.input_index {
+                let frac = (self.resample_next - (self.input_index - 1.0)).clamp(0.0, 1.0);
+                let value = self.previous_audio + (audio - self.previous_audio) * frac;
+                output.push(value as f32);
+                self.resample_next += self.resample_step;
+            }
+            self.previous_audio = audio;
+            self.previous = Some(sample);
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.channelizer.reset();
+        self.previous = None;
+        if let Some(deemphasis) = &mut self.deemph {
+            deemphasis.reset();
+        }
+        self.audio_lp.reset();
+        self.baseband.clear();
+        self.resample_next = 1.0;
+        self.input_index = 0.0;
+        self.previous_audio = 0.0;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,6 +672,52 @@ mod tests {
             .unwrap();
         assert_eq!(peak_index, bin);
         assert!((*peak - 0.0).abs() < 1.0, "peak was {peak} dB");
+    }
+
+    #[test]
+    fn fm_demod_recovers_audio_tone() {
+        let fs = 240_000.0;
+        let offset = 20_000.0;
+        let deviation = 3_000.0;
+        let tone = 1_000.0;
+        let n = 96_000;
+        let mut phase = 0.0f64;
+        let input: Vec<Sample> = (0..n)
+            .map(|i| {
+                let t = i as f64 / fs;
+                let instantaneous =
+                    offset + deviation * (2.0 * std::f64::consts::PI * tone * t).sin();
+                phase += 2.0 * std::f64::consts::PI * instantaneous / fs;
+                Complex32::new(phase.cos() as f32, phase.sin() as f32)
+            })
+            .collect();
+
+        let mut demod = FmDemod::new(FmDemodConfig {
+            input_rate_hz: fs,
+            channel_rate_hz: 48_000.0,
+            output_rate_hz: 48_000.0,
+            offset_hz: offset,
+            channel_bandwidth_hz: 16_000.0,
+            deemphasis_us: 0.0,
+            audio_bandwidth_hz: 4_000.0,
+        });
+        let mut audio = Vec::new();
+        demod.process(&input, &mut audio);
+
+        assert!(audio.len() > 15_000, "got {} samples", audio.len());
+        let steady = &audio[2_000..];
+        let rms = (steady.iter().map(|&x| x * x).sum::<f32>() / steady.len() as f32).sqrt();
+        assert!(rms > 100.0, "discriminator RMS too low: {rms}");
+
+        let crossings = steady
+            .windows(2)
+            .filter(|w| (w[0] < 0.0) != (w[1] < 0.0))
+            .count();
+        let measured = crossings as f64 / 2.0 / (steady.len() as f64 / 48_000.0);
+        assert!(
+            (measured - tone).abs() < 100.0,
+            "measured {measured} Hz, expected {tone} Hz"
+        );
     }
 
     #[test]

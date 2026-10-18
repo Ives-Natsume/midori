@@ -21,9 +21,14 @@ Doppler correction, recording, and plugins for SSTV/SSDV/FT4/CW.
 - Averaged spectrum with peak reporting.
 - AM channel demodulation (NCO + low-pass + envelope + DC block + resample)
   to 16-bit PCM WAV.
+- FM channel demodulation (channelizer + polar discriminator + de-emphasis +
+  audio low-pass + resample) to 16-bit PCM WAV.
 - egui desktop UI with spectrum/waterfall, frequency/gain controls, and
   one-click SigMF recording.
-- Unit tests for the spectrum analyser, AM demodulator, and SigMF round-trip.
+- Core contracts for frames, digital VFOs, channels, sinks, sessions, and
+  out-of-process decoder plugins.
+- Unit tests for the spectrum analyser, AM/FM demodulators, SigMF round-trip,
+  and plugin manifest parsing.
 
 ## Build
 
@@ -81,6 +86,17 @@ Demodulate an AM channel to audio:
   --freq 120.0 --bw 6000 --out captures/airband_120m.wav
 ```
 
+Demodulate a broadcast FM channel (mono L+R):
+
+```bash
+./target/release/midori fm captures/fm_91.6 \
+  --freq 91.6 --bw 200000 --deemph 50 \
+  --out captures/fm_91.6.wav
+```
+
+For narrowband FM voice, use `--bw 15000 --audio-bw 3000` and optionally
+`--deemph 0`.
+
 `midori help` lists all options. Pass a capture base path; a trailing
 `.sigmf` is accepted and normalised. The CLI adds the `.sigmf-data` /
 `.sigmf-meta` suffixes.
@@ -97,6 +113,7 @@ crates/
   midori-source-libiio/  # Pluto/AD9361 backend
   midori-dsp/            # spectrum, biquads, AM demodulator
   midori-sigmf/          # SigMF writer/reader
+  midori-plugin/         # plugin manifest, events, host trait
   midori-cli/            # `midori` command-line tool
   midori-app/            # egui desktop UI (`midori-gui`)
 ```
@@ -111,6 +128,9 @@ prototype are stored as sibling directories outside the repository
   `IqBlock`s containing an `Arc<[Complex32]>` plus `StreamSpec`, a
   sample index, and flags. This lets one block feed a waterfall, a recorder,
   and several decoder channels without copying.
+- **Core owns contracts, not domain decoders.** `FrameMeta`, `Frame`,
+  `VfoConfig`, `Channel`, `Sink`, `Session`, and the plugin manifest/host
+  traits live in the core. SSTV, SSDV, FT4, APT, and CW logic do not.
 - **Keep the hardware LO fixed during a pass.** Tuning and Doppler correction
   belong in a digital VFO/NCO, not in repeated PLL retunes. This keeps phase
   continuous and makes wideband recording straightforward.
@@ -120,16 +140,17 @@ prototype are stored as sibling directories outside the repository
 - **Decoders are separate processes.** FT4, SSDV, SSTV, and CW decoders have
   different languages, licenses, and failure modes. A sidecar supervisor with
   typed streams (`IQ`, `Audio`, `SoftBits`, `Bytes`) keeps the core clean.
+  Plugins emit text/image/table display events rather than linking egui.
 - **The core has no UI dependency.** The CLI and egui app are both consumers;
   a remote or Tauri client can use the same engine later.
 
 ## Roadmap
 
-1. File source and a streaming session/ring-buffer layer.
-2. SSB/CW/FM demodulation, AGC, squelch, and live audio output (`cpal`).
-3. Decoder sidecar protocol and the first plugin (SSDV or FT4).
+1. Live audio output (`cpal`) and a real session/VFO implementation.
+2. Decoder sidecar supervisor and the first plugin (CW or APT).
+3. SSB/CW/FM voice demodulation, AGC, squelch, and filter controls.
 4. TLE/SGP4 Doppler tracking, pass scheduling, and presets.
-5. Live audio/waterfall polish, SigMF browse/playback, and packaging.
+5. SigMF browse/playback, plugin display panels, and packaging.
 
 ## License
 

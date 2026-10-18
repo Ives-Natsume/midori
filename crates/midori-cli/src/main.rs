@@ -13,7 +13,8 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use midori_core::{GainMode, IqSource, SourceConfig};
 use midori_dsp::{
-    AmDemod, AmDemodConfig, SpectrumAnalyzer, fftshift, frequency_axis, median, top_peaks,
+    AmDemod, AmDemodConfig, FmDemod, FmDemodConfig, SpectrumAnalyzer, fftshift, frequency_axis,
+    median, top_peaks,
 };
 use midori_sigmf::{SigMfReader, SigMfWriter};
 use midori_source_libiio::LibiioSource;
@@ -103,6 +104,7 @@ fn main() -> Result<()> {
         Some("info") => cmd_info(&args),
         Some("spectrum") => cmd_spectrum(&args),
         Some("am") => cmd_am(&args),
+        Some("fm") => cmd_fm(&args),
         Some("help") | Some("--help") | None => {
             print_help();
             Ok(())
@@ -123,6 +125,7 @@ USAGE:
   midori info     <capture>       Show SigMF metadata
   midori spectrum <capture>       Print the averaged spectrum and top peaks
   midori am       <capture>       Demodulate an AM channel to a WAV file
+  midori fm       <capture>       Demodulate an FM channel to a WAV file
 
 RECORD OPTIONS:
   --freq <MHz>       Centre frequency (default 120.0)
@@ -148,10 +151,20 @@ AM OPTIONS:
   --rate <Hz>        Audio sample rate (default 48000)
   --out <wav>        Output WAV path (default: <capture>.wav)
 
+FM OPTIONS:
+  --freq <MHz>       Absolute channel frequency (default: capture centre)
+  --bw <Hz>          RF channel bandwidth (default 200000 broadcast)
+  --channel-rate <Hz> Intermediate channel rate (default 240000)
+  --deemph <us>      De-emphasis 0 / 50 / 75 (default 50)
+  --audio-bw <Hz>    Audio bandwidth (default 15000; use 3000 for voice)
+  --rate <Hz>        Audio sample rate (default 48000)
+  --out <wav>        Output WAV path (default: <capture>.wav)
+
 EXAMPLES:
   midori record --freq 120.0 --gain 40 --seconds 30 --out captures/airband_120m
   midori spectrum captures/airband_120m --top 20
   midori am captures/airband_120m --freq 120.0 --out captures/airband_120m.wav
+  midori fm captures/fm_91.6 --freq 91.6 --bw 200000 --out captures/fm_91.6.wav
 "#
     );
 }
@@ -221,9 +234,14 @@ fn cmd_record(args: &Args) -> Result<()> {
     let started = Instant::now();
     let mut last_report = 0.0f64;
     let mut blocks = 0u64;
+    let mut peak = 0.0f32;
 
     while started.elapsed().as_secs_f64() < seconds {
         let block = source.read_block()?;
+        let block_peak = block.samples.iter().fold(0.0f32, |acc, sample| {
+            acc.max(sample.re.abs()).max(sample.im.abs())
+        });
+        peak = peak.max(block_peak);
         writer.write_block(&block.samples)?;
         blocks += 1;
 
@@ -244,11 +262,15 @@ fn cmd_record(args: &Args) -> Result<()> {
     source.stop()?;
 
     println!(
-        "done: {:.2} s, {} samples ({:.1} MiB)",
+        "done: {:.2} s, {} samples ({:.1} MiB), peak {:.3} FS",
         seconds_recorded,
         samples,
-        samples as f64 * 4.0 / MB
+        samples as f64 * 4.0 / MB,
+        peak
     );
+    if peak >= 0.99 {
+        println!("warning: peak sample is at full scale; reduce gain to avoid ADC clipping");
+    }
     println!("  {}.sigmf-data", out_path.display());
     println!("  {}.sigmf-meta", out_path.display());
     Ok(())
@@ -382,6 +404,84 @@ fn cmd_am(args: &Args) -> Result<()> {
         output_rate_hz: audio_rate,
         offset_hz,
         bandwidth_hz,
+    });
+    let mut audio = Vec::new();
+    loop {
+        let block = reader.read_block(65_536)?;
+        if block.is_empty() {
+            break;
+        }
+        demod.process(&block, &mut audio);
+    }
+    if audio.is_empty() {
+        bail!("no audio produced (empty capture?)");
+    }
+
+    normalize(&mut audio);
+    let peak = audio.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+    let rms = (audio.iter().map(|s| s * s).sum::<f32>() / audio.len() as f32).sqrt();
+
+    write_wav(&out, &audio, audio_rate.round() as u32)?;
+    println!(
+        "wrote {} ({:.2} s, {} samples, peak {:.2}, rms {:.3})",
+        out.display(),
+        audio.len() as f64 / audio_rate,
+        audio.len(),
+        peak,
+        rms
+    );
+    Ok(())
+}
+
+fn cmd_fm(args: &Args) -> Result<()> {
+    let path = args.path("file", None)?;
+    let mut reader = SigMfReader::open(&path)?;
+    let spec = reader.spec();
+    let freq_mhz = args.f64("freq", spec.center_freq_hz / 1e6)?;
+    let channel_bandwidth_hz = args.f64("bw", 200_000.0)?;
+    let channel_rate_hz = args.f64("channel-rate", 240_000.0)?;
+    let deemphasis_us = args.f64("deemph", 50.0)?;
+    let audio_bandwidth_hz = args.f64("audio-bw", 15_000.0)?;
+    let audio_rate = args.f64("rate", 48_000.0)?;
+    let out = args
+        .optional_str("out")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!("{}.wav", path.display())));
+
+    if channel_bandwidth_hz <= 0.0 || channel_bandwidth_hz > spec.sample_rate_hz {
+        bail!("--bw must be between 0 and the capture sample rate");
+    }
+    if channel_rate_hz <= 0.0 || channel_rate_hz > spec.sample_rate_hz {
+        bail!("--channel-rate must be between 0 and the capture sample rate");
+    }
+
+    let offset_hz = freq_mhz * 1e6 - spec.center_freq_hz;
+    if offset_hz.abs() > spec.sample_rate_hz * 0.45 {
+        bail!(
+            "channel {:.6} MHz is outside the capture ({:.6} MHz ± {:.3} MHz)",
+            freq_mhz,
+            spec.center_freq_hz / 1e6,
+            spec.sample_rate_hz / 2e6
+        );
+    }
+
+    println!(
+        "FM demod: {:.6} MHz (offset {:+.1} kHz), channel {:.0} Hz, rate {:.0} Hz, de-emph {:.0} us",
+        freq_mhz,
+        offset_hz / 1e3,
+        channel_bandwidth_hz,
+        channel_rate_hz,
+        deemphasis_us
+    );
+
+    let mut demod = FmDemod::new(FmDemodConfig {
+        input_rate_hz: spec.sample_rate_hz,
+        channel_rate_hz,
+        output_rate_hz: audio_rate,
+        offset_hz,
+        channel_bandwidth_hz,
+        deemphasis_us,
+        audio_bandwidth_hz,
     });
     let mut audio = Vec::new();
     loop {

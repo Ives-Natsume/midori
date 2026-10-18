@@ -241,6 +241,8 @@ impl IqSource for LibiioSource {
 
         let actual_rate =
             Self::read_f64_attr(rx, "sampling_frequency").unwrap_or(config.sample_rate_hz);
+        let actual_bandwidth =
+            Self::read_f64_attr(rx, "rf_bandwidth").unwrap_or(config.bandwidth_hz);
         let actual_gain = Self::read_f64_attr(rx, "hardwaregain").unwrap_or(config.gain_db);
 
         let i_chan = self.rx_channel("voltage0")?;
@@ -252,12 +254,14 @@ impl IqSource for LibiioSource {
         let mut actual_config = config.clone();
         actual_config.center_freq_hz = actual_freq;
         actual_config.sample_rate_hz = actual_rate;
+        actual_config.bandwidth_hz = actual_bandwidth;
         actual_config.gain_db = actual_gain;
         self.config = Some(actual_config);
 
         let spec = StreamSpec {
             sample_rate_hz: actual_rate,
             center_freq_hz: actual_freq,
+            bandwidth_hz: actual_bandwidth,
             format: SampleFormat::Ci16Le,
             full_scale,
         };

@@ -1,12 +1,16 @@
-//! Core types shared by every Midori component.
+//! Core types and contracts shared by every Midori component.
 //!
 //! The core deliberately knows nothing about a particular SDR, UI toolkit, or
-//! decoder. Hardware backends produce [`IqBlock`]s, DSP stages consume them,
-//! and sinks (waterfall, audio, recorder, decoder sidecars) consume the output.
+//! decoder. Hardware backends produce [`IqBlock`]s, channels turn them into
+//! typed [`Frame`]s, and sinks (waterfall, audio, recorder, decoder sidecars)
+//! consume the output.
+//!
+//! Units are always SI: hertz, seconds, dBFS, UTC nanoseconds. Keep it that way.
 
 use std::sync::Arc;
 
 use num_complex::Complex32;
+use serde::{Deserialize, Serialize};
 
 /// The sample type used inside the engine.
 ///
@@ -15,7 +19,8 @@ use num_complex::Complex32;
 pub type Sample = Complex32;
 
 /// On-disk / on-wire sample formats a source or recorder may use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SampleFormat {
     /// Interleaved signed 16-bit little-endian I/Q.
     Ci16Le,
@@ -24,10 +29,13 @@ pub enum SampleFormat {
 }
 
 /// Everything a downstream stage needs to interpret a block.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct StreamSpec {
     pub sample_rate_hz: f64,
     pub center_freq_hz: f64,
+    /// Bandwidth of the signal represented by this stream. For IQ this is the
+    /// source RF bandwidth; for audio it is the audio bandwidth.
+    pub bandwidth_hz: f64,
     pub format: SampleFormat,
     /// Integer value corresponding to a full-scale sample in the source's
     /// native format. Pluto's 12-bit ADC, stored in 16-bit words, uses 2048.
@@ -36,7 +44,7 @@ pub struct StreamSpec {
 }
 
 /// Non-fatal conditions attached to a block.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockFlags {
     /// The source reported a buffer overrun before this block.
     pub overflow: bool,
@@ -79,10 +87,187 @@ impl IqBlock {
     pub fn is_empty(&self) -> bool {
         self.samples.is_empty()
     }
+
+    /// Metadata for this block as a generic frame.
+    pub fn meta(&self, seq: u64) -> FrameMeta {
+        FrameMeta {
+            seq,
+            start_sample: self.start_sample,
+            timestamp_ns: self.timestamp_ns,
+            sample_rate_hz: self.spec.sample_rate_hz,
+            center_freq_hz: self.spec.center_freq_hz,
+            bandwidth_hz: self.spec.bandwidth_hz,
+            flags: self.flags,
+        }
+    }
+
+    /// Convert into a generic IQ frame, typically for a wideband sink such as
+    /// a recorder or an IQ decoder plugin.
+    pub fn into_frame(self, seq: u64) -> Frame {
+        let meta = self.meta(seq);
+        Frame {
+            meta,
+            data: StreamData::Iq(self.samples),
+        }
+    }
+}
+
+/// Metadata carried by every frame between the engine and a sink/plugin.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct FrameMeta {
+    /// Monotonic sequence number within a stream.
+    pub seq: u64,
+    /// Index of the first sample since the start of the stream.
+    pub start_sample: u64,
+    /// UTC timestamp of the first sample, when known.
+    pub timestamp_ns: Option<u64>,
+    pub sample_rate_hz: f64,
+    pub center_freq_hz: f64,
+    pub bandwidth_hz: f64,
+    pub flags: BlockFlags,
+}
+
+/// The payload types that can cross a stream boundary.
+#[derive(Debug, Clone)]
+pub enum StreamData {
+    /// Complex baseband IQ.
+    Iq(Arc<[Sample]>),
+    /// Mono real audio, normalised to roughly [-1, 1].
+    Audio(Arc<[f32]>),
+    /// Soft bits / LLRs, one byte per symbol unless documented otherwise.
+    SoftBits(Arc<[u8]>),
+    /// Framed or raw bytes, e.g. AX.25 frames or SSDV packets.
+    Bytes(Arc<[u8]>),
+}
+
+impl StreamData {
+    pub fn kind(&self) -> StreamKind {
+        match self {
+            Self::Iq(_) => StreamKind::Iq,
+            Self::Audio(_) => StreamKind::Audio,
+            Self::SoftBits(_) => StreamKind::SoftBits,
+            Self::Bytes(_) => StreamKind::Bytes,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Iq(samples) => samples.len(),
+            Self::Audio(samples) => samples.len(),
+            Self::SoftBits(bits) => bits.len(),
+            Self::Bytes(bytes) => bytes.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamKind {
+    Iq,
+    Audio,
+    SoftBits,
+    Bytes,
+}
+
+/// A typed frame plus its timing/frequency metadata.
+#[derive(Debug, Clone)]
+pub struct Frame {
+    pub meta: FrameMeta,
+    pub data: StreamData,
+}
+
+impl Frame {
+    pub fn new(meta: FrameMeta, data: StreamData) -> Self {
+        Self { meta, data }
+    }
+}
+
+/// Digital VFO / channel definition. The hardware LO stays fixed; this offset
+/// selects a channel inside the captured band.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VfoConfig {
+    pub id: VfoId,
+    /// Offset from the source centre frequency.
+    pub offset_hz: f64,
+    /// Channel bandwidth.
+    pub bandwidth_hz: f64,
+    pub demod: DemodMode,
+    pub audio_rate_hz: f64,
+}
+
+pub type VfoId = u32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DemodMode {
+    Am,
+    Fm,
+    Usb,
+    Lsb,
+    Cw,
+}
+
+impl VfoConfig {
+    pub fn new(id: VfoId, offset_hz: f64, bandwidth_hz: f64, demod: DemodMode) -> Self {
+        Self {
+            id,
+            offset_hz,
+            bandwidth_hz,
+            demod,
+            audio_rate_hz: 48_000.0,
+        }
+    }
+}
+
+/// A channel turns wideband IQ into one or more typed frames (audio, soft
+/// bits, bytes, or a narrower IQ stream).
+pub trait Channel: Send {
+    fn config(&self) -> &VfoConfig;
+
+    /// Process one source block. Implementations append zero or more frames.
+    fn process(&mut self, iq: &IqBlock, out: &mut Vec<Frame>) -> anyhow::Result<()>;
+}
+
+/// A consumer of frames: recorder, audio device, waterfall, plugin, ...
+pub trait Sink: Send {
+    fn on_frame(&mut self, frame: Frame) -> anyhow::Result<()>;
+
+    fn flush(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SessionStats {
+    pub blocks: u64,
+    pub samples: u64,
+    pub frames: u64,
+    pub dropped: u64,
+}
+
+/// The runtime that owns a source, its channels, and its sinks.
+///
+/// A concrete implementation will be added with the live-audio/VFO work. The
+/// important part for now is that the application talks to a session rather
+/// than to libiio directly.
+pub trait Session: Send {
+    fn spec(&self) -> Option<StreamSpec>;
+
+    fn start(&mut self) -> anyhow::Result<()>;
+
+    /// Read and process one source block.
+    fn step(&mut self) -> anyhow::Result<SessionStats>;
+
+    fn stop(&mut self) -> anyhow::Result<()>;
 }
 
 /// Gain control modes exposed by AD9361-style front ends.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum GainMode {
     #[default]
     Manual,
