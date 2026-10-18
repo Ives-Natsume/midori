@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{Local, Utc};
 use crossbeam_channel::{Receiver, Sender, bounded};
@@ -20,7 +20,7 @@ use midori_config::{AppConfig, Colormap, DecoderTab, Theme};
 use midori_core::{DemodMode, Session, Sink, SourceConfig, StreamSpec, VfoConfig};
 use midori_dsp::median;
 use midori_engine::{LiveSession, PluginHandle, PluginSink, RecorderSink, VfoChannel, plugin_sink};
-use midori_orbit::{GridSquare, Pass, PassPredictor, Tle};
+use midori_orbit::{GridSquare, Pass, PassPredictor, Sgp4Doppler, Tle};
 use midori_plugin::{
     DisplayUpdate, InputSpec, Manifest, OutputKind, PROTOCOL_VERSION, PluginEvent, PluginHost,
     SidecarPlugin,
@@ -54,12 +54,24 @@ struct WorkerOptions {
     cw_tone_hz: f64,
     source_uri: String,
     fft_size: usize,
+    doppler: Option<DopplerOptions>,
+}
+
+struct DopplerOptions {
+    tle_path: PathBuf,
+    grid: String,
+    downlink_hz: f64,
 }
 
 enum WorkerEvent {
     Connected(StreamSpec),
+    Info(String),
     Error(String),
     Fatal(String),
+    Doppler {
+        offset_hz: f64,
+        rate_hz_s: f64,
+    },
     RecordingStarted(PathBuf),
     RecordingError(String),
     RecordingStopped {
@@ -114,6 +126,9 @@ pub struct MidoriApp {
     satellite_name: String,
     passes: Vec<Pass>,
     pass_status: String,
+    doppler_tracking: bool,
+    doppler_hz: f64,
+    doppler_rate_hz_s: f64,
     log: VecDeque<String>,
 
     is_connected: bool,
@@ -147,6 +162,8 @@ impl Default for MidoriApp {
         let grid_input = config.satellite.grid.clone();
         let min_elev_input = format!("{:.1}", config.satellite.min_elevation_deg);
         let cw_enabled = config.decoder.cw_enabled;
+        let doppler_tracking =
+            std::env::var_os("MIDORI_DOPPLER").is_some() || config.satellite.doppler_tracking;
 
         Self {
             config,
@@ -182,6 +199,9 @@ impl Default for MidoriApp {
             satellite_name: "No TLE loaded".to_string(),
             passes: Vec::new(),
             pass_status: "Load a TLE and predict passes".to_string(),
+            doppler_tracking,
+            doppler_hz: 0.0,
+            doppler_rate_hz_s: 0.0,
             log: VecDeque::with_capacity(200),
             is_connected: false,
             is_connecting: false,
@@ -253,6 +273,11 @@ impl MidoriApp {
         let source_uri = source.uri.clone();
         let fft_size = self.config.ui.fft_size;
         let cw_enabled = self.cw_enabled;
+        let doppler = self.doppler_tracking.then(|| DopplerOptions {
+            tle_path: PathBuf::from(&self.tle_path),
+            grid: self.grid_input.clone(),
+            downlink_hz: freq_mhz * 1e6,
+        });
 
         let (data_tx, data_rx) = bounded(4);
         let (event_tx, event_rx) = bounded(64);
@@ -264,6 +289,7 @@ impl MidoriApp {
             cw_tone_hz,
             source_uri,
             fft_size,
+            doppler,
         };
 
         match thread::Builder::new()
@@ -302,6 +328,8 @@ impl MidoriApp {
         self.is_connecting = false;
         self.is_recording = false;
         self.recording_path = None;
+        self.doppler_hz = 0.0;
+        self.doppler_rate_hz_s = 0.0;
         self.current_spectrum.clear();
         self.waterfall_rows.clear();
         self.waterfall_texture = None;
@@ -412,6 +440,7 @@ impl MidoriApp {
         self.config.ui.colormap = self.colormap;
         self.config.satellite.tle_path = self.tle_path.clone();
         self.config.satellite.grid = self.grid_input.clone();
+        self.config.satellite.doppler_tracking = self.doppler_tracking;
         self.config.sanitize();
 
         match self.config.save(&self.config_path) {
@@ -452,6 +481,7 @@ impl MidoriApp {
         self.tle_path = config.satellite.tle_path.clone();
         self.grid_input = config.satellite.grid.clone();
         self.min_elev_input = format!("{:.1}", config.satellite.min_elevation_deg);
+        self.doppler_tracking = config.satellite.doppler_tracking;
 
         apply_theme(ctx, config.ui.theme);
         self.status_msg = if self.is_connected || self.is_connecting {
@@ -569,6 +599,16 @@ impl MidoriApp {
                         spec.sample_rate_hz / 1e6
                     );
                     self.push_log(self.status_msg.clone());
+                }
+                WorkerEvent::Doppler {
+                    offset_hz,
+                    rate_hz_s,
+                } => {
+                    self.doppler_hz = offset_hz;
+                    self.doppler_rate_hz_s = rate_hz_s;
+                }
+                WorkerEvent::Info(message) => {
+                    self.push_log(message);
                 }
                 WorkerEvent::Error(message) => {
                     self.push_log(format!("error: {message}"));
@@ -788,7 +828,21 @@ impl MidoriApp {
                         self.start_recording();
                     }
                 }
-                ui.label(egui::RichText::new("Track: SGP4 next").weak());
+                if self.doppler_tracking {
+                    let text = if self.is_connected || self.is_connecting {
+                        format!(
+                            "Doppler {:+.0} Hz ({:+.1} Hz/s)",
+                            self.doppler_hz, self.doppler_rate_hz_s
+                        )
+                    } else {
+                        "Doppler: armed".to_string()
+                    };
+                    ui.label(
+                        egui::RichText::new(text).color(egui::Color32::from_rgb(120, 220, 180)),
+                    );
+                } else {
+                    ui.label(egui::RichText::new("Track: off").weak());
+                }
             });
 
             ui.horizontal(|ui| {
@@ -1210,7 +1264,30 @@ impl MidoriApp {
                             self.decoder_tab = DecoderTab::Passes;
                             self.decoder_dock_open = true;
                         }
-                        ui.label(egui::RichText::new("Doppler tracking: next step").weak());
+                        let previous = self.doppler_tracking;
+                        ui.checkbox(&mut self.doppler_tracking, "Track Doppler (SGP4)");
+                        if self.doppler_tracking != previous
+                            && (self.is_connected || self.is_connecting)
+                        {
+                            self.status_msg = "Reconnect to apply Doppler tracking".to_string();
+                        }
+                        if self.doppler_tracking {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "shift {:+.0} Hz   rate {:+.1} Hz/s",
+                                    self.doppler_hz, self.doppler_rate_hz_s
+                                ))
+                                .monospace(),
+                            );
+                            ui.label(
+                                egui::RichText::new(
+                                    "keep the LO on the nominal downlink; the VFO corrects",
+                                )
+                                .weak(),
+                            );
+                        } else {
+                            ui.label(egui::RichText::new("Doppler tracking off").weak());
+                        }
                     });
 
                 egui::CollapsingHeader::new("Keyboard shortcuts")
@@ -1574,6 +1651,49 @@ fn start_cw_plugin(
     Some((sink, handle))
 }
 
+fn build_doppler(
+    options: &DopplerOptions,
+    event_tx: &Sender<WorkerEvent>,
+) -> Option<Box<dyn midori_core::DopplerSource>> {
+    let tle = match Tle::from_file(&options.tle_path) {
+        Ok(tle) => tle,
+        Err(error) => {
+            let _ = event_tx.try_send(WorkerEvent::Error(format!(
+                "Doppler: could not load TLE {}: {error}",
+                options.tle_path.display()
+            )));
+            return None;
+        }
+    };
+    let grid = match GridSquare::parse(&options.grid) {
+        Ok(grid) => grid,
+        Err(error) => {
+            let _ = event_tx.try_send(WorkerEvent::Error(format!(
+                "Doppler: invalid grid '{}': {error}",
+                options.grid
+            )));
+            return None;
+        }
+    };
+    let predictor = match PassPredictor::new(&tle, grid.observer(0.0)) {
+        Ok(predictor) => predictor,
+        Err(error) => {
+            let _ = event_tx.try_send(WorkerEvent::Error(format!(
+                "Doppler: SGP4 setup failed: {error}"
+            )));
+            return None;
+        }
+    };
+    let _ = event_tx.try_send(WorkerEvent::Info(format!(
+        "Doppler: tracking {} at {:.6} MHz",
+        tle.name
+            .clone()
+            .unwrap_or_else(|| format!("NORAD {}", tle.norad_id)),
+        options.downlink_hz / 1e6
+    )));
+    Some(Box::new(Sgp4Doppler::new(predictor, options.downlink_hz)))
+}
+
 fn run_worker(
     config: SourceConfig,
     mut vfo: VfoConfig,
@@ -1591,6 +1711,12 @@ fn run_worker(
             return;
         }
     };
+
+    let doppler = options
+        .doppler
+        .as_ref()
+        .and_then(|doppler| build_doppler(doppler, &event_tx));
+    let doppler_active = doppler.is_some();
 
     let (audio_output, audio_producer) = match AudioOutput::open() {
         Ok((output, producer)) => (Some(output), Some(producer)),
@@ -1635,6 +1761,7 @@ fn run_worker(
 
     let channel = VfoChannel::new(vfo);
     let mut session = LiveSession::new(config, Box::new(source), vec![Box::new(channel)], sinks);
+    session.set_doppler_source(doppler);
     let _audio_output = audio_output;
 
     if let Err(error) = session.start() {
@@ -1660,6 +1787,8 @@ fn run_worker(
     let _ = event_tx.try_send(WorkerEvent::Connected(spec));
 
     let mut plugin_events = 0u64;
+    let track_doppler = doppler_active;
+    let mut last_doppler_event: Option<Instant> = None;
     while !stop.load(Ordering::SeqCst) {
         while let Ok(command) = cmd_rx.try_recv() {
             match command {
@@ -1729,6 +1858,19 @@ fn run_worker(
             eprintln!("[worker] receive failed: {error}");
             let _ = event_tx.try_send(WorkerEvent::Fatal(format!("receive failed: {error}")));
             break;
+        }
+
+        if track_doppler {
+            let now = Instant::now();
+            let due = last_doppler_event
+                .is_none_or(|last| now.duration_since(last) >= Duration::from_millis(500));
+            if due {
+                last_doppler_event = Some(now);
+                let _ = event_tx.try_send(WorkerEvent::Doppler {
+                    offset_hz: session.doppler_hz(),
+                    rate_hz_s: session.doppler_rate_hz_s(),
+                });
+            }
         }
 
         if let Some(error) = recorder_handle.take_error() {

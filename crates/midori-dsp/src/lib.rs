@@ -341,6 +341,13 @@ impl AmDemod {
         self.config.output_rate_hz
     }
 
+    /// Retune the NCO without resetting the filter state. Used for Doppler
+    /// correction, so phase stays continuous across frequency updates.
+    pub fn set_offset(&mut self, offset_hz: f64) {
+        self.config.offset_hz = offset_hz;
+        self.phase_inc = 2.0 * std::f64::consts::PI * offset_hz / self.config.input_rate_hz;
+    }
+
     /// Append demodulated audio to `output`.
     pub fn process(&mut self, input: &[Sample], output: &mut Vec<f32>) {
         for sample in input {
@@ -500,6 +507,7 @@ pub struct ComplexChannelizer {
     lp_q: Lowpass4,
     decimation: usize,
     count: usize,
+    input_rate_hz: f64,
     output_rate_hz: f64,
 }
 
@@ -516,6 +524,7 @@ impl ComplexChannelizer {
             lp_q: Lowpass4::new(input_rate_hz, cutoff),
             decimation,
             count: 0,
+            input_rate_hz,
             output_rate_hz: actual_output_rate,
         }
     }
@@ -524,8 +533,8 @@ impl ComplexChannelizer {
         self.output_rate_hz
     }
 
-    pub fn set_offset(&mut self, input_rate_hz: f64, offset_hz: f64) {
-        self.nco.set_offset(input_rate_hz, offset_hz);
+    pub fn set_offset(&mut self, offset_hz: f64) {
+        self.nco.set_offset(self.input_rate_hz, offset_hz);
     }
 
     /// Append decimated complex baseband samples to `output`.
@@ -662,6 +671,11 @@ impl FmDemod {
         self.channel_rate_hz / self.resample_step
     }
 
+    /// Retune the channel NCO while keeping filter/discriminator state.
+    pub fn set_offset(&mut self, offset_hz: f64) {
+        self.channelizer.set_offset(offset_hz);
+    }
+
     /// Append demodulated audio to `output`.
     pub fn process(&mut self, input: &[Sample], output: &mut Vec<f32>) {
         self.baseband.clear();
@@ -783,6 +797,11 @@ impl CwDemod {
 
     pub fn output_rate_hz(&self) -> f64 {
         self.channel_rate_hz / self.resample_step
+    }
+
+    /// Retune the channel NCO while keeping filter and BFO state.
+    pub fn set_offset(&mut self, offset_hz: f64) {
+        self.channelizer.set_offset(offset_hz);
     }
 
     pub fn process(&mut self, input: &[Sample], output: &mut Vec<f32>) {

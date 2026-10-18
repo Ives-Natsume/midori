@@ -40,6 +40,8 @@ Doppler correction, recording, and plugins for SSTV/SSDV/FT4/CW.
   cannot block the SDR worker.
 - TLE parsing with checksums, Maidenhead grid conversion, SGP4 pass
   prediction, and Doppler range-rate calculation.
+- Live SGP4 Doppler correction applied to the digital VFO (single satellite,
+  armed before connecting), with offset/rate shown in the UI.
 - TOML configuration with compiled fallbacks, manual save, and reload.
 - Doppler metadata and `DopplerSource`/`TrackingConfig` contracts.
 - Unit tests for the spectrum analyser, AM/FM demodulators, SigMF round-trip,
@@ -134,7 +136,12 @@ The desktop UI uses a fixed three-column layout:
 
 The Passes tab loads a TLE file, converts a Maidenhead locator, and predicts
 the next 24 hours of passes with SGP4. The placeholder grid is `PM95`; pass
-times are UTC. `MIDORI_CW` and `MIDORI_AUTOCONNECT` are handy for development.
+times are UTC. `MIDORI_CW`, `MIDORI_DOPPLER`, and `MIDORI_AUTOCONNECT` are handy
+for development.
+
+Enable **Track Doppler (SGP4)** in the Satellite panel before connecting to
+apply range-rate correction to the digital VFO. Keep the hardware LO on the
+nominal downlink; the VFO offset and rate are shown in the receiver strip.
 
 ## Configuration
 
@@ -232,10 +239,10 @@ The plugin protocol and sidecar ABI are documented in
 
 ## Roadmap
 
-1. Wire `Sgp4Doppler` into `LiveSession`/VFO and pass scheduling.
-2. SSB/CW voice demodulation, squelch, and filter controls.
-3. Click-to-tune digital VFOs and shareable presets.
-4. APT/SSTV/SSDV plugins and plugin parameter UI.
+1. SSTV decoder sidecar, then SSDV/APT.
+2. Pass Arm/AOS/LOS automation and automatic Doppler arming.
+3. SSB/CW voice demodulation, squelch, and filter controls.
+4. Click-to-tune digital VFOs and shareable presets.
 5. SigMF browse/playback, packaging, and cross-platform audio.
 
 ## License

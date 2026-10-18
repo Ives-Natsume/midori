@@ -30,6 +30,12 @@ impl Sgp4Doppler {
     pub fn predictor(&self) -> &PassPredictor {
         &self.predictor
     }
+
+    /// Change the downlink used to scale the range rate. Called when the user
+    /// retunes the receiver while tracking.
+    pub fn set_downlink_hz(&mut self, downlink_hz: f64) {
+        self.downlink_hz = downlink_hz;
+    }
 }
 
 impl DopplerSource for Sgp4Doppler {
@@ -49,6 +55,10 @@ impl DopplerSource for Sgp4Doppler {
         let before = self.offset_at(before).unwrap_or(0.0);
         let after = self.offset_at(after).unwrap_or(0.0);
         after - before
+    }
+
+    fn set_nominal_hz(&mut self, hz: f64) {
+        self.set_downlink_hz(hz);
     }
 }
 

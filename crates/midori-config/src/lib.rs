@@ -203,6 +203,8 @@ pub struct SatelliteSettings {
     pub grid: String,
     pub min_elevation_deg: f64,
     pub auto_predict: bool,
+    /// Apply SGP4 Doppler correction to the digital VFO while connected.
+    pub doppler_tracking: bool,
 }
 
 impl Default for SatelliteSettings {
@@ -212,6 +214,7 @@ impl Default for SatelliteSettings {
             grid: String::new(),
             min_elevation_deg: 5.0,
             auto_predict: false,
+            doppler_tracking: false,
         }
     }
 }

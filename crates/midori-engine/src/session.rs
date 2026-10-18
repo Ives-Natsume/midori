@@ -5,10 +5,11 @@
 //! its own typed frames (audio, soft bits, bytes).
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use midori_core::{
-    Channel, Frame, IqSource, Session, SessionStats, Sink, SourceConfig, StreamSpec,
+    Channel, DopplerSource, Frame, IqSource, Session, SessionStats, Sink, SourceConfig, StreamSpec,
 };
 
 pub struct LiveSession {
@@ -16,6 +17,9 @@ pub struct LiveSession {
     source: Box<dyn IqSource>,
     channels: Vec<Box<dyn Channel>>,
     sinks: Vec<Box<dyn Sink>>,
+    doppler: Option<Box<dyn DopplerSource>>,
+    doppler_hz: f64,
+    doppler_rate_hz_s: f64,
     spec: Option<StreamSpec>,
     seq: u64,
     stats: SessionStats,
@@ -34,11 +38,40 @@ impl LiveSession {
             source,
             channels,
             sinks,
+            doppler: None,
+            doppler_hz: 0.0,
+            doppler_rate_hz_s: 0.0,
             spec: None,
             seq: 0,
             stats: SessionStats::default(),
             frames: Vec::new(),
         }
+    }
+
+    /// Install (or remove) the Doppler source used for every channel.
+    pub fn set_doppler_source(&mut self, doppler: Option<Box<dyn DopplerSource>>) {
+        let was_tracking = self.doppler.is_some();
+        self.doppler = doppler;
+        self.doppler_hz = 0.0;
+        self.doppler_rate_hz_s = 0.0;
+        if self.doppler.is_none() && was_tracking {
+            for channel in &mut self.channels {
+                channel.set_doppler(0.0, 0.0);
+            }
+        }
+        if let Some(spec) = self.spec {
+            self.update_nominal_frequency(spec.center_freq_hz);
+        }
+    }
+
+    /// Last correction applied to the channels, Hz.
+    pub fn doppler_hz(&self) -> f64 {
+        self.doppler_hz
+    }
+
+    /// Last Doppler rate, Hz/s.
+    pub fn doppler_rate_hz_s(&self) -> f64 {
+        self.doppler_rate_hz_s
     }
 
     pub fn current_spec(&self) -> Option<StreamSpec> {
@@ -50,11 +83,26 @@ impl LiveSession {
         if let Some(spec) = &mut self.spec {
             spec.center_freq_hz = hz;
         }
+        self.update_nominal_frequency(hz);
         Ok(())
     }
 
     pub fn set_gain(&mut self, db: f64) -> Result<()> {
         self.source.set_gain(db)
+    }
+
+    /// Tell the Doppler source which RF frequency the channels are tuned to.
+    /// With a single VFO this is the LO plus the configured VFO offset.
+    fn update_nominal_frequency(&mut self, center_freq_hz: f64) {
+        let Some(doppler) = self.doppler.as_mut() else {
+            return;
+        };
+        let offset_hz = self
+            .channels
+            .first()
+            .map(|channel| channel.config().offset_hz)
+            .unwrap_or(0.0);
+        doppler.set_nominal_hz(center_freq_hz + offset_hz);
     }
 
     /// Start, loop until `stop` is set, then stop. Useful for tests and simple
@@ -84,6 +132,7 @@ impl Session for LiveSession {
         }
         self.source.start()?;
         self.spec = Some(spec);
+        self.update_nominal_frequency(spec.center_freq_hz);
         self.stats = SessionStats::default();
         self.seq = 0;
         Ok(())
@@ -100,6 +149,18 @@ impl Session for LiveSession {
         self.seq += 1;
         for sink in &mut self.sinks {
             sink.on_frame(iq_frame.clone())?;
+        }
+
+        // Compute the correction once per block, then hand it to every VFO.
+        // Updating NCO phase increments (not phase) keeps the mixers
+        // phase-continuous across block boundaries.
+        if let Some(doppler) = self.doppler.as_ref() {
+            let utc_ns = block.timestamp_ns.unwrap_or_else(now_ns);
+            self.doppler_hz = doppler.offset_hz(utc_ns);
+            self.doppler_rate_hz_s = doppler.rate_hz_s(utc_ns);
+            for channel in &mut self.channels {
+                channel.set_doppler(self.doppler_hz, self.doppler_rate_hz_s);
+            }
         }
 
         // Then run the digital channels.
@@ -128,9 +189,17 @@ impl Session for LiveSession {
     }
 }
 
+fn now_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use midori_core::{
@@ -242,6 +311,25 @@ mod tests {
         }
     }
 
+    struct DopplerRecordingChannel {
+        config: VfoConfig,
+        seen: Arc<Mutex<Vec<(f64, f64)>>>,
+    }
+
+    impl Channel for DopplerRecordingChannel {
+        fn config(&self) -> &VfoConfig {
+            &self.config
+        }
+
+        fn set_doppler(&mut self, offset_hz: f64, rate_hz_s: f64) {
+            self.seen.lock().unwrap().push((offset_hz, rate_hz_s));
+        }
+
+        fn process(&mut self, _iq: &IqBlock, _out: &mut Vec<Frame>) -> Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn session_fans_out_iq_and_audio() {
         let spec = StreamSpec {
@@ -279,5 +367,42 @@ mod tests {
         assert_eq!(second.blocks, 2);
         assert_eq!(iq_count.load(Ordering::SeqCst), 2);
         assert_eq!(audio_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn session_applies_doppler_to_every_channel() {
+        let spec = StreamSpec {
+            sample_rate_hz: 2_400_000.0,
+            center_freq_hz: 145_800_000.0,
+            bandwidth_hz: 2_000_000.0,
+            format: SampleFormat::Cf32Le,
+            full_scale: 1.0,
+        };
+        let source = MockSource { spec, remaining: 2 };
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let channel = DopplerRecordingChannel {
+            config: VfoConfig::new(0, 0.0, 15_000.0, DemodMode::Fm),
+            seen: Arc::clone(&seen),
+        };
+
+        let mut session = LiveSession::new(
+            SourceConfig::default(),
+            Box::new(source),
+            vec![Box::new(channel)],
+            Vec::new(),
+        );
+        session.set_doppler_source(Some(Box::new(midori_core::FixedDoppler {
+            offset_hz: 1_500.0,
+        })));
+        session.start().unwrap();
+        session.step().unwrap();
+        session.step().unwrap();
+        session.stop().unwrap();
+
+        assert_eq!(session.doppler_hz(), 1_500.0);
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &[(1_500.0, 0.0), (1_500.0, 0.0)]
+        );
     }
 }

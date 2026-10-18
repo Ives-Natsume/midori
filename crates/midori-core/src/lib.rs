@@ -271,6 +271,10 @@ pub trait DopplerSource: Send {
     fn rate_hz_s(&self, _utc_ns: u64) -> f64 {
         0.0
     }
+
+    /// Update the nominal signal frequency the correction is computed for.
+    /// Called when the hardware LO changes.
+    fn set_nominal_hz(&mut self, _hz: f64) {}
 }
 
 /// A fixed Doppler offset, useful for tests and manual operation.
@@ -294,6 +298,11 @@ pub trait Channel: Send {
     fn configure(&mut self, _spec: &StreamSpec) -> anyhow::Result<()> {
         Ok(())
     }
+
+    /// Apply the current Doppler correction. `offset_hz` is an absolute shift
+    /// added to the channel offset; `rate_hz_s` is informational and may be
+    /// exposed in frame metadata.
+    fn set_doppler(&mut self, _offset_hz: f64, _rate_hz_s: f64) {}
 
     /// Process one source block. Implementations append zero or more frames.
     fn process(&mut self, iq: &IqBlock, out: &mut Vec<Frame>) -> anyhow::Result<()>;

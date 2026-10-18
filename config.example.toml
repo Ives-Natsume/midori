@@ -66,3 +66,4 @@ tle_path = ""
 grid = "PM95"
 min_elevation_deg = 5
 auto_predict = false
+doppler_tracking = false
