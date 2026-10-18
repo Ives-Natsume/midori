@@ -37,7 +37,10 @@ impl Sink for PluginSink {
             .host
             .lock()
             .map_err(|error| anyhow!("plugin lock poisoned: {error}"))?;
-        host.send_frame(frame)
+        if let Err(error) = host.send_frame(frame) {
+            eprintln!("[plugin] frame dropped: {error}");
+        }
+        Ok(())
     }
 }
 

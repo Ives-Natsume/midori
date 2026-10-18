@@ -84,6 +84,7 @@ fn cw_sidecar_decodes_cq() {
         plugin
             .send_frame(Frame::new(meta, StreamData::Audio(samples)))
             .expect("send audio");
+        std::thread::sleep(Duration::from_millis(2));
     }
 
     let deadline = Instant::now() + Duration::from_secs(3);

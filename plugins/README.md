@@ -87,6 +87,20 @@ AFC/tone tracking, but it must not compute SGP4 or retune hardware.
 Raw IQ streams are not enabled for sidecars yet. When they are added they will
 use shared memory; the current audio/byte path is pipe-friendly.
 
+## Timeouts and backpressure
+
+The host runs one reader thread and one writer thread per plugin, both with
+bounded queues. The SDR worker never writes to a pipe directly.
+
+- `hello` timeout: 3 s
+- `ready` timeout: 3 s
+- outbound queue: 32 frames; when full, the audio frame is dropped and the
+  engine logs `[plugin] frame dropped: ...`
+- shutdown wait: 1 s, then the child is killed
+
+A plugin that hangs during handshake is killed and reported as an error. A
+slow decoder cannot stall the receiver or the waterfall.
+
 ## Events
 
 A plugin can emit:
