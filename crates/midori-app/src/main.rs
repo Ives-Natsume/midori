@@ -1,4 +1,6 @@
 mod app;
+mod audio;
+mod sinks;
 
 use app::MidoriApp;
 use eframe::egui;

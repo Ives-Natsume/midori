@@ -388,6 +388,67 @@ impl AmDemod {
 }
 
 // ---------------------------------------------------------------------------
+// Audio AGC
+// ---------------------------------------------------------------------------
+
+/// Simple per-sample AGC for demodulated audio.
+///
+/// It is intentionally gentle and cheap; it is not a broadcast-grade
+/// compressor. The goal is to keep FM discriminator output (which is in Hz)
+/// and AM envelope output in a usable range for the sound card.
+#[derive(Debug, Clone)]
+pub struct AudioAgc {
+    gain: f32,
+    target: f32,
+    attack: f32,
+    release: f32,
+    min_gain: f32,
+    max_gain: f32,
+}
+
+impl Default for AudioAgc {
+    fn default() -> Self {
+        Self {
+            gain: 1.0,
+            target: 0.25,
+            attack: 0.02,
+            release: 0.0005,
+            min_gain: 1e-5,
+            max_gain: 1_000.0,
+        }
+    }
+}
+
+impl AudioAgc {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn process(&mut self, samples: &mut [f32]) {
+        for sample in samples {
+            let magnitude = sample.abs();
+            let desired = if magnitude > 1e-6 {
+                self.target / magnitude
+            } else {
+                self.gain
+            };
+            let coefficient = if desired < self.gain {
+                self.attack
+            } else {
+                self.release
+            };
+            self.gain = (self.gain + coefficient * (desired - self.gain))
+                .clamp(self.min_gain, self.max_gain);
+            *sample = (*sample * self.gain).clamp(-1.0, 1.0);
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.gain = 1.0;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // FM demodulator
 // ---------------------------------------------------------------------------
 

@@ -11,11 +11,12 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+cpal.workspace = true
 crossbeam-channel.workspace = true
 eframe.workspace = true
 egui.workspace = true
 egui_plot.workspace = true
 midori-core.workspace = true
 midori-dsp.workspace = true
-midori-sigmf.workspace = true
+midori-engine.workspace = true
 midori-source-libiio.workspace = true

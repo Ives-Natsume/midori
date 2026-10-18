@@ -97,6 +97,7 @@ impl IqBlock {
             sample_rate_hz: self.spec.sample_rate_hz,
             center_freq_hz: self.spec.center_freq_hz,
             bandwidth_hz: self.spec.bandwidth_hz,
+            vfo_id: None,
             flags: self.flags,
         }
     }
@@ -124,6 +125,8 @@ pub struct FrameMeta {
     pub sample_rate_hz: f64,
     pub center_freq_hz: f64,
     pub bandwidth_hz: f64,
+    /// Which digital VFO produced this frame, if any.
+    pub vfo_id: Option<VfoId>,
     pub flags: BlockFlags,
 }
 
@@ -197,6 +200,12 @@ pub struct VfoConfig {
     pub bandwidth_hz: f64,
     pub demod: DemodMode,
     pub audio_rate_hz: f64,
+    /// Intermediate complex sample rate after channel selection.
+    pub channel_rate_hz: f64,
+    /// Audio bandwidth passed by the demodulator.
+    pub audio_bandwidth_hz: f64,
+    /// FM de-emphasis in microseconds; 0 disables it.
+    pub deemphasis_us: f64,
 }
 
 pub type VfoId = u32;
@@ -219,6 +228,9 @@ impl VfoConfig {
             bandwidth_hz,
             demod,
             audio_rate_hz: 48_000.0,
+            channel_rate_hz: 240_000.0,
+            audio_bandwidth_hz: 15_000.0,
+            deemphasis_us: 50.0,
         }
     }
 }
@@ -227,6 +239,11 @@ impl VfoConfig {
 /// bits, bytes, or a narrower IQ stream).
 pub trait Channel: Send {
     fn config(&self) -> &VfoConfig;
+
+    /// Called once the source sample rate/centre frequency are known.
+    fn configure(&mut self, _spec: &StreamSpec) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     /// Process one source block. Implementations append zero or more frames.
     fn process(&mut self, iq: &IqBlock, out: &mut Vec<Frame>) -> anyhow::Result<()>;

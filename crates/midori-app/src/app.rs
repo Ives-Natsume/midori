@@ -15,10 +15,12 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
 
-use midori_core::{GainMode, IqSource, SourceConfig, StreamSpec};
-use midori_dsp::{SpectrumAnalyzer, fftshift, frequency_axis};
-use midori_sigmf::SigMfWriter;
+use midori_core::{DemodMode, Session, Sink, SourceConfig, StreamSpec, VfoConfig};
+use midori_engine::{LiveSession, RecorderSink, VfoChannel};
 use midori_source_libiio::LibiioSource;
+
+use crate::audio::{AudioOutput, AudioSink};
+use crate::sinks::SpectrumSink;
 
 const SAMPLE_RATE_HZ: f64 = 2_400_000.0;
 const BANDWIDTH_HZ: f64 = 2_400_000.0;
@@ -33,11 +35,11 @@ const DB_MAX: f32 = -20.0;
 // Worker messages
 // ---------------------------------------------------------------------------
 
-struct SpectrumFrame {
-    spectrum_db: Vec<f32>,
-    frequencies_mhz: Vec<f32>,
-    center_freq_hz: f64,
-    sample_rate_hz: f64,
+pub(crate) struct SpectrumFrame {
+    pub(crate) spectrum_db: Vec<f32>,
+    pub(crate) frequencies_mhz: Vec<f32>,
+    pub(crate) center_freq_hz: f64,
+    pub(crate) sample_rate_hz: f64,
 }
 
 enum WorkerCommand {
@@ -89,6 +91,7 @@ pub struct MidoriApp {
 
     freq_input: String,
     gain_input: String,
+    demod_mode: DemodMode,
 
     is_connected: bool,
     is_connecting: bool,
@@ -109,12 +112,13 @@ impl Default for MidoriApp {
             worker: None,
             stop_flag: Arc::new(AtomicBool::new(false)),
             current_spectrum: Vec::new(),
-            center_freq_hz: 120_000_000.0,
+            center_freq_hz: 91_600_000.0,
             sample_rate_hz: SAMPLE_RATE_HZ,
             waterfall_rows: VecDeque::with_capacity(WATERFALL_ROWS + 4),
             waterfall_texture: None,
-            freq_input: "120.000".to_string(),
-            gain_input: "40".to_string(),
+            freq_input: "91.600".to_string(),
+            gain_input: "60".to_string(),
+            demod_mode: DemodMode::Fm,
             is_connected: false,
             is_connecting: false,
             is_recording: false,
@@ -155,9 +159,26 @@ impl MidoriApp {
             sample_rate_hz: SAMPLE_RATE_HZ,
             bandwidth_hz: BANDWIDTH_HZ,
             gain_db,
-            gain_mode: GainMode::Manual,
+            gain_mode: midori_core::GainMode::Manual,
             rf_port: Some("A_BALANCED".to_string()),
             buffer_samples: BUFFER_SAMPLES,
+        };
+
+        let (bandwidth_hz, channel_rate_hz, audio_bandwidth_hz, deemphasis_us) =
+            match self.demod_mode {
+                DemodMode::Fm => (200_000.0, 240_000.0, 15_000.0, 50.0),
+                DemodMode::Am => (6_000.0, 48_000.0, 4_000.0, 0.0),
+                _ => (15_000.0, 48_000.0, 3_000.0, 0.0),
+            };
+        let vfo = VfoConfig {
+            id: 0,
+            offset_hz: 0.0,
+            bandwidth_hz,
+            demod: self.demod_mode,
+            audio_rate_hz: 48_000.0,
+            channel_rate_hz,
+            audio_bandwidth_hz,
+            deemphasis_us,
         };
 
         let (data_tx, data_rx) = bounded(4);
@@ -168,7 +189,7 @@ impl MidoriApp {
 
         match thread::Builder::new()
             .name("sdr-worker".into())
-            .spawn(move || run_worker(config, data_tx, event_tx, cmd_rx, worker_stop))
+            .spawn(move || run_worker(config, vfo, data_tx, event_tx, cmd_rx, worker_stop))
         {
             Ok(handle) => {
                 self.worker = Some(handle);
@@ -263,8 +284,15 @@ impl MidoriApp {
             .unwrap_or_else(|_| PathBuf::from("."))
             .join("captures")
             .join(format!("gui_{stamp}.sigmf"));
-        if let Some(tx) = &self.cmd_tx {
-            let _ = tx.try_send(WorkerCommand::StartRecording(path));
+        self.is_recording = true;
+        self.recording_path = Some(path.clone());
+        self.status_msg = "Starting recording...".to_string();
+        if let Some(tx) = &self.cmd_tx
+            && tx.try_send(WorkerCommand::StartRecording(path)).is_err()
+        {
+            self.is_recording = false;
+            self.recording_path = None;
+            self.error_msg = Some("could not send recording command".to_string());
         }
     }
 
@@ -287,7 +315,6 @@ impl MidoriApp {
                     self.is_connected = true;
                     self.center_freq_hz = spec.center_freq_hz;
                     self.sample_rate_hz = spec.sample_rate_hz;
-                    self.error_msg = None;
                     self.status_msg = format!(
                         "Connected | {:.3} MHz | {:.3} MSPS",
                         spec.center_freq_hz / 1e6,
@@ -414,11 +441,17 @@ impl MidoriApp {
     fn draw_bottom_bar(&self, ctx: &egui::Context) {
         egui::TopBottomPanel::bottom("bottom_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
+                let demod = match self.demod_mode {
+                    DemodMode::Fm => "FM",
+                    DemodMode::Am => "AM",
+                    _ => "?",
+                };
                 ui.label(format!(
-                    "LO {:.3} MHz   {:.3} MSPS   FFT {}",
+                    "LO {:.3} MHz   {:.3} MSPS   FFT {}   {}",
                     self.center_freq_hz / 1e6,
                     self.sample_rate_hz / 1e6,
-                    FFT_SIZE
+                    FFT_SIZE,
+                    demod
                 ));
                 if self.is_recording {
                     ui.separator();
@@ -468,6 +501,19 @@ impl MidoriApp {
                     ui.selectable_value(&mut self.view_mode, ViewMode::Spectrum, "Spectrum");
                     ui.selectable_value(&mut self.view_mode, ViewMode::Waterfall, "Waterfall");
                 });
+
+                ui.add_space(8.0);
+                ui.separator();
+
+                ui.label("Demod");
+                let previous_demod = self.demod_mode;
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.demod_mode, DemodMode::Fm, "FM");
+                    ui.selectable_value(&mut self.demod_mode, DemodMode::Am, "AM");
+                });
+                if self.demod_mode != previous_demod && (self.is_connected || self.is_connecting) {
+                    self.status_msg = "Reconnect to apply demod mode".to_string();
+                }
 
                 ui.add_space(8.0);
                 ui.separator();
@@ -700,12 +746,13 @@ impl Drop for MidoriApp {
 
 fn run_worker(
     config: SourceConfig,
+    mut vfo: VfoConfig,
     data_tx: Sender<SpectrumFrame>,
     event_tx: Sender<WorkerEvent>,
     cmd_rx: Receiver<WorkerCommand>,
     stop: Arc<AtomicBool>,
 ) {
-    let mut source = match LibiioSource::open(None) {
+    let source = match LibiioSource::open(None) {
         Ok(source) => source,
         Err(error) => {
             eprintln!("[worker] connect failed: {error}");
@@ -714,73 +761,91 @@ fn run_worker(
         }
     };
 
-    let mut current_spec = match source.configure(config) {
-        Ok(spec) => spec,
+    let (audio_output, audio_producer) = match AudioOutput::open() {
+        Ok((output, producer)) => (Some(output), Some(producer)),
         Err(error) => {
-            eprintln!("[worker] configure failed: {error}");
-            let _ = event_tx.try_send(WorkerEvent::Fatal(format!("configure failed: {error}")));
-            return;
+            eprintln!("[worker] audio unavailable: {error}");
+            let _ = event_tx.try_send(WorkerEvent::Error(format!("audio unavailable: {error}")));
+            (None, None)
         }
     };
 
-    if let Err(error) = source.start() {
+    if let Some(producer) = &audio_producer {
+        vfo.audio_rate_hz = producer.sample_rate_hz() as f64;
+    }
+    if let Some(output) = &audio_output {
+        eprintln!(
+            "[worker] audio output: {} Hz, {} channel(s)",
+            output.sample_rate_hz(),
+            output.channels()
+        );
+    }
+
+    let (recorder_sink, recorder_handle) = RecorderSink::new();
+    let mut sinks: Vec<Box<dyn Sink>> = vec![
+        Box::new(SpectrumSink::new(FFT_SIZE, data_tx)),
+        Box::new(recorder_sink),
+    ];
+    if let Some(producer) = audio_producer {
+        sinks.push(Box::new(AudioSink::new(producer)));
+    }
+
+    let channel = VfoChannel::new(vfo);
+    let mut session = LiveSession::new(config, Box::new(source), vec![Box::new(channel)], sinks);
+    let _audio_output = audio_output;
+
+    if let Err(error) = session.start() {
         eprintln!("[worker] start failed: {error}");
         let _ = event_tx.try_send(WorkerEvent::Fatal(format!("start failed: {error}")));
         return;
     }
 
+    let Some(spec) = session.current_spec() else {
+        let _ = event_tx.try_send(WorkerEvent::Fatal("session has no stream spec".to_string()));
+        return;
+    };
     eprintln!(
-        "[worker] connected: {:.3} MHz, {:.3} MSPS",
-        current_spec.center_freq_hz / 1e6,
-        current_spec.sample_rate_hz / 1e6
+        "[worker] connected: {:.3} MHz, {:.3} MSPS, {} audio",
+        spec.center_freq_hz / 1e6,
+        spec.sample_rate_hz / 1e6,
+        if _audio_output.is_some() {
+            "with"
+        } else {
+            "without"
+        }
     );
-    let _ = event_tx.try_send(WorkerEvent::Connected(current_spec));
-
-    let mut analyzer = SpectrumAnalyzer::new(FFT_SIZE);
-    let mut recorder: Option<(PathBuf, SigMfWriter)> = None;
+    let _ = event_tx.try_send(WorkerEvent::Connected(spec));
 
     while !stop.load(Ordering::SeqCst) {
         while let Ok(command) = cmd_rx.try_recv() {
             match command {
                 WorkerCommand::SetFrequency(hz) => {
-                    if recorder.is_some() {
+                    if recorder_handle.is_recording() {
                         let _ = event_tx.try_send(WorkerEvent::Error(
                             "stop recording before retuning".to_string(),
                         ));
                         continue;
                     }
-                    match source.set_frequency(hz) {
-                        Ok(()) => {
-                            current_spec.center_freq_hz = hz;
-                        }
-                        Err(error) => {
-                            let _ = event_tx
-                                .try_send(WorkerEvent::Error(format!("tune failed: {error}")));
-                        }
+                    if let Err(error) = session.set_frequency(hz) {
+                        let _ =
+                            event_tx.try_send(WorkerEvent::Error(format!("tune failed: {error}")));
                     }
                 }
                 WorkerCommand::SetGain(db) => {
-                    if let Err(error) = source.set_gain(db) {
+                    if let Err(error) = session.set_gain(db) {
                         let _ =
                             event_tx.try_send(WorkerEvent::Error(format!("gain failed: {error}")));
                     }
                 }
                 WorkerCommand::StartRecording(path) => {
-                    if recorder.is_some() {
-                        let _ = event_tx.try_send(WorkerEvent::Error(
-                            "recording already in progress".to_string(),
+                    let Some(spec) = session.current_spec() else {
+                        let _ = event_tx.try_send(WorkerEvent::RecordingError(
+                            "session has no stream spec".to_string(),
                         ));
                         continue;
-                    }
-                    match SigMfWriter::create(
-                        &path,
-                        current_spec.sample_rate_hz,
-                        current_spec.center_freq_hz,
-                        current_spec.full_scale,
-                        "Midori GUI capture",
-                    ) {
-                        Ok(writer) => {
-                            recorder = Some((path.clone(), writer));
+                    };
+                    match recorder_handle.start(path.clone(), spec) {
+                        Ok(()) => {
                             let _ = event_tx.try_send(WorkerEvent::RecordingStarted(path));
                         }
                         Err(error) => {
@@ -790,26 +855,21 @@ fn run_worker(
                         }
                     }
                 }
-                WorkerCommand::StopRecording => {
-                    if let Some((path, writer)) = recorder.take() {
-                        let samples = writer.samples_written();
-                        let seconds = samples as f64 / current_spec.sample_rate_hz;
-                        match writer.finish() {
-                            Ok(()) => {
-                                let _ = event_tx.try_send(WorkerEvent::RecordingStopped {
-                                    path,
-                                    samples,
-                                    seconds,
-                                });
-                            }
-                            Err(error) => {
-                                let _ = event_tx.try_send(WorkerEvent::RecordingError(format!(
-                                    "recording finalise failed: {error}"
-                                )));
-                            }
-                        }
+                WorkerCommand::StopRecording => match recorder_handle.stop() {
+                    Ok(Some(info)) => {
+                        let _ = event_tx.try_send(WorkerEvent::RecordingStopped {
+                            path: info.path,
+                            samples: info.samples,
+                            seconds: info.seconds,
+                        });
                     }
-                }
+                    Ok(None) => {}
+                    Err(error) => {
+                        let _ = event_tx.try_send(WorkerEvent::RecordingError(format!(
+                            "recording finalise failed: {error}"
+                        )));
+                    }
+                },
                 WorkerCommand::Stop => {
                     stop.store(true, Ordering::SeqCst);
                     break;
@@ -821,54 +881,25 @@ fn run_worker(
             break;
         }
 
-        let block = match source.read_block() {
-            Ok(block) => block,
-            Err(error) => {
-                eprintln!("[worker] receive failed: {error}");
-                let _ = event_tx.try_send(WorkerEvent::Fatal(format!("receive failed: {error}")));
-                break;
-            }
-        };
-        current_spec = block.spec;
-
-        let mut write_error = None;
-        if let Some((_, writer)) = recorder.as_mut()
-            && let Err(error) = writer.write_block(&block.samples)
-        {
-            write_error = Some(error);
-        }
-        if let Some(error) = write_error {
-            let _ = event_tx.try_send(WorkerEvent::RecordingError(format!(
-                "write failed: {error}"
-            )));
-            recorder = None;
+        if let Err(error) = session.step() {
+            eprintln!("[worker] receive failed: {error}");
+            let _ = event_tx.try_send(WorkerEvent::Fatal(format!("receive failed: {error}")));
+            break;
         }
 
-        analyzer.process(&block.samples);
-        let spectrum_db = fftshift(&analyzer.spectrum_db());
-        let frequencies_mhz = frequency_axis(
-            block.spec.center_freq_hz,
-            block.spec.sample_rate_hz,
-            spectrum_db.len(),
-        )
-        .into_iter()
-        .map(|hz| (hz / 1e6) as f32)
-        .collect();
-
-        let frame = SpectrumFrame {
-            spectrum_db,
-            frequencies_mhz,
-            center_freq_hz: block.spec.center_freq_hz,
-            sample_rate_hz: block.spec.sample_rate_hz,
-        };
-        let _ = data_tx.try_send(frame);
-        analyzer.reset();
+        if let Some(error) = recorder_handle.take_error() {
+            let _ = event_tx.try_send(WorkerEvent::RecordingError(error));
+        }
     }
 
-    if let Some((_, writer)) = recorder.take() {
-        let _ = writer.finish();
+    if let Ok(Some(info)) = recorder_handle.stop() {
+        let _ = event_tx.try_send(WorkerEvent::RecordingStopped {
+            path: info.path,
+            samples: info.samples,
+            seconds: info.seconds,
+        });
     }
-    let _ = source.stop();
+    let _ = session.stop();
     eprintln!("[worker] stopped");
 }
 

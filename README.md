@@ -23,8 +23,10 @@ Doppler correction, recording, and plugins for SSTV/SSDV/FT4/CW.
   to 16-bit PCM WAV.
 - FM channel demodulation (channelizer + polar discriminator + de-emphasis +
   audio low-pass + resample) to 16-bit PCM WAV.
-- egui desktop UI with spectrum/waterfall, frequency/gain controls, and
-  one-click SigMF recording.
+- Live FM/AM audio through `cpal`, driven by the same `VfoChannel` used for
+  offline captures, with a simple AGC.
+- egui desktop UI with spectrum/waterfall, frequency/gain controls, demod
+  selection, and one-click SigMF recording.
 - Core contracts for frames, digital VFOs, channels, sinks, sessions, and
   out-of-process decoder plugins.
 - Unit tests for the spectrum analyser, AM/FM demodulators, SigMF round-trip,
@@ -59,9 +61,11 @@ cargo run --release -p midori-app
 # or: ./target/release/midori-gui
 ```
 
-The UI currently connects to RX1A at 2.4 MSPS with manual gain. Set the centre
-frequency and gain, press **Connect Pluto**, then switch between spectrum and
-waterfall. **Record IQ** writes a SigMF capture to `captures/gui_<timestamp>`.
+The UI starts at 91.6 MHz FM with 60 dB gain for the current broadcast test,
+and plays demodulated audio through the default output device. For the
+airband, set the centre frequency to 120.0 MHz, choose AM, and reconnect to
+apply. The UI currently connects to RX1A at 2.4 MSPS with manual gain.
+**Record IQ** writes a SigMF capture to `captures/gui_<timestamp>`.
 For development, `MIDORI_AUTOCONNECT=1` connects on startup.
 
 Record 30 seconds of the aviation band around 120 MHz from RX1A:
@@ -114,6 +118,7 @@ crates/
   midori-dsp/            # spectrum, biquads, AM demodulator
   midori-sigmf/          # SigMF writer/reader
   midori-plugin/         # plugin manifest, events, host trait
+  midori-engine/         # LiveSession, VFO channel, recorder sink
   midori-cli/            # `midori` command-line tool
   midori-app/            # egui desktop UI (`midori-gui`)
 ```
@@ -146,10 +151,10 @@ prototype are stored as sibling directories outside the repository
 
 ## Roadmap
 
-1. Live audio output (`cpal`) and a real session/VFO implementation.
-2. Decoder sidecar supervisor and the first plugin (CW or APT).
-3. SSB/CW/FM voice demodulation, AGC, squelch, and filter controls.
-4. TLE/SGP4 Doppler tracking, pass scheduling, and presets.
+1. Decoder sidecar supervisor and the first plugin (CW or APT).
+2. SSB/CW voice demodulation, squelch, and filter controls.
+3. Click-to-tune digital VFOs and TLE/SGP4 Doppler tracking.
+4. Pass scheduling and shareable presets.
 5. SigMF browse/playback, plugin display panels, and packaging.
 
 ## License
