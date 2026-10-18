@@ -1,0 +1,11 @@
+[package]
+name = "midori-dsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+midori-core.workspace = true
+num-complex.workspace = true
+rustfft.workspace = true

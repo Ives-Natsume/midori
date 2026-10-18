@@ -1,0 +1,23 @@
+# Copy this file to .cargo/config.toml when libiio is installed as a macOS
+# framework outside the path assumed by libiio-sys.
+#
+# This development machine has iio.framework in /Library/Frameworks.
+# Linux builds do not need these flags.
+
+[target.aarch64-apple-darwin]
+rustflags = [
+    "-C", "link-args=-F/Library/Frameworks",
+    "-C", "link-args=-rpath",
+    "-C", "link-args=/Library/Frameworks",
+    "-C", "link-args=-rpath",
+    "-C", "link-args=/opt/homebrew/lib",
+]
+
+[target.x86_64-apple-darwin]
+rustflags = [
+    "-C", "link-args=-F/Library/Frameworks",
+    "-C", "link-args=-rpath",
+    "-C", "link-args=/Library/Frameworks",
+    "-C", "link-args=-rpath",
+    "-C", "link-args=/opt/homebrew/lib",
+]

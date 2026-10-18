@@ -1,0 +1,10 @@
+[package]
+name = "midori-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+num-complex.workspace = true

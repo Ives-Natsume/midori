@@ -1,1 +1,4 @@
-/dsp_bridge/target/
+/target
+/captures
+/.cargo/config.toml
+.DS_Store

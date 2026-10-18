@@ -1,0 +1,18 @@
+[package]
+name = "midori-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "midori"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+midori-core.workspace = true
+midori-dsp.workspace = true
+midori-sigmf.workspace = true
+midori-source-libiio.workspace = true
+num-complex.workspace = true
