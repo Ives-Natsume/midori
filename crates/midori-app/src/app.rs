@@ -16,6 +16,7 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
 
+use midori_config::{AppConfig, Colormap, DecoderTab, Theme};
 use midori_core::{DemodMode, Session, Sink, SourceConfig, StreamSpec, VfoConfig};
 use midori_dsp::median;
 use midori_engine::{LiveSession, PluginHandle, PluginSink, RecorderSink, VfoChannel, plugin_sink};
@@ -28,15 +29,6 @@ use midori_source_libiio::LibiioSource;
 
 use crate::audio::{AudioOutput, AudioSink};
 use crate::sinks::SpectrumSink;
-
-const SAMPLE_RATE_HZ: f64 = 2_400_000.0;
-const BANDWIDTH_HZ: f64 = 2_400_000.0;
-const BUFFER_SAMPLES: usize = 32_768;
-const FFT_SIZE: usize = 4_096;
-const WATERFALL_ROWS: usize = 200;
-const WATERFALL_WIDTH: usize = 1_024;
-const DB_MIN: f32 = -110.0;
-const DB_MAX: f32 = -20.0;
 
 // ---------------------------------------------------------------------------
 // Worker messages
@@ -57,6 +49,13 @@ enum WorkerCommand {
     Stop,
 }
 
+struct WorkerOptions {
+    cw_enabled: bool,
+    cw_tone_hz: f64,
+    source_uri: String,
+    fft_size: usize,
+}
+
 enum WorkerEvent {
     Connected(StreamSpec),
     Error(String),
@@ -75,14 +74,11 @@ enum WorkerEvent {
 // UI state
 // ---------------------------------------------------------------------------
 
-#[derive(PartialEq, Eq, Clone, Copy)]
-enum DecoderTab {
-    Cw,
-    Passes,
-    Log,
-}
-
 pub struct MidoriApp {
+    config: AppConfig,
+    config_path: PathBuf,
+    config_warning: Option<String>,
+
     data_rx: Option<Receiver<SpectrumFrame>>,
     event_rx: Option<Receiver<WorkerEvent>>,
     cmd_tx: Option<Sender<WorkerCommand>>,
@@ -95,6 +91,9 @@ pub struct MidoriApp {
     signal_dbfs: f32,
     noise_dbfs: f32,
     spectrum_ratio: f32,
+    db_min: f32,
+    db_max: f32,
+    colormap: Colormap,
 
     waterfall_rows: VecDeque<Vec<f32>>,
     waterfall_texture: Option<egui::TextureHandle>,
@@ -128,32 +127,58 @@ pub struct MidoriApp {
 
 impl Default for MidoriApp {
     fn default() -> Self {
+        let config_path = PathBuf::from(midori_config::DEFAULT_FILE);
+        let loaded = AppConfig::load(&config_path);
+        let warning = loaded.warning.clone();
+        let config = loaded.config;
+
+        let center_freq_hz = config.source.center_freq_hz;
+        let sample_rate_hz = config.source.sample_rate_hz;
+        let gain_db = config.source.gain_db;
+        let demod_mode = config.demod.mode;
+        let spectrum_ratio = config.ui.spectrum_ratio;
+        let decoder_tab = config.ui.decoder_tab;
+        let decoder_dock_open = config.ui.decoder_dock_open;
+        let db_min = config.ui.db_min;
+        let db_max = config.ui.db_max;
+        let colormap = config.ui.colormap;
+        let waterfall_capacity = config.ui.waterfall_rows + 4;
+        let tle_path = config.satellite.tle_path.clone();
+        let grid_input = config.satellite.grid.clone();
+        let min_elev_input = format!("{:.1}", config.satellite.min_elevation_deg);
+        let cw_enabled = config.decoder.cw_enabled;
+
         Self {
+            config,
+            config_path,
+            config_warning: warning,
             data_rx: None,
             event_rx: None,
             cmd_tx: None,
             worker: None,
             stop_flag: Arc::new(AtomicBool::new(false)),
             current_spectrum: Vec::new(),
-            center_freq_hz: 91_600_000.0,
-            sample_rate_hz: SAMPLE_RATE_HZ,
+            center_freq_hz,
+            sample_rate_hz,
             signal_dbfs: f32::NEG_INFINITY,
             noise_dbfs: f32::NEG_INFINITY,
-            spectrum_ratio: 0.55,
-            waterfall_rows: VecDeque::with_capacity(WATERFALL_ROWS + 4),
+            spectrum_ratio,
+            db_min,
+            db_max,
+            colormap,
+            waterfall_rows: VecDeque::with_capacity(waterfall_capacity),
             waterfall_texture: None,
-            freq_input: "91.600".to_string(),
-            gain_input: "60".to_string(),
-            demod_mode: DemodMode::Fm,
-            decoder_tab: DecoderTab::Passes,
-            decoder_dock_open: true,
-            cw_enabled: std::env::var_os("MIDORI_CW").is_some(),
+            freq_input: format!("{:.6}", center_freq_hz / 1e6),
+            gain_input: format!("{gain_db:.1}"),
+            demod_mode,
+            decoder_tab,
+            decoder_dock_open,
+            cw_enabled: std::env::var_os("MIDORI_CW").is_some() || cw_enabled,
             cw_text: String::new(),
             cw_status: "idle".to_string(),
-            tle_path: std::env::var("MIDORI_TLE")
-                .unwrap_or_else(|_| "captures/iss.tle".to_string()),
-            grid_input: "PM95".to_string(),
-            min_elev_input: "5".to_string(),
+            tle_path,
+            grid_input,
+            min_elev_input,
             satellite_name: "No TLE loaded".to_string(),
             passes: Vec::new(),
             pass_status: "Load a TLE and predict passes".to_string(),
@@ -171,20 +196,15 @@ impl Default for MidoriApp {
 
 impl MidoriApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let mut visuals = egui::Visuals::dark();
-        visuals.panel_fill = egui::Color32::from_rgb(16, 20, 26);
-        visuals.window_fill = egui::Color32::from_rgb(20, 25, 32);
-        visuals.extreme_bg_color = egui::Color32::from_rgb(10, 13, 18);
-        visuals.faint_bg_color = egui::Color32::from_rgb(24, 30, 38);
-        visuals.selection.bg_fill = egui::Color32::from_rgb(30, 120, 180);
-        cc.egui_ctx.set_visuals(visuals);
+        let mut app = Self::default();
+        apply_theme(&cc.egui_ctx, app.config.ui.theme);
 
-        let mut style = (*cc.egui_ctx.style()).clone();
-        style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-        style.spacing.button_padding = egui::vec2(8.0, 4.0);
-        cc.egui_ctx.set_style(style);
+        if let Some(warning) = app.config_warning.clone() {
+            app.push_log(format!("config: {warning}"));
+            app.status_msg = "config warning; using defaults".to_string();
+        }
 
-        Self::default()
+        app
     }
 
     // -----------------------------------------------------------------------
@@ -206,55 +226,50 @@ impl MidoriApp {
             return;
         };
 
+        let source = &self.config.source;
         let config = SourceConfig {
             center_freq_hz: freq_mhz * 1e6,
-            sample_rate_hz: SAMPLE_RATE_HZ,
-            bandwidth_hz: BANDWIDTH_HZ,
+            sample_rate_hz: source.sample_rate_hz,
+            bandwidth_hz: source.bandwidth_hz,
             gain_db,
-            gain_mode: midori_core::GainMode::Manual,
-            rf_port: Some("A_BALANCED".to_string()),
-            buffer_samples: BUFFER_SAMPLES,
+            gain_mode: source.gain_mode,
+            rf_port: Some(source.rf_port.clone()),
+            buffer_samples: source.buffer_samples,
         };
 
-        let (bandwidth_hz, channel_rate_hz, audio_bandwidth_hz, deemphasis_us) =
-            match self.demod_mode {
-                DemodMode::Fm => (200_000.0, 240_000.0, 15_000.0, 50.0),
-                DemodMode::Am => (6_000.0, 48_000.0, 4_000.0, 0.0),
-                DemodMode::Cw => (500.0, 48_000.0, 2_000.0, 0.0),
-                _ => (15_000.0, 48_000.0, 3_000.0, 0.0),
-            };
+        let demod = self.config.demod.params(self.demod_mode);
         let vfo = VfoConfig {
             id: 0,
             offset_hz: 0.0,
-            bandwidth_hz,
+            bandwidth_hz: demod.bandwidth_hz,
             demod: self.demod_mode,
-            audio_rate_hz: 48_000.0,
-            channel_rate_hz,
-            audio_bandwidth_hz,
-            deemphasis_us,
-            bfo_hz: 700.0,
+            audio_rate_hz: demod.audio_rate_hz,
+            channel_rate_hz: demod.channel_rate_hz,
+            audio_bandwidth_hz: demod.audio_bandwidth_hz,
+            deemphasis_us: demod.deemphasis_us,
+            bfo_hz: demod.bfo_hz,
         };
+        let cw_tone_hz = self.config.demod.cw.bfo_hz;
+        let source_uri = source.uri.clone();
+        let fft_size = self.config.ui.fft_size;
+        let cw_enabled = self.cw_enabled;
 
         let (data_tx, data_rx) = bounded(4);
         let (event_tx, event_rx) = bounded(64);
         let (cmd_tx, cmd_rx) = bounded(16);
         let stop_flag = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop_flag);
-        let cw_enabled = self.cw_enabled;
+        let options = WorkerOptions {
+            cw_enabled,
+            cw_tone_hz,
+            source_uri,
+            fft_size,
+        };
 
         match thread::Builder::new()
             .name("sdr-worker".into())
-            .spawn(move || {
-                run_worker(
-                    config,
-                    vfo,
-                    data_tx,
-                    event_tx,
-                    cmd_rx,
-                    worker_stop,
-                    cw_enabled,
-                )
-            }) {
+            .spawn(move || run_worker(config, vfo, options, data_tx, event_tx, cmd_rx, worker_stop))
+        {
             Ok(handle) => {
                 self.worker = Some(handle);
                 self.data_rx = Some(data_rx);
@@ -374,6 +389,77 @@ impl MidoriApp {
         if let Some(tx) = &self.cmd_tx {
             let _ = tx.try_send(WorkerCommand::StopRecording);
         }
+    }
+
+    fn save_config(&mut self) {
+        if let Ok(mhz) = self.freq_input.parse::<f64>() {
+            self.config.source.center_freq_hz = mhz * 1e6;
+        }
+        if let Ok(gain) = self.gain_input.parse::<f64>() {
+            self.config.source.gain_db = gain;
+        }
+        if let Ok(elevation) = self.min_elev_input.parse::<f64>() {
+            self.config.satellite.min_elevation_deg = elevation;
+        }
+
+        self.config.demod.mode = self.demod_mode;
+        self.config.decoder.cw_enabled = self.cw_enabled;
+        self.config.ui.spectrum_ratio = self.spectrum_ratio;
+        self.config.ui.decoder_tab = self.decoder_tab;
+        self.config.ui.decoder_dock_open = self.decoder_dock_open;
+        self.config.ui.db_min = self.db_min;
+        self.config.ui.db_max = self.db_max;
+        self.config.ui.colormap = self.colormap;
+        self.config.satellite.tle_path = self.tle_path.clone();
+        self.config.satellite.grid = self.grid_input.clone();
+        self.config.sanitize();
+
+        match self.config.save(&self.config_path) {
+            Ok(()) => {
+                self.status_msg = format!("settings saved to {}", self.config_path.display());
+                self.push_log(self.status_msg.clone());
+            }
+            Err(error) => {
+                let message = format!("saving config: {error}");
+                self.error_msg = Some(message.clone());
+                self.push_log(message);
+            }
+        }
+    }
+
+    fn reload_config(&mut self, ctx: &egui::Context) {
+        let loaded = AppConfig::load(&self.config_path);
+        self.config = loaded.config;
+        self.config_warning = loaded.warning.clone();
+        if let Some(warning) = loaded.warning {
+            self.push_log(format!("config: {warning}"));
+            self.error_msg = Some(warning);
+        }
+
+        let config = &self.config;
+        self.freq_input = format!("{:.6}", config.source.center_freq_hz / 1e6);
+        self.gain_input = format!("{:.1}", config.source.gain_db);
+        self.center_freq_hz = config.source.center_freq_hz;
+        self.sample_rate_hz = config.source.sample_rate_hz;
+        self.demod_mode = config.demod.mode;
+        self.cw_enabled = config.decoder.cw_enabled;
+        self.spectrum_ratio = config.ui.spectrum_ratio;
+        self.decoder_tab = config.ui.decoder_tab;
+        self.decoder_dock_open = config.ui.decoder_dock_open;
+        self.db_min = config.ui.db_min;
+        self.db_max = config.ui.db_max;
+        self.colormap = config.ui.colormap;
+        self.tle_path = config.satellite.tle_path.clone();
+        self.grid_input = config.satellite.grid.clone();
+        self.min_elev_input = format!("{:.1}", config.satellite.min_elevation_deg);
+
+        apply_theme(ctx, config.ui.theme);
+        self.status_msg = if self.is_connected || self.is_connecting {
+            "config reloaded; reconnect to apply source/demod/decoder".to_string()
+        } else {
+            "config reloaded".to_string()
+        };
+        self.push_log(self.status_msg.clone());
     }
 
     // -----------------------------------------------------------------------
@@ -592,8 +678,8 @@ impl MidoriApp {
             .filter(|value| value.is_finite())
             .fold(f32::NEG_INFINITY, f32::max);
 
-        let row = downsample(&frame.spectrum_db, WATERFALL_WIDTH);
-        if self.waterfall_rows.len() >= WATERFALL_ROWS {
+        let row = downsample(&frame.spectrum_db, self.config.ui.waterfall_width);
+        if self.waterfall_rows.len() >= self.config.ui.waterfall_rows {
             self.waterfall_rows.pop_front();
         }
         self.waterfall_rows.push_back(row);
@@ -603,8 +689,8 @@ impl MidoriApp {
     }
 
     fn rebuild_waterfall_texture(&mut self, ctx: &egui::Context) {
-        let width = WATERFALL_WIDTH;
-        let height = WATERFALL_ROWS;
+        let width = self.config.ui.waterfall_width;
+        let height = self.config.ui.waterfall_rows;
         let mut pixels = vec![egui::Color32::BLACK; width * height];
 
         for (row_index, row) in self.waterfall_rows.iter().rev().enumerate() {
@@ -612,7 +698,8 @@ impl MidoriApp {
                 break;
             }
             for (column, &db) in row.iter().enumerate().take(width) {
-                pixels[row_index * width + column] = db_to_color(db);
+                pixels[row_index * width + column] =
+                    db_to_color(db, self.db_min, self.db_max, self.colormap);
             }
         }
 
@@ -775,7 +862,7 @@ impl MidoriApp {
                         "LO {:.3} MHz   {:.3} MSPS   FFT {}",
                         self.center_freq_hz / 1e6,
                         self.sample_rate_hz / 1e6,
-                        FFT_SIZE
+                        self.config.ui.fft_size
                     ))
                     .weak(),
                 );
@@ -830,9 +917,9 @@ impl MidoriApp {
         if !self.decoder_dock_open {
             return;
         }
-        egui::TopBottomPanel::bottom("decoder_dock")
+        let dock = egui::TopBottomPanel::bottom("decoder_dock")
             .resizable(true)
-            .default_height(170.0)
+            .default_height(self.config.ui.decoder_dock_height)
             .min_height(80.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -854,6 +941,7 @@ impl MidoriApp {
                     DecoderTab::Log => self.draw_log_tab(ui),
                 }
             });
+        self.config.ui.decoder_dock_height = dock.response.rect.height();
     }
 
     fn draw_cw_tab(&self, ui: &mut egui::Ui) {
@@ -952,9 +1040,9 @@ impl MidoriApp {
     }
 
     fn draw_radio_panel(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("radio_panel")
+        let panel = egui::SidePanel::left("radio_panel")
             .resizable(true)
-            .default_width(280.0)
+            .default_width(self.config.ui.left_panel_width)
             .min_width(230.0)
             .show(ctx, |ui| {
                 ui.add_space(6.0);
@@ -1042,10 +1130,18 @@ impl MidoriApp {
                         ));
                         ui.label(
                             egui::RichText::new(match self.demod_mode {
-                                DemodMode::Fm => "de-emphasis 50 µs",
-                                DemodMode::Cw => "BFO 700 Hz",
-                                DemodMode::Am => "envelope detector",
-                                _ => "",
+                                DemodMode::Fm => {
+                                    format!(
+                                        "de-emphasis {:.0} µs",
+                                        self.config.demod.params(self.demod_mode).deemphasis_us
+                                    )
+                                }
+                                DemodMode::Cw => format!(
+                                    "BFO {:.0} Hz",
+                                    self.config.demod.params(self.demod_mode).bfo_hz
+                                ),
+                                DemodMode::Am => "envelope detector".to_string(),
+                                _ => String::new(),
                             })
                             .weak(),
                         );
@@ -1058,9 +1154,20 @@ impl MidoriApp {
                 egui::CollapsingHeader::new("FFT / Waterfall")
                     .default_open(false)
                     .show(ui, |ui| {
-                        ui.label(egui::RichText::new("FFT 4096 · Hann").weak());
-                        ui.label(egui::RichText::new("range -110 .. -20 dBFS").weak());
-                        ui.label(egui::RichText::new("colormap viridis").weak());
+                        ui.label(
+                            egui::RichText::new(format!("FFT {} · Hann", self.config.ui.fft_size))
+                                .weak(),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "range {:.0} .. {:.0} dBFS",
+                                self.db_min, self.db_max
+                            ))
+                            .weak(),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!("colormap {:?}", self.colormap)).weak(),
+                        );
                     });
 
                 egui::CollapsingHeader::new("Recording")
@@ -1114,13 +1221,27 @@ impl MidoriApp {
                         ui.label("PageUp / PageDown +/-1 MHz");
                         ui.label("G / H            gain +/-5 dB");
                     });
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Save settings").clicked() {
+                        self.save_config();
+                    }
+                    if ui.button("Reload config").clicked() {
+                        self.reload_config(ui.ctx());
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(format!("config: {}", self.config_path.display())).weak(),
+                );
             });
+        self.config.ui.left_panel_width = panel.response.rect.width();
     }
 
     fn draw_decoder_panel(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::right("decoder_panel")
+        let panel = egui::SidePanel::right("decoder_panel")
             .resizable(true)
-            .default_width(320.0)
+            .default_width(self.config.ui.right_panel_width)
             .min_width(260.0)
             .show(ctx, |ui| {
                 ui.add_space(6.0);
@@ -1159,6 +1280,7 @@ impl MidoriApp {
                 ui.separator();
                 ui.label(egui::RichText::new("plugins run as separate processes").weak());
             });
+        self.config.ui.right_panel_width = panel.response.rect.width();
     }
 
     fn draw_central(&mut self, ctx: &egui::Context) {
@@ -1194,8 +1316,8 @@ impl MidoriApp {
         let plot = Plot::new("spectrum_plot")
             .x_axis_label("Frequency (MHz)")
             .y_axis_label("Power (dBFS)")
-            .include_y(DB_MIN as f64)
-            .include_y(DB_MAX as f64)
+            .include_y(self.db_min as f64)
+            .include_y(self.db_max as f64)
             .allow_drag(true)
             .allow_zoom(true)
             .show_axes([true, true])
@@ -1218,7 +1340,7 @@ impl MidoriApp {
             ] {
                 let edges = Line::new(
                     name,
-                    PlotPoints::new(vec![[x, DB_MIN as f64], [x, DB_MAX as f64]]),
+                    PlotPoints::new(vec![[x, self.db_min as f64], [x, self.db_max as f64]]),
                 )
                 .color(egui::Color32::from_rgb(90, 110, 130))
                 .width(0.8);
@@ -1227,8 +1349,8 @@ impl MidoriApp {
             let vfo = Line::new(
                 "VFO",
                 PlotPoints::new(vec![
-                    [center_mhz, DB_MIN as f64],
-                    [center_mhz, DB_MAX as f64],
+                    [center_mhz, self.db_min as f64],
+                    [center_mhz, self.db_max as f64],
                 ]),
             )
             .color(egui::Color32::from_rgb(80, 220, 255))
@@ -1292,7 +1414,7 @@ impl MidoriApp {
         let steps = 5;
         for i in 0..=steps {
             let t = i as f32 / steps as f32;
-            let db = DB_MIN + t * (DB_MAX - DB_MIN);
+            let db = self.db_min + t * (self.db_max - self.db_min);
             let y = rect.min.y + (1.0 - t) * rect.height();
             painter.text(
                 egui::pos2(rect.max.x - 6.0, y),
@@ -1407,7 +1529,10 @@ fn cw_plugin_path() -> Option<PathBuf> {
     path.exists().then_some(path)
 }
 
-fn start_cw_plugin(event_tx: &Sender<WorkerEvent>) -> Option<(PluginSink, PluginHandle)> {
+fn start_cw_plugin(
+    event_tx: &Sender<WorkerEvent>,
+    tone_hz: f64,
+) -> Option<(PluginSink, PluginHandle)> {
     let Some(path) = cw_plugin_path() else {
         let _ = event_tx.try_send(WorkerEvent::Error(
             "CW plugin binary not found; build the workspace first".to_string(),
@@ -1439,7 +1564,7 @@ fn start_cw_plugin(event_tx: &Sender<WorkerEvent>) -> Option<(PluginSink, Plugin
         let _ = event_tx.try_send(WorkerEvent::Error(format!("CW plugin start: {error}")));
         return None;
     }
-    if let Err(error) = plugin.configure(&serde_json::json!({"tone_hz": 700.0})) {
+    if let Err(error) = plugin.configure(&serde_json::json!({"tone_hz": tone_hz})) {
         let _ = plugin.stop();
         let _ = event_tx.try_send(WorkerEvent::Error(format!("CW plugin configure: {error}")));
         return None;
@@ -1452,13 +1577,13 @@ fn start_cw_plugin(event_tx: &Sender<WorkerEvent>) -> Option<(PluginSink, Plugin
 fn run_worker(
     config: SourceConfig,
     mut vfo: VfoConfig,
+    options: WorkerOptions,
     data_tx: Sender<SpectrumFrame>,
     event_tx: Sender<WorkerEvent>,
     cmd_rx: Receiver<WorkerCommand>,
     stop: Arc<AtomicBool>,
-    cw_enabled: bool,
 ) {
-    let source = match LibiioSource::open(None) {
+    let source = match LibiioSource::open(Some(&options.source_uri)) {
         Ok(source) => source,
         Err(error) => {
             eprintln!("[worker] connect failed: {error}");
@@ -1487,8 +1612,8 @@ fn run_worker(
         );
     }
 
-    let (plugin_sink, plugin_handle) = if cw_enabled {
-        match start_cw_plugin(&event_tx) {
+    let (plugin_sink, plugin_handle) = if options.cw_enabled {
+        match start_cw_plugin(&event_tx, options.cw_tone_hz) {
             Some((sink, handle)) => (Some(sink), Some(handle)),
             None => (None, None),
         }
@@ -1498,7 +1623,7 @@ fn run_worker(
 
     let (recorder_sink, recorder_handle) = RecorderSink::new();
     let mut sinks: Vec<Box<dyn Sink>> = vec![
-        Box::new(SpectrumSink::new(FFT_SIZE, data_tx)),
+        Box::new(SpectrumSink::new(options.fft_size, data_tx)),
         Box::new(recorder_sink),
     ];
     if let Some(sink) = plugin_sink {
@@ -1648,6 +1773,30 @@ fn run_worker(
 // Presentation helpers
 // ---------------------------------------------------------------------------
 
+fn apply_theme(ctx: &egui::Context, theme: Theme) {
+    let mut visuals = match theme {
+        Theme::Dark => {
+            let mut visuals = egui::Visuals::dark();
+            visuals.panel_fill = egui::Color32::from_rgb(16, 20, 26);
+            visuals.window_fill = egui::Color32::from_rgb(20, 25, 32);
+            visuals.extreme_bg_color = egui::Color32::from_rgb(10, 13, 18);
+            visuals.faint_bg_color = egui::Color32::from_rgb(24, 30, 38);
+            visuals.selection.bg_fill = egui::Color32::from_rgb(30, 120, 180);
+            visuals
+        }
+        Theme::Light => egui::Visuals::light(),
+    };
+    if theme == Theme::Light {
+        visuals.selection.bg_fill = egui::Color32::from_rgb(30, 120, 180);
+    }
+    ctx.set_visuals(visuals);
+
+    let mut style = (*ctx.style()).clone();
+    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+    style.spacing.button_padding = egui::vec2(8.0, 4.0);
+    ctx.set_style(style);
+}
+
 fn format_bandwidth(hz: f64) -> String {
     if hz >= 1_000.0 {
         format!("{:.1} kHz", hz / 1_000.0)
@@ -1674,9 +1823,19 @@ fn downsample(input: &[f32], width: usize) -> Vec<f32> {
 
 /// Map a dBFS value to a viridis-like colour.
 #[inline]
-fn db_to_color(db: f32) -> egui::Color32 {
-    let t = ((db - DB_MIN) / (DB_MAX - DB_MIN)).clamp(0.0, 1.0);
+fn db_to_color(db: f32, min: f32, max: f32, colormap: Colormap) -> egui::Color32 {
+    let t = ((db - min) / (max - min)).clamp(0.0, 1.0);
+    match colormap {
+        Colormap::Grayscale => {
+            let value = (t * 255.0) as u8;
+            egui::Color32::from_rgb(value, value, value)
+        }
+        Colormap::Turbo => turbo_color(t),
+        Colormap::Viridis => viridis_color(t),
+    }
+}
 
+fn viridis_color(t: f32) -> egui::Color32 {
     let (r, g, b) = if t < 0.25 {
         let s = t / 0.25;
         (
@@ -1706,8 +1865,30 @@ fn db_to_color(db: f32) -> egui::Color32 {
             lerp(97.0, 37.0, s),
         )
     };
-
     egui::Color32::from_rgb(r as u8, g as u8, b as u8)
+}
+
+fn turbo_color(t: f32) -> egui::Color32 {
+    const STOPS: [(f32, [f32; 3]); 5] = [
+        (0.0, [48.0, 18.0, 59.0]),
+        (0.25, [70.0, 107.0, 227.0]),
+        (0.5, [62.0, 188.0, 115.0]),
+        (0.75, [245.0, 187.0, 68.0]),
+        (1.0, [180.0, 4.0, 38.0]),
+    ];
+
+    for pair in STOPS.windows(2) {
+        let (start, start_color) = pair[0];
+        let (end, end_color) = pair[1];
+        if t <= end {
+            let local = ((t - start) / (end - start)).clamp(0.0, 1.0);
+            let red = lerp(start_color[0], end_color[0], local);
+            let green = lerp(start_color[1], end_color[1], local);
+            let blue = lerp(start_color[2], end_color[2], local);
+            return egui::Color32::from_rgb(red as u8, green as u8, blue as u8);
+        }
+    }
+    egui::Color32::from_rgb(180, 4, 38)
 }
 
 #[inline]

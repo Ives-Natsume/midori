@@ -1,4 +1,5 @@
 /target
 /captures
+/config.toml
 /.cargo/config.toml
 .DS_Store

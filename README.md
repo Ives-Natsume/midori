@@ -37,6 +37,7 @@ Doppler correction, recording, and plugins for SSTV/SSDV/FT4/CW.
   cannot block the SDR worker.
 - TLE parsing with checksums, Maidenhead grid conversion, SGP4 pass
   prediction, and Doppler range-rate calculation.
+- TOML configuration with compiled fallbacks, manual save, and reload.
 - Doppler metadata and `DopplerSource`/`TrackingConfig` contracts.
 - Unit tests for the spectrum analyser, AM/FM demodulators, SigMF round-trip,
   plugin manifest parsing, sidecar framing, engine fan-out, and CW decoding.
@@ -130,13 +131,31 @@ The desktop UI uses a fixed three-column layout:
 
 The Passes tab loads a TLE file, converts a Maidenhead locator, and predicts
 the next 24 hours of passes with SGP4. The placeholder grid is `PM95`; pass
-times are UTC. `MIDORI_TLE`, `MIDORI_CW`, and `MIDORI_AUTOCONNECT` are handy
-for development.
+times are UTC. `MIDORI_CW` and `MIDORI_AUTOCONNECT` are handy for development.
 
-The UI starts at 91.6 MHz FM with 60 dB gain for the current broadcast test,
-and plays demodulated audio through the default output device. For the
-airband, set the centre frequency to 120.0 MHz, choose AM, and reconnect to
-apply. **Record IQ** writes a SigMF capture to `captures/gui_<timestamp>`.
+## Configuration
+
+Settings live in `config.toml` in the working directory during development.
+The file is gitignored and may contain local frequencies, grid locators, and
+TLE paths; `config.example.toml` is the committed template.
+
+- Loaded once at startup, not every frame.
+- Missing sections/fields use compiled fallbacks.
+- A missing file starts from neutral defaults (100 MHz, FM, 40 dB, empty grid).
+- A malformed file falls back to defaults and reports a warning in the Log tab;
+  the bad file is not overwritten.
+- Settings are written only when **Save settings** is clicked. There is no
+  autosave.
+- **Reload config** re-reads the file without restarting the app. Source/demod
+  changes still require a reconnect.
+
+A platform-specific config directory will be added later. For now the file is
+in the workspace so it is easy to inspect while developing.
+
+The compiled fallback starts at 100.0 MHz FM with 40 dB gain. The development
+`config.toml` currently sets 91.6 MHz / 60 dB for broadcast testing; it is
+gitignored. For the airband, set 120.0 MHz, choose AM, and reconnect to apply.
+**Record IQ** writes a SigMF capture to `captures/gui_<timestamp>`.
 
 Note: the Pluto/AD9361 accepts only certain sample rates. On the tested unit
 `2.084`, `2.4`, `3.2`, and `4.0` MSPS work, while `1.0` and `2.0` MSPS are
@@ -153,6 +172,7 @@ crates/
   midori-plugin/         # plugin manifest, events, host trait
   midori-engine/         # LiveSession, VFO channel, recorder sink
   midori-orbit/          # TLE, Maidenhead, SGP4 passes, Doppler
+  midori-config/         # TOML settings, fallbacks, atomic save
   midori-cli/            # `midori` command-line tool
   midori-app/            # egui desktop UI (`midori-gui`)
 plugins/

@@ -1,0 +1,68 @@
+# Midori example configuration.
+#
+# Copy this file to config.toml in the workspace (or use it as a reference).
+# config.toml is gitignored because it may contain local frequencies, grids,
+# and TLE paths. Only the manual "Save settings" button writes it.
+
+version = 1
+
+[source]
+uri = "usb:"
+center_freq_hz = 100_000_000
+sample_rate_hz = 2_400_000
+bandwidth_hz = 2_400_000
+gain_db = 40
+gain_mode = "manual"
+rf_port = "A_BALANCED"
+buffer_samples = 32768
+
+[demod]
+mode = "fm"
+
+[demod.fm]
+bandwidth_hz = 200_000
+channel_rate_hz = 240_000
+audio_rate_hz = 48_000
+audio_bandwidth_hz = 15_000
+deemphasis_us = 50
+bfo_hz = 700
+
+[demod.am]
+bandwidth_hz = 6_000
+channel_rate_hz = 48_000
+audio_rate_hz = 48_000
+audio_bandwidth_hz = 4_000
+deemphasis_us = 0
+bfo_hz = 700
+
+[demod.cw]
+bandwidth_hz = 500
+channel_rate_hz = 48_000
+audio_rate_hz = 48_000
+audio_bandwidth_hz = 2_000
+deemphasis_us = 0
+bfo_hz = 700
+
+[decoder]
+cw_enabled = false
+
+[ui]
+spectrum_ratio = 0.55
+decoder_dock_open = true
+decoder_tab = "passes"
+left_panel_width = 280
+right_panel_width = 320
+decoder_dock_height = 170
+theme = "dark"
+colormap = "viridis"
+db_min = -110
+db_max = -20
+fft_size = 4096
+waterfall_rows = 200
+waterfall_width = 1024
+
+[satellite]
+tle_path = ""
+grid = "PM95"
+min_elevation_deg = 5
+auto_predict = false

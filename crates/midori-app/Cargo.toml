@@ -17,6 +17,7 @@ crossbeam-channel.workspace = true
 eframe.workspace = true
 egui.workspace = true
 egui_plot.workspace = true
+midori-config.workspace = true
 midori-core.workspace = true
 midori-dsp.workspace = true
 midori-engine.workspace = true
