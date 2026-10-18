@@ -6,11 +6,14 @@ use anyhow::{Result, bail};
 use midori_core::{
     Channel, DemodMode, Frame, FrameMeta, IqBlock, StreamData, StreamSpec, VfoConfig,
 };
-use midori_dsp::{AmDemod, AmDemodConfig, AudioAgc, FmDemod, FmDemodConfig};
+use midori_dsp::{
+    AmDemod, AmDemodConfig, AudioAgc, CwDemod, CwDemodConfig, FmDemod, FmDemodConfig,
+};
 
 enum Demod {
     Am(AmDemod),
     Fm(FmDemod),
+    Cw(CwDemod),
 }
 
 /// One digital channel inside a session.
@@ -58,6 +61,15 @@ impl Channel for VfoChannel {
                 offset_hz: self.config.offset_hz,
                 bandwidth_hz: self.config.bandwidth_hz,
             })),
+            DemodMode::Cw => Demod::Cw(CwDemod::new(CwDemodConfig {
+                input_rate_hz: spec.sample_rate_hz,
+                channel_rate_hz: self.config.channel_rate_hz,
+                output_rate_hz: self.config.audio_rate_hz,
+                offset_hz: self.config.offset_hz,
+                bandwidth_hz: self.config.bandwidth_hz,
+                bfo_hz: self.config.bfo_hz,
+                audio_bandwidth_hz: self.config.audio_bandwidth_hz,
+            })),
             other => bail!("demod mode {other:?} is not implemented yet"),
         };
 
@@ -77,6 +89,7 @@ impl Channel for VfoChannel {
         match demod {
             Demod::Am(demod) => demod.process(&iq.samples, &mut self.audio_scratch),
             Demod::Fm(demod) => demod.process(&iq.samples, &mut self.audio_scratch),
+            Demod::Cw(demod) => demod.process(&iq.samples, &mut self.audio_scratch),
         }
         if self.audio_scratch.is_empty() {
             return Ok(());
@@ -154,6 +167,7 @@ mod tests {
             channel_rate_hz: 240_000.0,
             audio_bandwidth_hz: 15_000.0,
             deemphasis_us: 0.0,
+            bfo_hz: 700.0,
         });
         channel.configure(&spec).unwrap();
 

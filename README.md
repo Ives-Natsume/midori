@@ -23,10 +23,11 @@ Doppler correction, recording, and plugins for SSTV/SSDV/FT4/CW.
   to 16-bit PCM WAV.
 - FM channel demodulation (channelizer + polar discriminator + de-emphasis +
   audio low-pass + resample) to 16-bit PCM WAV.
-- Live FM/AM audio through `cpal`, driven by the same `VfoChannel` used for
+- CW product demodulation with a 700 Hz BFO, feeding the CW decoder plugin.
+- Live FM/AM/CW audio through `cpal`, driven by the same `VfoChannel` used for
   offline captures, with a simple AGC.
 - egui desktop UI with spectrum/waterfall, frequency/gain controls, demod
-  selection, and one-click SigMF recording.
+  selection, CW decoder panel, and one-click SigMF recording.
 - Core contracts for frames, digital VFOs, channels, sinks, sessions, and
   out-of-process decoder plugins.
 - Out-of-process sidecar host with a length-prefixed JSON/binary protocol.
@@ -170,7 +171,9 @@ MIDORI_AUTOCONNECT=1 MIDORI_CW=1 ./target/release/midori-gui
 
 It assumes a 700 Hz CW tone and writes decoded text into the CW panel. Enable
 the **CW decoder** checkbox before connecting; changing it while connected
-requires a reconnect.
+requires a reconnect. For real CW, select the **CW** demod, tune the hardware
+LO to the carrier, and leave the VFO at zero offset; the core BFO places the
+carrier at 700 Hz.
 
 The plugin protocol and sidecar ABI are documented in
 [`plugins/README.md`](plugins/README.md).

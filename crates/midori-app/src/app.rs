@@ -179,6 +179,7 @@ impl MidoriApp {
             match self.demod_mode {
                 DemodMode::Fm => (200_000.0, 240_000.0, 15_000.0, 50.0),
                 DemodMode::Am => (6_000.0, 48_000.0, 4_000.0, 0.0),
+                DemodMode::Cw => (500.0, 48_000.0, 2_000.0, 0.0),
                 _ => (15_000.0, 48_000.0, 3_000.0, 0.0),
             };
         let vfo = VfoConfig {
@@ -190,6 +191,7 @@ impl MidoriApp {
             channel_rate_hz,
             audio_bandwidth_hz,
             deemphasis_us,
+            bfo_hz: 700.0,
         };
 
         let (data_tx, data_rx) = bounded(4);
@@ -508,6 +510,7 @@ impl MidoriApp {
                 let demod = match self.demod_mode {
                     DemodMode::Fm => "FM",
                     DemodMode::Am => "AM",
+                    DemodMode::Cw => "CW",
                     _ => "?",
                 };
                 ui.label(format!(
@@ -594,6 +597,7 @@ impl MidoriApp {
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.demod_mode, DemodMode::Fm, "FM");
                     ui.selectable_value(&mut self.demod_mode, DemodMode::Am, "AM");
+                    ui.selectable_value(&mut self.demod_mode, DemodMode::Cw, "CW");
                 });
                 if self.demod_mode != previous_demod && (self.is_connected || self.is_connecting) {
                     self.status_msg = "Reconnect to apply demod mode".to_string();

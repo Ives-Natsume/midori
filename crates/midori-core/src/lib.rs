@@ -218,6 +218,9 @@ pub struct VfoConfig {
     pub audio_bandwidth_hz: f64,
     /// FM de-emphasis in microseconds; 0 disables it.
     pub deemphasis_us: f64,
+    /// CW beat-frequency oscillator, Hz. The CW demod places the carrier at
+    /// this audio tone.
+    pub bfo_hz: f64,
 }
 
 pub type VfoId = u32;
@@ -243,6 +246,7 @@ impl VfoConfig {
             channel_rate_hz: 240_000.0,
             audio_bandwidth_hz: 15_000.0,
             deemphasis_us: 50.0,
+            bfo_hz: 700.0,
         }
     }
 }

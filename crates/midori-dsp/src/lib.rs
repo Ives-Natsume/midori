@@ -709,6 +709,118 @@ impl FmDemod {
     }
 }
 
+// ---------------------------------------------------------------------------
+// CW demodulator
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy)]
+pub struct CwDemodConfig {
+    pub input_rate_hz: f64,
+    pub channel_rate_hz: f64,
+    pub output_rate_hz: f64,
+    pub offset_hz: f64,
+    /// Complex channel bandwidth before the BFO.
+    pub bandwidth_hz: f64,
+    /// Beat-frequency oscillator, e.g. 700 Hz.
+    pub bfo_hz: f64,
+    pub audio_bandwidth_hz: f64,
+}
+
+impl Default for CwDemodConfig {
+    fn default() -> Self {
+        Self {
+            input_rate_hz: 2_400_000.0,
+            channel_rate_hz: 48_000.0,
+            output_rate_hz: 48_000.0,
+            offset_hz: 0.0,
+            bandwidth_hz: 500.0,
+            bfo_hz: 700.0,
+            audio_bandwidth_hz: 2_000.0,
+        }
+    }
+}
+
+/// CW product demodulator: channelize, mix with a BFO, take the real part.
+pub struct CwDemod {
+    channelizer: ComplexChannelizer,
+    channel_rate_hz: f64,
+    bfo_phase: f64,
+    bfo_phase_inc: f64,
+    audio_lp: Lowpass4,
+    baseband: Vec<Complex32>,
+    resample_next: f64,
+    resample_step: f64,
+    input_index: f64,
+    previous_audio: f64,
+}
+
+impl CwDemod {
+    pub fn new(config: CwDemodConfig) -> Self {
+        let channelizer = ComplexChannelizer::new(
+            config.input_rate_hz,
+            config.channel_rate_hz,
+            config.offset_hz,
+            config.bandwidth_hz,
+        );
+        let channel_rate_hz = channelizer.output_rate_hz();
+        let audio_bandwidth = config
+            .audio_bandwidth_hz
+            .clamp(100.0, channel_rate_hz * 0.45);
+
+        Self {
+            channelizer,
+            channel_rate_hz,
+            bfo_phase: 0.0,
+            bfo_phase_inc: std::f64::consts::TAU * config.bfo_hz / channel_rate_hz,
+            audio_lp: Lowpass4::new(channel_rate_hz, audio_bandwidth),
+            baseband: Vec::new(),
+            resample_next: 1.0,
+            resample_step: channel_rate_hz / config.output_rate_hz,
+            input_index: 0.0,
+            previous_audio: 0.0,
+        }
+    }
+
+    pub fn output_rate_hz(&self) -> f64 {
+        self.channel_rate_hz / self.resample_step
+    }
+
+    pub fn process(&mut self, input: &[Sample], output: &mut Vec<f32>) {
+        self.baseband.clear();
+        self.channelizer.process(input, &mut self.baseband);
+
+        for index in 0..self.baseband.len() {
+            let sample = self.baseband[index];
+            let (sin, cos) = self.bfo_phase.sin_cos();
+            let audio = sample.re as f64 * cos - sample.im as f64 * sin;
+            self.bfo_phase += self.bfo_phase_inc;
+            if self.bfo_phase > std::f64::consts::TAU {
+                self.bfo_phase -= std::f64::consts::TAU;
+            }
+
+            let audio = self.audio_lp.process(audio);
+            self.input_index += 1.0;
+            while self.resample_next <= self.input_index {
+                let frac = (self.resample_next - (self.input_index - 1.0)).clamp(0.0, 1.0);
+                let value = self.previous_audio + (audio - self.previous_audio) * frac;
+                output.push(value as f32);
+                self.resample_next += self.resample_step;
+            }
+            self.previous_audio = audio;
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.channelizer.reset();
+        self.bfo_phase = 0.0;
+        self.audio_lp.reset();
+        self.baseband.clear();
+        self.resample_next = 1.0;
+        self.input_index = 0.0;
+        self.previous_audio = 0.0;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -778,6 +890,36 @@ mod tests {
         assert!(
             (measured - tone).abs() < 100.0,
             "measured {measured} Hz, expected {tone} Hz"
+        );
+    }
+
+    #[test]
+    fn cw_demod_produces_bfo_tone() {
+        let fs = 240_000.0;
+        let n = 48_000;
+        let input: Vec<Sample> = (0..n).map(|_| Sample::new(0.5, 0.0)).collect();
+        let mut demod = CwDemod::new(CwDemodConfig {
+            input_rate_hz: fs,
+            channel_rate_hz: 48_000.0,
+            output_rate_hz: 48_000.0,
+            offset_hz: 0.0,
+            bandwidth_hz: 500.0,
+            bfo_hz: 700.0,
+            audio_bandwidth_hz: 2_000.0,
+        });
+        let mut audio = Vec::new();
+        demod.process(&input, &mut audio);
+
+        assert!(audio.len() > 8_000, "got {} samples", audio.len());
+        let steady = &audio[2_000..];
+        let crossings = steady
+            .windows(2)
+            .filter(|window| (window[0] < 0.0) != (window[1] < 0.0))
+            .count();
+        let measured = crossings as f64 / 2.0 / (steady.len() as f64 / 48_000.0);
+        assert!(
+            (measured - 700.0).abs() < 30.0,
+            "measured {measured} Hz, expected 700 Hz"
         );
     }
 

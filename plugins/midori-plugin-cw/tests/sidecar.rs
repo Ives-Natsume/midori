@@ -58,7 +58,7 @@ fn cw_sidecar_decodes_cq() {
         .configure(&serde_json::json!({"tone_hz": 700.0}))
         .expect("configure");
 
-    let sample_rate = 48_000.0;
+    let sample_rate = 96_000.0;
     let tone_hz = 700.0;
     let mut audio = Vec::new();
     push_marks(&mut audio, sample_rate, tone_hz, "-.-.");
