@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+chrono.workspace = true
 cpal.workspace = true
 crossbeam-channel.workspace = true
 eframe.workspace = true
@@ -19,6 +20,7 @@ egui_plot.workspace = true
 midori-core.workspace = true
 midori-dsp.workspace = true
 midori-engine.workspace = true
+midori-orbit.workspace = true
 midori-plugin.workspace = true
 midori-source-libiio.workspace = true
 serde_json.workspace = true

@@ -26,8 +26,9 @@ Doppler correction, recording, and plugins for SSTV/SSDV/FT4/CW.
 - CW product demodulation with a 700 Hz BFO, feeding the CW decoder plugin.
 - Live FM/AM/CW audio through `cpal`, driven by the same `VfoChannel` used for
   offline captures, with a simple AGC.
-- egui desktop UI with spectrum/waterfall, frequency/gain controls, demod
-  selection, CW decoder panel, and one-click SigMF recording.
+- egui desktop UI with a fixed three-column layout, stacked spectrum/waterfall,
+  click-to-tune, a bottom CW/pass/log dock, demod selection, and one-click
+  SigMF recording.
 - Core contracts for frames, digital VFOs, channels, sinks, sessions, and
   out-of-process decoder plugins.
 - Out-of-process sidecar host with a length-prefixed JSON/binary protocol.
@@ -69,12 +70,8 @@ cargo run --release -p midori-app
 # or: ./target/release/midori-gui
 ```
 
-The UI starts at 91.6 MHz FM with 60 dB gain for the current broadcast test,
-and plays demodulated audio through the default output device. For the
-airband, set the centre frequency to 120.0 MHz, choose AM, and reconnect to
-apply. The UI currently connects to RX1A at 2.4 MSPS with manual gain.
-**Record IQ** writes a SigMF capture to `captures/gui_<timestamp>`.
-For development, `MIDORI_AUTOCONNECT=1` connects on startup.
+See the **UI** section below for the layout, satellite pass planner, and
+development environment variables.
 
 Record 30 seconds of the aviation band around 120 MHz from RX1A:
 
@@ -119,6 +116,27 @@ Predict ISS passes for a Maidenhead locator:
 `midori help` lists all options. Pass a capture base path; a trailing
 `.sigmf` is accepted and normalised. The CLI adds the `.sigmf-data` /
 `.sigmf-meta` suffixes.
+
+## UI
+
+The desktop UI uses a fixed three-column layout:
+
+- **Left — Radio**: source, gain, demod summary, FFT/waterfall info, recording,
+  satellite summary.
+- **Centre — Spectrum + waterfall**: stacked view with a draggable splitter.
+  Click either view to retune; the VFO and passband are overlaid.
+- **Right — Decoders**: CW control, plugin list, decoder dock visibility.
+- **Bottom dock**: `CW` output, `Passes` planner, and `Log`.
+
+The Passes tab loads a TLE file, converts a Maidenhead locator, and predicts
+the next 24 hours of passes with SGP4. The placeholder grid is `PM95`; pass
+times are UTC. `MIDORI_TLE`, `MIDORI_CW`, and `MIDORI_AUTOCONNECT` are handy
+for development.
+
+The UI starts at 91.6 MHz FM with 60 dB gain for the current broadcast test,
+and plays demodulated audio through the default output device. For the
+airband, set the centre frequency to 120.0 MHz, choose AM, and reconnect to
+apply. **Record IQ** writes a SigMF capture to `captures/gui_<timestamp>`.
 
 Note: the Pluto/AD9361 accepts only certain sample rates. On the tested unit
 `2.084`, `2.4`, `3.2`, and `4.0` MSPS work, while `1.0` and `2.0` MSPS are

@@ -5,18 +5,21 @@
 //! a slow or disconnected device from freezing the window.
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use chrono::{Local, Utc};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
 
 use midori_core::{DemodMode, Session, Sink, SourceConfig, StreamSpec, VfoConfig};
+use midori_dsp::median;
 use midori_engine::{LiveSession, PluginHandle, PluginSink, RecorderSink, VfoChannel, plugin_sink};
+use midori_orbit::{GridSquare, Pass, PassPredictor, Tle};
 use midori_plugin::{
     DisplayUpdate, InputSpec, Manifest, OutputKind, PROTOCOL_VERSION, PluginEvent, PluginHost,
     SidecarPlugin,
@@ -72,15 +75,14 @@ enum WorkerEvent {
 // UI state
 // ---------------------------------------------------------------------------
 
-#[derive(PartialEq, Clone, Copy)]
-enum ViewMode {
-    Spectrum,
-    Waterfall,
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum DecoderTab {
+    Cw,
+    Passes,
+    Log,
 }
 
 pub struct MidoriApp {
-    view_mode: ViewMode,
-
     data_rx: Option<Receiver<SpectrumFrame>>,
     event_rx: Option<Receiver<WorkerEvent>>,
     cmd_tx: Option<Sender<WorkerCommand>>,
@@ -90,6 +92,9 @@ pub struct MidoriApp {
     current_spectrum: Vec<[f64; 2]>,
     center_freq_hz: f64,
     sample_rate_hz: f64,
+    signal_dbfs: f32,
+    noise_dbfs: f32,
+    spectrum_ratio: f32,
 
     waterfall_rows: VecDeque<Vec<f32>>,
     waterfall_texture: Option<egui::TextureHandle>,
@@ -98,12 +103,23 @@ pub struct MidoriApp {
     gain_input: String,
     demod_mode: DemodMode,
 
-    is_connected: bool,
-    is_connecting: bool,
-    is_recording: bool,
+    decoder_tab: DecoderTab,
+    decoder_dock_open: bool,
     cw_enabled: bool,
     cw_text: String,
     cw_status: String,
+
+    tle_path: String,
+    grid_input: String,
+    min_elev_input: String,
+    satellite_name: String,
+    passes: Vec<Pass>,
+    pass_status: String,
+    log: VecDeque<String>,
+
+    is_connected: bool,
+    is_connecting: bool,
+    is_recording: bool,
     auto_connect: bool,
     recording_path: Option<PathBuf>,
     status_msg: String,
@@ -113,7 +129,6 @@ pub struct MidoriApp {
 impl Default for MidoriApp {
     fn default() -> Self {
         Self {
-            view_mode: ViewMode::Spectrum,
             data_rx: None,
             event_rx: None,
             cmd_tx: None,
@@ -122,17 +137,30 @@ impl Default for MidoriApp {
             current_spectrum: Vec::new(),
             center_freq_hz: 91_600_000.0,
             sample_rate_hz: SAMPLE_RATE_HZ,
+            signal_dbfs: f32::NEG_INFINITY,
+            noise_dbfs: f32::NEG_INFINITY,
+            spectrum_ratio: 0.55,
             waterfall_rows: VecDeque::with_capacity(WATERFALL_ROWS + 4),
             waterfall_texture: None,
             freq_input: "91.600".to_string(),
             gain_input: "60".to_string(),
             demod_mode: DemodMode::Fm,
-            is_connected: false,
-            is_connecting: false,
-            is_recording: false,
+            decoder_tab: DecoderTab::Passes,
+            decoder_dock_open: true,
             cw_enabled: std::env::var_os("MIDORI_CW").is_some(),
             cw_text: String::new(),
             cw_status: "idle".to_string(),
+            tle_path: std::env::var("MIDORI_TLE")
+                .unwrap_or_else(|_| "captures/iss.tle".to_string()),
+            grid_input: "PM95".to_string(),
+            min_elev_input: "5".to_string(),
+            satellite_name: "No TLE loaded".to_string(),
+            passes: Vec::new(),
+            pass_status: "Load a TLE and predict passes".to_string(),
+            log: VecDeque::with_capacity(200),
+            is_connected: false,
+            is_connecting: false,
+            is_recording: false,
             auto_connect: std::env::var_os("MIDORI_AUTOCONNECT").is_some(),
             recording_path: None,
             status_msg: "Not connected".to_string(),
@@ -142,7 +170,20 @@ impl Default for MidoriApp {
 }
 
 impl MidoriApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let mut visuals = egui::Visuals::dark();
+        visuals.panel_fill = egui::Color32::from_rgb(16, 20, 26);
+        visuals.window_fill = egui::Color32::from_rgb(20, 25, 32);
+        visuals.extreme_bg_color = egui::Color32::from_rgb(10, 13, 18);
+        visuals.faint_bg_color = egui::Color32::from_rgb(24, 30, 38);
+        visuals.selection.bg_fill = egui::Color32::from_rgb(30, 120, 180);
+        cc.egui_ctx.set_visuals(visuals);
+
+        let mut style = (*cc.egui_ctx.style()).clone();
+        style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+        style.spacing.button_padding = egui::vec2(8.0, 4.0);
+        cc.egui_ctx.set_style(style);
+
         Self::default()
     }
 
@@ -257,6 +298,16 @@ impl MidoriApp {
     // Commands
     // -----------------------------------------------------------------------
 
+    fn set_frequency_mhz(&mut self, mhz: f64) {
+        if self.is_recording {
+            self.error_msg = Some("stop recording before retuning".to_string());
+            return;
+        }
+        let mhz = mhz.clamp(0.0, 6_000.0);
+        self.freq_input = format!("{mhz:.6}");
+        self.send_frequency();
+    }
+
     fn send_frequency(&mut self) {
         let Ok(freq_mhz) = self.freq_input.parse::<f64>() else {
             self.error_msg = Some("invalid centre frequency".to_string());
@@ -326,6 +377,86 @@ impl MidoriApp {
     }
 
     // -----------------------------------------------------------------------
+    // Satellite / pass planning
+    // -----------------------------------------------------------------------
+
+    fn push_log(&mut self, message: impl Into<String>) {
+        if self.log.len() >= 200 {
+            self.log.pop_front();
+        }
+        self.log.push_back(format!(
+            "{}  {}",
+            Utc::now().format("%H:%M:%S"),
+            message.into()
+        ));
+    }
+
+    fn predict_passes(&mut self) {
+        let tle = match Tle::from_file(Path::new(&self.tle_path)) {
+            Ok(tle) => tle,
+            Err(error) => {
+                self.pass_status = format!("TLE error: {error}");
+                self.push_log(self.pass_status.clone());
+                return;
+            }
+        };
+        let grid = match GridSquare::parse(&self.grid_input) {
+            Ok(grid) => grid,
+            Err(error) => {
+                self.pass_status = format!("grid error: {error}");
+                self.push_log(self.pass_status.clone());
+                return;
+            }
+        };
+        let min_elevation = match self.min_elev_input.parse::<f64>() {
+            Ok(value) if (0.0..=90.0).contains(&value) => value,
+            _ => {
+                self.pass_status = "minimum elevation must be 0..90".to_string();
+                return;
+            }
+        };
+
+        let observer = grid.observer(0.0);
+        let predictor = match PassPredictor::new(&tle, observer) {
+            Ok(predictor) => predictor,
+            Err(error) => {
+                self.pass_status = format!("SGP4 error: {error}");
+                self.push_log(self.pass_status.clone());
+                return;
+            }
+        };
+
+        let now = Utc::now();
+        match predictor.predict(now, now + chrono::Duration::hours(24), min_elevation) {
+            Ok(passes) => {
+                self.satellite_name = tle
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("NORAD {}", tle.norad_id));
+                self.pass_status = format!(
+                    "{} passes in the next 24 h | grid {} | min el {:.1}°",
+                    passes.len(),
+                    self.grid_input.to_uppercase(),
+                    min_elevation
+                );
+                self.passes = passes;
+                self.decoder_tab = DecoderTab::Passes;
+                self.decoder_dock_open = true;
+                self.push_log(format!("predicted {} passes", self.passes.len()));
+            }
+            Err(error) => {
+                self.pass_status = format!("prediction error: {error}");
+                self.push_log(self.pass_status.clone());
+            }
+        }
+    }
+
+    fn next_pass(&self) -> Option<&Pass> {
+        let now = Utc::now();
+        self.passes.iter().find(|pass| pass.los > now)
+    }
+
+    // -----------------------------------------------------------------------
     // Data polling
     // -----------------------------------------------------------------------
 
@@ -351,14 +482,17 @@ impl MidoriApp {
                         spec.center_freq_hz / 1e6,
                         spec.sample_rate_hz / 1e6
                     );
+                    self.push_log(self.status_msg.clone());
                 }
                 WorkerEvent::Error(message) => {
+                    self.push_log(format!("error: {message}"));
                     self.error_msg = Some(message);
                 }
                 WorkerEvent::Fatal(message) => {
                     self.is_connecting = false;
                     self.is_connected = false;
                     self.is_recording = false;
+                    self.push_log(format!("fatal: {message}"));
                     self.error_msg = Some(message);
                     self.status_msg = "Device error".to_string();
                     if let Some(handle) = self.worker.take() {
@@ -369,9 +503,11 @@ impl MidoriApp {
                     self.is_recording = true;
                     self.recording_path = Some(path.clone());
                     self.status_msg = format!("Recording {}", path.display());
+                    self.push_log(self.status_msg.clone());
                 }
                 WorkerEvent::RecordingError(message) => {
                     self.is_recording = false;
+                    self.push_log(format!("recording: {message}"));
                     self.error_msg = Some(message);
                     self.status_msg = "Recording stopped".to_string();
                 }
@@ -388,6 +524,7 @@ impl MidoriApp {
                         seconds,
                         samples
                     );
+                    self.push_log(self.status_msg.clone());
                 }
                 WorkerEvent::Plugin(event) => self.handle_plugin_event(event),
             }
@@ -422,6 +559,7 @@ impl MidoriApp {
                 } else {
                     message.clone()
                 };
+                self.push_log(format!("plugin: {message}"));
                 self.error_msg = Some(message);
             }
             PluginEvent::Packet { .. } => {}
@@ -446,6 +584,13 @@ impl MidoriApp {
             .collect();
         self.center_freq_hz = frame.center_freq_hz;
         self.sample_rate_hz = frame.sample_rate_hz;
+        self.noise_dbfs = median(&frame.spectrum_db);
+        self.signal_dbfs = frame
+            .spectrum_db
+            .iter()
+            .copied()
+            .filter(|value| value.is_finite())
+            .fold(f32::NEG_INFINITY, f32::max);
 
         let row = downsample(&frame.spectrum_db, WATERFALL_WIDTH);
         if self.waterfall_rows.len() >= WATERFALL_ROWS {
@@ -490,74 +635,330 @@ impl MidoriApp {
     // UI drawing
     // -----------------------------------------------------------------------
 
-    fn draw_top_panel(&self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
+    fn demod_bandwidth_hz(&self) -> f64 {
+        match self.demod_mode {
+            DemodMode::Fm => 200_000.0,
+            DemodMode::Am => 6_000.0,
+            DemodMode::Cw => 500.0,
+            _ => 15_000.0,
+        }
+    }
+
+    fn demod_label(&self) -> &'static str {
+        match self.demod_mode {
+            DemodMode::Fm => "FM",
+            DemodMode::Am => "AM",
+            DemodMode::Cw => "CW",
+            _ => "?",
+        }
+    }
+
+    fn draw_receiver_strip(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("receiver_strip").show(ctx, |ui| {
+            ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.heading("Midori SDR");
+                ui.label(egui::RichText::new("MIDORI").strong().size(14.0));
                 ui.separator();
-                ui.label(&self.status_msg);
-                if let Some(error) = &self.error_msg {
-                    ui.separator();
-                    ui.label(egui::RichText::new(error).color(egui::Color32::LIGHT_RED));
+
+                let freq_response = ui.add(
+                    egui::TextEdit::singleline(&mut self.freq_input)
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(120.0),
+                );
+                if freq_response.lost_focus()
+                    || (freq_response.has_focus()
+                        && ui.input(|input| input.key_pressed(egui::Key::Enter)))
+                {
+                    self.send_frequency();
                 }
+                ui.label("MHz");
+                if ui.small_button("-").on_hover_text("-10 kHz").clicked() {
+                    self.adjust_freq(-0.01);
+                }
+                if ui.small_button("+").on_hover_text("+10 kHz").clicked() {
+                    self.adjust_freq(0.01);
+                }
+                ui.separator();
+
+                let previous_demod = self.demod_mode;
+                ui.selectable_value(&mut self.demod_mode, DemodMode::Fm, "FM");
+                ui.selectable_value(&mut self.demod_mode, DemodMode::Am, "AM");
+                ui.selectable_value(&mut self.demod_mode, DemodMode::Cw, "CW");
+                if self.demod_mode != previous_demod && (self.is_connected || self.is_connecting) {
+                    self.status_msg = "Reconnect to apply demod mode".to_string();
+                }
+
+                ui.separator();
+                let record_text = if self.is_recording {
+                    egui::RichText::new("■ REC").color(egui::Color32::LIGHT_RED)
+                } else {
+                    egui::RichText::new("● Record IQ")
+                };
+                if ui.button(record_text).clicked() {
+                    if self.is_recording {
+                        self.stop_recording();
+                    } else {
+                        self.start_recording();
+                    }
+                }
+                ui.label(egui::RichText::new("Track: SGP4 next").weak());
+            });
+
+            ui.horizontal(|ui| {
+                let signal = if self.signal_dbfs.is_finite() {
+                    format!("{:.1}", self.signal_dbfs)
+                } else {
+                    "--".to_string()
+                };
+                let snr = if self.signal_dbfs.is_finite() && self.noise_dbfs.is_finite() {
+                    format!("{:.1}", self.signal_dbfs - self.noise_dbfs)
+                } else {
+                    "--".to_string()
+                };
+                ui.label(egui::RichText::new(format!("S {signal} dBFS  SNR {snr} dB")).weak());
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{}  |  BW {}  |  {:.3} MSPS  |  RX1A",
+                        self.demod_label(),
+                        format_bandwidth(self.demod_bandwidth_hz()),
+                        self.sample_rate_hz / 1e6
+                    ))
+                    .weak(),
+                );
+                if self.is_recording
+                    && let Some(path) = &self.recording_path
+                {
+                    ui.label(
+                        egui::RichText::new(format!("REC {}", path.display()))
+                            .color(egui::Color32::LIGHT_RED),
+                    );
+                }
+                if let Some(pass) = self.next_pass() {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "next {} {:.1}° at {}",
+                            self.satellite_name,
+                            pass.max_elevation_deg,
+                            pass.aos.format("%H:%M:%S")
+                        ))
+                        .weak(),
+                    );
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if let Some(error) = &self.error_msg {
+                        ui.label(egui::RichText::new(error).color(egui::Color32::LIGHT_RED));
+                    } else {
+                        ui.label(egui::RichText::new(&self.status_msg).weak());
+                    }
+                });
             });
         });
     }
 
     fn draw_bottom_bar(&self, ctx: &egui::Context) {
-        egui::TopBottomPanel::bottom("bottom_bar").show(ctx, |ui| {
+        egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                let demod = match self.demod_mode {
-                    DemodMode::Fm => "FM",
-                    DemodMode::Am => "AM",
-                    DemodMode::Cw => "CW",
-                    _ => "?",
-                };
-                ui.label(format!(
-                    "LO {:.3} MHz   {:.3} MSPS   FFT {}   {}",
-                    self.center_freq_hz / 1e6,
-                    self.sample_rate_hz / 1e6,
-                    FFT_SIZE,
-                    demod
-                ));
-                if self.is_recording {
+                let utc = Utc::now();
+                let local = Local::now();
+                ui.label(
+                    egui::RichText::new(format!(
+                        "UTC {}   Local {}",
+                        utc.format("%H:%M:%S"),
+                        local.format("%H:%M:%S")
+                    ))
+                    .monospace(),
+                );
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(format!(
+                        "LO {:.3} MHz   {:.3} MSPS   FFT {}",
+                        self.center_freq_hz / 1e6,
+                        self.sample_rate_hz / 1e6,
+                        FFT_SIZE
+                    ))
+                    .weak(),
+                );
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(format!("GRID {}", self.grid_input.to_uppercase())).weak(),
+                );
+
+                if let Some(pass) = self.next_pass() {
                     ui.separator();
-                    ui.label(egui::RichText::new("REC").color(egui::Color32::LIGHT_RED));
+                    let now = Utc::now();
+                    let label = if pass.aos > now {
+                        format!(
+                            "NEXT {} AOS {} ({} min)",
+                            self.satellite_name,
+                            pass.aos.format("%H:%M:%S"),
+                            (pass.aos - now).num_seconds() / 60
+                        )
+                    } else {
+                        format!(
+                            "IN PASS {}  max {:.1}°  LOS {}",
+                            self.satellite_name,
+                            pass.max_elevation_deg,
+                            pass.los.format("%H:%M:%S")
+                        )
+                    };
+                    ui.label(label);
                 }
+
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label("Pluto RX1A  |  cf32 core");
+                    if self.is_recording {
+                        ui.label(
+                            egui::RichText::new("REC")
+                                .color(egui::Color32::LIGHT_RED)
+                                .strong(),
+                        );
+                    }
+                    ui.label(
+                        egui::RichText::new(if self.is_connected {
+                            "connected"
+                        } else {
+                            "idle"
+                        })
+                        .weak(),
+                    );
                 });
             });
         });
     }
 
-    fn draw_decoder_panel(&self, ctx: &egui::Context) {
-        if !self.cw_enabled && self.cw_text.is_empty() {
+    fn draw_decoder_dock(&mut self, ctx: &egui::Context) {
+        if !self.decoder_dock_open {
             return;
         }
-        egui::TopBottomPanel::bottom("decoder_panel")
+        egui::TopBottomPanel::bottom("decoder_dock")
             .resizable(true)
-            .default_height(120.0)
+            .default_height(170.0)
+            .min_height(80.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.heading("CW");
-                    ui.label(&self.cw_status);
-                });
-                egui::ScrollArea::vertical()
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        ui.monospace(&self.cw_text);
+                    ui.selectable_value(&mut self.decoder_tab, DecoderTab::Cw, "CW");
+                    ui.selectable_value(&mut self.decoder_tab, DecoderTab::Passes, "Passes");
+                    ui.selectable_value(&mut self.decoder_tab, DecoderTab::Log, "Log");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("hide").clicked() {
+                            self.decoder_dock_open = false;
+                        }
+                        ui.label(egui::RichText::new("decoder dock").weak());
                     });
+                });
+                ui.separator();
+
+                match self.decoder_tab {
+                    DecoderTab::Cw => self.draw_cw_tab(ui),
+                    DecoderTab::Passes => self.draw_passes_tab(ui),
+                    DecoderTab::Log => self.draw_log_tab(ui),
+                }
             });
     }
 
-    fn draw_control_panel(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::right("control_panel")
-            .min_width(230.0)
+    fn draw_cw_tab(&self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("CW");
+            ui.label(&self.cw_status);
+        });
+        egui::ScrollArea::vertical()
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                if self.cw_text.is_empty() {
+                    ui.label(
+                        egui::RichText::new(
+                            "Enable the CW decoder, select CW demod, and tune a beacon.",
+                        )
+                        .weak(),
+                    );
+                } else {
+                    ui.monospace(&self.cw_text);
+                }
+            });
+    }
+
+    fn draw_passes_tab(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("TLE");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.tle_path)
+                    .hint_text("path/to/iss.tle")
+                    .desired_width(220.0),
+            );
+            ui.label("Grid");
+            ui.add(egui::TextEdit::singleline(&mut self.grid_input).desired_width(64.0));
+            ui.label("Min el");
+            ui.add(egui::TextEdit::singleline(&mut self.min_elev_input).desired_width(40.0));
+            if ui.button("Predict 24 h").clicked() {
+                self.predict_passes();
+            }
+            ui.label(egui::RichText::new(&self.pass_status).weak());
+        });
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(format!("Satellite: {}", self.satellite_name));
+            ui.label(egui::RichText::new("tracking: SGP4 next").weak());
+            ui.label(egui::RichText::new("times UTC").weak());
+        });
+
+        if self.passes.is_empty() {
+            ui.label(
+                egui::RichText::new("No passes loaded. Choose a TLE file and press Predict.")
+                    .weak(),
+            );
+            return;
+        }
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            egui::Grid::new("pass_table")
+                .striped(true)
+                .num_columns(7)
+                .show(ui, |ui| {
+                    ui.strong("#");
+                    ui.strong("AOS");
+                    ui.strong("TCA");
+                    ui.strong("LOS");
+                    ui.strong("Max el");
+                    ui.strong("AOS az");
+                    ui.strong("LOS az");
+                    ui.end_row();
+
+                    for (index, pass) in self.passes.iter().enumerate() {
+                        ui.label((index + 1).to_string());
+                        ui.monospace(pass.aos.format("%m-%d %H:%M:%S").to_string());
+                        ui.monospace(pass.tca.format("%m-%d %H:%M:%S").to_string());
+                        ui.monospace(pass.los.format("%m-%d %H:%M:%S").to_string());
+                        ui.label(format!("{:.1}°", pass.max_elevation_deg));
+                        ui.label(format!("{:.1}°", pass.aos_azimuth_deg));
+                        ui.label(format!("{:.1}°", pass.los_azimuth_deg));
+                        ui.end_row();
+                    }
+                });
+        });
+    }
+
+    fn draw_log_tab(&self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical()
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                if self.log.is_empty() {
+                    ui.label(egui::RichText::new("no log events yet").weak());
+                } else {
+                    for line in &self.log {
+                        ui.monospace(line);
+                    }
+                }
+            });
+    }
+
+    fn draw_radio_panel(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::left("radio_panel")
             .resizable(true)
+            .default_width(280.0)
+            .min_width(230.0)
             .show(ctx, |ui| {
                 ui.add_space(6.0);
-                ui.heading("Control");
+                ui.heading("Radio");
                 ui.separator();
 
                 if self.is_connected || self.is_connecting {
@@ -580,146 +981,216 @@ impl MidoriApp {
                     self.connect();
                 }
 
-                ui.add_space(8.0);
-                ui.separator();
-
-                ui.label("Display");
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.view_mode, ViewMode::Spectrum, "Spectrum");
-                    ui.selectable_value(&mut self.view_mode, ViewMode::Waterfall, "Waterfall");
-                });
-
-                ui.add_space(8.0);
-                ui.separator();
-
-                ui.label("Demod");
-                let previous_demod = self.demod_mode;
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.demod_mode, DemodMode::Fm, "FM");
-                    ui.selectable_value(&mut self.demod_mode, DemodMode::Am, "AM");
-                    ui.selectable_value(&mut self.demod_mode, DemodMode::Cw, "CW");
-                });
-                if self.demod_mode != previous_demod && (self.is_connected || self.is_connecting) {
-                    self.status_msg = "Reconnect to apply demod mode".to_string();
-                }
-
-                ui.add_space(6.0);
-                let previous_cw = self.cw_enabled;
-                ui.checkbox(&mut self.cw_enabled, "CW decoder (700 Hz)");
-                if self.cw_enabled != previous_cw && (self.is_connected || self.is_connecting) {
-                    self.status_msg = "Reconnect to apply CW decoder".to_string();
-                }
-
-                ui.add_space(8.0);
-                ui.separator();
-
-                ui.label(egui::RichText::new("Centre frequency (MHz)").strong());
-                let freq_edit = ui.add(
-                    egui::TextEdit::singleline(&mut self.freq_input)
-                        .hint_text("120.000")
-                        .desired_width(ui.available_width()),
-                );
-                if freq_edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    self.send_frequency();
-                }
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    if ui.button("<<").on_hover_text("-100 kHz").clicked() {
-                        self.adjust_freq(-0.1);
-                    }
-                    if ui.button("<").on_hover_text("-10 kHz").clicked() {
-                        self.adjust_freq(-0.01);
-                    }
-                    if ui.button(">").on_hover_text("+10 kHz").clicked() {
-                        self.adjust_freq(0.01);
-                    }
-                    if ui.button(">>").on_hover_text("+100 kHz").clicked() {
-                        self.adjust_freq(0.1);
-                    }
-                });
-                if ui
-                    .add_sized(
-                        [ui.available_width(), 28.0],
-                        egui::Button::new("Set frequency"),
-                    )
-                    .clicked()
-                {
-                    self.send_frequency();
-                }
-
-                ui.add_space(8.0);
-                ui.separator();
-
-                ui.label(egui::RichText::new("Manual gain (dB)").strong());
-                let gain_edit = ui.add(
-                    egui::TextEdit::singleline(&mut self.gain_input)
-                        .hint_text("40")
-                        .desired_width(ui.available_width()),
-                );
-                if gain_edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    self.send_gain();
-                }
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    if ui.button("-5").clicked() {
-                        self.adjust_gain(-5.0);
-                    }
-                    if ui.button("-1").clicked() {
-                        self.adjust_gain(-1.0);
-                    }
-                    if ui.button("+1").clicked() {
-                        self.adjust_gain(1.0);
-                    }
-                    if ui.button("+5").clicked() {
-                        self.adjust_gain(5.0);
-                    }
-                });
-                if ui
-                    .add_sized([ui.available_width(), 28.0], egui::Button::new("Set gain"))
-                    .clicked()
-                {
-                    self.send_gain();
-                }
-
-                ui.add_space(8.0);
-                ui.separator();
-
-                if self.is_recording {
-                    if ui
-                        .add_sized(
-                            [ui.available_width(), 30.0],
-                            egui::Button::new("Stop recording"),
-                        )
-                        .clicked()
-                    {
-                        self.stop_recording();
-                    }
-                    if let Some(path) = &self.recording_path {
+                egui::CollapsingHeader::new("Source")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Gain (dB)");
+                            let response = ui.add(
+                                egui::TextEdit::singleline(&mut self.gain_input)
+                                    .hint_text("60")
+                                    .desired_width(60.0),
+                            );
+                            if response.lost_focus()
+                                || (response.has_focus()
+                                    && ui.input(|input| input.key_pressed(egui::Key::Enter)))
+                            {
+                                self.send_gain();
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            if ui.small_button("-5").clicked() {
+                                self.adjust_gain(-5.0);
+                            }
+                            if ui.small_button("-1").clicked() {
+                                self.adjust_gain(-1.0);
+                            }
+                            if ui.small_button("+1").clicked() {
+                                self.adjust_gain(1.0);
+                            }
+                            if ui.small_button("+5").clicked() {
+                                self.adjust_gain(5.0);
+                            }
+                            if ui.small_button("Set").clicked() {
+                                self.send_gain();
+                            }
+                        });
+                        ui.label(egui::RichText::new("Port: RX1A / A_BALANCED").weak());
                         ui.label(
-                            egui::RichText::new(format!("REC {}", path.display()))
-                                .color(egui::Color32::LIGHT_RED),
+                            egui::RichText::new(format!(
+                                "Sample rate: {:.3} MSPS",
+                                self.sample_rate_hz / 1e6
+                            ))
+                            .weak(),
                         );
-                    }
-                } else if ui
-                    .add_sized([ui.available_width(), 30.0], egui::Button::new("Record IQ"))
-                    .clicked()
-                {
-                    self.start_recording();
-                }
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "LO: {:.3} MHz",
+                                self.center_freq_hz / 1e6
+                            ))
+                            .weak(),
+                        );
+                    });
 
-                ui.add_space(8.0);
-                ui.separator();
+                egui::CollapsingHeader::new("Demod")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        ui.label(format!(
+                            "Mode: {}   BW: {}",
+                            self.demod_label(),
+                            format_bandwidth(self.demod_bandwidth_hz())
+                        ));
+                        ui.label(
+                            egui::RichText::new(match self.demod_mode {
+                                DemodMode::Fm => "de-emphasis 50 µs",
+                                DemodMode::Cw => "BFO 700 Hz",
+                                DemodMode::Am => "envelope detector",
+                                _ => "",
+                            })
+                            .weak(),
+                        );
+                        let mut agc = false;
+                        let mut squelch = false;
+                        ui.add_enabled(false, egui::Checkbox::new(&mut agc, "AGC"));
+                        ui.add_enabled(false, egui::Checkbox::new(&mut squelch, "Squelch"));
+                    });
 
-                ui.collapsing("Keyboard shortcuts", |ui| {
-                    ui.label("Left / Right     +/-10 kHz");
-                    ui.label("Shift+Left/Right +/-100 kHz");
-                    ui.label("PageUp / PageDown +/-1 MHz");
-                    ui.label("G / H            gain +/-5 dB");
-                });
+                egui::CollapsingHeader::new("FFT / Waterfall")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new("FFT 4096 · Hann").weak());
+                        ui.label(egui::RichText::new("range -110 .. -20 dBFS").weak());
+                        ui.label(egui::RichText::new("colormap viridis").weak());
+                    });
+
+                egui::CollapsingHeader::new("Recording")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        if self.is_recording {
+                            ui.label(
+                                egui::RichText::new("recording IQ")
+                                    .color(egui::Color32::LIGHT_RED)
+                                    .strong(),
+                            );
+                            if let Some(path) = &self.recording_path {
+                                ui.label(egui::RichText::new(path.display().to_string()).weak());
+                            }
+                            if ui.button("Stop recording").clicked() {
+                                self.stop_recording();
+                            }
+                        } else if ui.button("Record IQ").clicked() {
+                            self.start_recording();
+                        }
+                        ui.label(egui::RichText::new("writes SigMF into captures/").weak());
+                    });
+
+                egui::CollapsingHeader::new("Satellite")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        ui.label(format!("TLE: {}", self.satellite_name));
+                        ui.label(format!("Grid: {}", self.grid_input.to_uppercase()));
+                        if let Some(pass) = self.next_pass() {
+                            ui.label(format!(
+                                "Next: {}  max {:.1}°  AOS {}",
+                                pass.aos.format("%m-%d %H:%M:%S"),
+                                pass.max_elevation_deg,
+                                pass.aos.format("%H:%M:%S")
+                            ));
+                        } else {
+                            ui.label(egui::RichText::new("no pass loaded").weak());
+                        }
+                        if ui.button("Open pass planner").clicked() {
+                            self.decoder_tab = DecoderTab::Passes;
+                            self.decoder_dock_open = true;
+                        }
+                        ui.label(egui::RichText::new("Doppler tracking: next step").weak());
+                    });
+
+                egui::CollapsingHeader::new("Keyboard shortcuts")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.label("Left / Right     +/-10 kHz");
+                        ui.label("Shift+Left/Right +/-100 kHz");
+                        ui.label("PageUp / PageDown +/-1 MHz");
+                        ui.label("G / H            gain +/-5 dB");
+                    });
             });
     }
 
-    fn draw_spectrum(&self, ui: &mut egui::Ui) {
+    fn draw_decoder_panel(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::right("decoder_panel")
+            .resizable(true)
+            .default_width(320.0)
+            .min_width(260.0)
+            .show(ctx, |ui| {
+                ui.add_space(6.0);
+                ui.heading("Decoders");
+                ui.separator();
+
+                egui::CollapsingHeader::new("CW")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        let previous = self.cw_enabled;
+                        ui.checkbox(&mut self.cw_enabled, "CW decoder (700 Hz)");
+                        if self.cw_enabled != previous && (self.is_connected || self.is_connecting)
+                        {
+                            self.status_msg = "Reconnect to apply CW decoder".to_string();
+                        }
+                        ui.label(format!("Status: {}", self.cw_status));
+                        ui.label(egui::RichText::new("output in the bottom CW tab").weak());
+                    });
+
+                egui::CollapsingHeader::new("Plugins")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        ui.label(format!(
+                            "CW: {}",
+                            if self.cw_enabled {
+                                "enabled"
+                            } else {
+                                "disabled"
+                            }
+                        ));
+                        ui.label(egui::RichText::new("more: APT · SSTV · SSDV · FT4").weak());
+                    });
+
+                ui.add_space(6.0);
+                ui.checkbox(&mut self.decoder_dock_open, "Show decoder dock");
+                ui.separator();
+                ui.label(egui::RichText::new("plugins run as separate processes").weak());
+            });
+    }
+
+    fn draw_central(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let total = ui.available_height().max(120.0);
+            let max_split = (total - 70.0).max(60.0);
+            let split = (total * self.spectrum_ratio).clamp(60.0, max_split);
+
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), split),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    self.draw_spectrum(ui);
+                },
+            );
+
+            let separator = ui
+                .allocate_response(egui::vec2(ui.available_width(), 6.0), egui::Sense::drag())
+                .on_hover_cursor(egui::CursorIcon::ResizeVertical);
+            ui.painter()
+                .rect_filled(separator.rect, 1.0, egui::Color32::from_rgb(45, 55, 68));
+            if separator.dragged() {
+                let delta = ui.input(|input| input.pointer.delta().y);
+                self.spectrum_ratio = ((split + delta) / total).clamp(0.2, 0.85);
+            }
+
+            self.draw_waterfall(ui);
+        });
+    }
+
+    fn draw_spectrum(&mut self, ui: &mut egui::Ui) {
+        let mut tune_to = None;
         let plot = Plot::new("spectrum_plot")
             .x_axis_label("Frequency (MHz)")
             .y_axis_label("Power (dBFS)")
@@ -738,33 +1209,47 @@ impl MidoriApp {
                     .width(1.2);
                 plot_ui.line(line);
             }
+
+            let center_mhz = self.center_freq_hz / 1e6;
+            let half_bw_mhz = self.demod_bandwidth_hz() / 2.0 / 1e6;
+            for (name, x) in [
+                ("VFO low", center_mhz - half_bw_mhz),
+                ("VFO high", center_mhz + half_bw_mhz),
+            ] {
+                let edges = Line::new(
+                    name,
+                    PlotPoints::new(vec![[x, DB_MIN as f64], [x, DB_MAX as f64]]),
+                )
+                .color(egui::Color32::from_rgb(90, 110, 130))
+                .width(0.8);
+                plot_ui.line(edges);
+            }
+            let vfo = Line::new(
+                "VFO",
+                PlotPoints::new(vec![
+                    [center_mhz, DB_MIN as f64],
+                    [center_mhz, DB_MAX as f64],
+                ]),
+            )
+            .color(egui::Color32::from_rgb(80, 220, 255))
+            .width(1.0);
+            plot_ui.line(vfo);
+
+            if plot_ui.response().clicked()
+                && let Some(point) = plot_ui.pointer_coordinate()
+            {
+                tune_to = Some(point.x);
+            }
         });
+
+        if let Some(mhz) = tune_to {
+            self.set_frequency_mhz(mhz);
+        }
     }
 
-    fn draw_waterfall(&self, ui: &mut egui::Ui) {
+    fn draw_waterfall(&mut self, ui: &mut egui::Ui) {
         let available = ui.available_size();
-
-        if let Some(texture) = &self.waterfall_texture {
-            let (_, rect) = ui.allocate_space(available);
-            let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-            ui.painter()
-                .image(texture.id(), rect, uv, egui::Color32::WHITE);
-
-            let painter = ui.painter();
-            let steps = 5;
-            for i in 0..=steps {
-                let t = i as f32 / steps as f32;
-                let db = DB_MIN + t * (DB_MAX - DB_MIN);
-                let y = rect.min.y + (1.0 - t) * rect.height();
-                painter.text(
-                    egui::pos2(rect.max.x - 6.0, y),
-                    egui::Align2::RIGHT_CENTER,
-                    format!("{db:.0} dB"),
-                    egui::FontId::proportional(11.0),
-                    egui::Color32::WHITE,
-                );
-            }
-        } else {
+        let Some(texture_id) = self.waterfall_texture.as_ref().map(|texture| texture.id()) else {
             ui.centered_and_justified(|ui| {
                 ui.label(
                     egui::RichText::new("Waiting for IQ\nConnect the Pluto first")
@@ -772,11 +1257,81 @@ impl MidoriApp {
                         .color(egui::Color32::GRAY),
                 );
             });
+            return;
+        };
+
+        let response = ui
+            .allocate_response(available, egui::Sense::click())
+            .on_hover_cursor(egui::CursorIcon::Crosshair);
+        let rect = response.rect;
+        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        ui.painter()
+            .image(texture_id, rect, uv, egui::Color32::WHITE);
+
+        let painter = ui.painter();
+        let half = (self.demod_bandwidth_hz() / 2.0 / self.sample_rate_hz) as f32;
+        let x_center = rect.center().x;
+        let x_low = rect.min.x + (0.5 - half) * rect.width();
+        let x_high = rect.min.x + (0.5 + half) * rect.width();
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(x_low, rect.min.y),
+                egui::pos2(x_high, rect.max.y),
+            ),
+            0.0,
+            egui::Color32::from_rgba_unmultiplied(30, 200, 255, 18),
+        );
+        painter.line_segment(
+            [
+                egui::pos2(x_center, rect.min.y),
+                egui::pos2(x_center, rect.max.y),
+            ],
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 220, 255)),
+        );
+
+        let steps = 5;
+        for i in 0..=steps {
+            let t = i as f32 / steps as f32;
+            let db = DB_MIN + t * (DB_MAX - DB_MIN);
+            let y = rect.min.y + (1.0 - t) * rect.height();
+            painter.text(
+                egui::pos2(rect.max.x - 6.0, y),
+                egui::Align2::RIGHT_CENTER,
+                format!("{db:.0} dB"),
+                egui::FontId::proportional(11.0),
+                egui::Color32::WHITE,
+            );
+        }
+
+        for i in 0..=4 {
+            let t = i as f32 / 4.0;
+            let frequency =
+                self.center_freq_hz / 1e6 + (t as f64 - 0.5) * self.sample_rate_hz / 1e6;
+            let x = rect.min.x + t * rect.width();
+            painter.text(
+                egui::pos2(x, rect.max.y - 2.0),
+                egui::Align2::CENTER_BOTTOM,
+                format!("{frequency:.3}"),
+                egui::FontId::proportional(10.0),
+                egui::Color32::from_gray(200),
+            );
+        }
+
+        if response.clicked()
+            && let Some(position) = response.interact_pointer_pos()
+        {
+            let fraction = ((position.x - rect.min.x) / rect.width()).clamp(0.0, 1.0);
+            let frequency =
+                self.center_freq_hz / 1e6 + (fraction as f64 - 0.5) * self.sample_rate_hz / 1e6;
+            self.set_frequency_mhz(frequency);
         }
     }
 
     fn handle_keyboard(&mut self, ctx: &egui::Context) {
         if !self.is_connected || self.is_recording {
+            return;
+        }
+        if ctx.memory(|memory| memory.focused().is_some()) {
             return;
         }
         ctx.input(|input| {
@@ -818,15 +1373,12 @@ impl eframe::App for MidoriApp {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
 
-        self.draw_top_panel(ctx);
+        self.draw_receiver_strip(ctx);
         self.draw_bottom_bar(ctx);
+        self.draw_decoder_dock(ctx);
+        self.draw_radio_panel(ctx);
         self.draw_decoder_panel(ctx);
-        self.draw_control_panel(ctx);
-
-        egui::CentralPanel::default().show(ctx, |ui| match self.view_mode {
-            ViewMode::Spectrum => self.draw_spectrum(ui),
-            ViewMode::Waterfall => self.draw_waterfall(ui),
-        });
+        self.draw_central(ctx);
     }
 }
 
@@ -1095,6 +1647,14 @@ fn run_worker(
 // ---------------------------------------------------------------------------
 // Presentation helpers
 // ---------------------------------------------------------------------------
+
+fn format_bandwidth(hz: f64) -> String {
+    if hz >= 1_000.0 {
+        format!("{:.1} kHz", hz / 1_000.0)
+    } else {
+        format!("{hz:.0} Hz")
+    }
+}
 
 fn downsample(input: &[f32], width: usize) -> Vec<f32> {
     if input.len() == width || input.is_empty() {

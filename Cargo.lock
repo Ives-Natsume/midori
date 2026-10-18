@@ -1949,6 +1949,7 @@ name = "midori-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "cpal",
  "crossbeam-channel",
  "eframe",
@@ -1957,6 +1958,7 @@ dependencies = [
  "midori-core",
  "midori-dsp",
  "midori-engine",
+ "midori-orbit",
  "midori-plugin",
  "midori-source-libiio",
  "serde_json",
