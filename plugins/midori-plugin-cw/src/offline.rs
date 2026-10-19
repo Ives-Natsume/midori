@@ -13,7 +13,7 @@ use rustfft::FftPlanner;
 use midori_core::Sample;
 use midori_dsp::{ComplexChannelizer, CwDemod, CwDemodConfig};
 
-use crate::iq_wav::{WavIqReader, WavIqSpec};
+use midori_source_file::{WavIqReader, WavIqSpec};
 
 pub const WORKING_RATE_HZ: f64 = 60_000.0;
 pub const DEFAULT_SEARCH_HZ: f64 = 3_000.0;

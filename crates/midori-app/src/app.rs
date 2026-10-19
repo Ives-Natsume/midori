@@ -16,8 +16,8 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
 
-use midori_config::{AppConfig, Colormap, DecoderTab, Theme};
-use midori_core::{DemodMode, Session, Sink, SourceConfig, StreamSpec, VfoConfig};
+use midori_config::{AppConfig, Colormap, DecoderTab, SourceKind, Theme};
+use midori_core::{DemodMode, IqSource, Session, Sink, SourceConfig, StreamSpec, VfoConfig};
 use midori_dsp::median;
 use midori_engine::{LiveSession, PluginHandle, PluginSink, RecorderSink, VfoChannel, plugin_sink};
 use midori_orbit::{GridSquare, Pass, PassPredictor, Sgp4Doppler, Tle};
@@ -25,6 +25,7 @@ use midori_plugin::{
     DisplayUpdate, ImageFormat, InputSpec, Manifest, OutputKind, PROTOCOL_VERSION, PluginEvent,
     PluginHost, SidecarPlugin,
 };
+use midori_source_file::WavIqSource;
 use midori_source_libiio::LibiioSource;
 
 use crate::audio::{AudioOutput, AudioSink};
@@ -43,6 +44,7 @@ pub(crate) struct SpectrumFrame {
 
 enum WorkerCommand {
     SetFrequency(f64),
+    SetVfoOffset(f64),
     SetGain(f64),
     StartRecording(PathBuf),
     StopRecording,
@@ -50,13 +52,19 @@ enum WorkerCommand {
 }
 
 struct WorkerOptions {
+    source: WorkerSource,
     cw_enabled: bool,
     cw_tone_hz: f64,
     sstv_enabled: bool,
     sstv_output_dir: PathBuf,
-    source_uri: String,
     fft_size: usize,
     doppler: Option<DopplerOptions>,
+    initial_vfo_offset_hz: f64,
+}
+
+enum WorkerSource {
+    Pluto { uri: String },
+    File { path: PathBuf, loop_file: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +92,7 @@ enum WorkerEvent {
         source: PluginSource,
         event: PluginEvent,
     },
+    FileEnded,
     RecordingStarted(PathBuf),
     RecordingError(String),
     RecordingStopped {
@@ -124,6 +133,10 @@ pub struct MidoriApp {
     freq_input: String,
     gain_input: String,
     demod_mode: DemodMode,
+    source_kind: SourceKind,
+    file_path: String,
+    file_loop: bool,
+    vfo_offset_hz: f64,
 
     decoder_tab: DecoderTab,
     decoder_dock_open: bool,
@@ -164,10 +177,28 @@ impl Default for MidoriApp {
         let warning = loaded.warning.clone();
         let config = loaded.config;
 
-        let center_freq_hz = config.source.center_freq_hz;
+        let mut center_freq_hz = config.source.center_freq_hz;
         let sample_rate_hz = config.source.sample_rate_hz;
         let gain_db = config.source.gain_db;
         let demod_mode = config.demod.mode;
+        let mut source_kind = config.source.kind;
+        let mut file_path = config.source.file_path.clone();
+        let file_loop = config.source.file_loop;
+        if let Some(path) = std::env::var_os("MIDORI_FILE") {
+            file_path = path.to_string_lossy().into_owned();
+            source_kind = SourceKind::File;
+        }
+        if source_kind == SourceKind::File
+            && let Some(mhz) = frequency_from_path(&file_path)
+        {
+            center_freq_hz = mhz * 1e6;
+        }
+        let mut vfo_offset_hz = 0.0;
+        if source_kind == SourceKind::File
+            && let Ok(value) = std::env::var("MIDORI_VFO")
+        {
+            vfo_offset_hz = value.parse::<f64>().unwrap_or(0.0);
+        }
         let spectrum_ratio = config.ui.spectrum_ratio;
         let decoder_tab = config.ui.decoder_tab;
         let decoder_dock_open = config.ui.decoder_dock_open;
@@ -206,6 +237,10 @@ impl Default for MidoriApp {
             freq_input: format!("{:.6}", center_freq_hz / 1e6),
             gain_input: format!("{gain_db:.1}"),
             demod_mode,
+            source_kind,
+            file_path,
+            file_loop,
+            vfo_offset_hz,
             decoder_tab,
             decoder_dock_open,
             cw_enabled: std::env::var_os("MIDORI_CW").is_some() || cw_enabled,
@@ -280,6 +315,25 @@ impl MidoriApp {
             rf_port: Some(source.rf_port.clone()),
             buffer_samples: source.buffer_samples,
         };
+        self.center_freq_hz = freq_mhz * 1e6;
+        if !self.is_file_source() {
+            self.vfo_offset_hz = 0.0;
+        }
+
+        let worker_source = if self.is_file_source() {
+            if self.file_path.trim().is_empty() {
+                self.error_msg = Some("choose an I/Q file first".to_string());
+                return;
+            }
+            WorkerSource::File {
+                path: PathBuf::from(self.file_path.trim()),
+                loop_file: self.file_loop,
+            }
+        } else {
+            WorkerSource::Pluto {
+                uri: source.uri.clone(),
+            }
+        };
 
         let demod = self.config.demod.params(self.demod_mode);
         let vfo = VfoConfig {
@@ -294,14 +348,13 @@ impl MidoriApp {
             bfo_hz: demod.bfo_hz,
         };
         let cw_tone_hz = self.config.demod.cw.bfo_hz;
-        let source_uri = source.uri.clone();
         let fft_size = self.config.ui.fft_size;
         let cw_enabled = self.cw_enabled;
         let sstv_enabled = self.sstv_enabled;
         let sstv_output_dir = std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join("captures");
-        let doppler = self.doppler_tracking.then(|| DopplerOptions {
+        let doppler = (self.doppler_tracking && !self.is_file_source()).then(|| DopplerOptions {
             tle_path: PathBuf::from(&self.tle_path),
             grid: self.grid_input.clone(),
             downlink_hz: freq_mhz * 1e6,
@@ -313,13 +366,18 @@ impl MidoriApp {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop_flag);
         let options = WorkerOptions {
+            source: worker_source,
             cw_enabled,
             cw_tone_hz,
             sstv_enabled,
             sstv_output_dir,
-            source_uri,
             fft_size,
             doppler,
+            initial_vfo_offset_hz: if self.is_file_source() {
+                self.vfo_offset_hz
+            } else {
+                0.0
+            },
         };
 
         match thread::Builder::new()
@@ -335,7 +393,11 @@ impl MidoriApp {
                 self.is_connecting = true;
                 self.is_connected = false;
                 self.error_msg = None;
-                self.status_msg = "Connecting to Pluto SDR...".to_string();
+                self.status_msg = if self.is_file_source() {
+                    "Opening I/Q file...".to_string()
+                } else {
+                    "Connecting to Pluto SDR...".to_string()
+                };
             }
             Err(error) => {
                 self.error_msg = Some(format!("could not spawn worker: {error}"));
@@ -358,6 +420,10 @@ impl MidoriApp {
         self.is_connecting = false;
         self.is_recording = false;
         self.recording_path = None;
+        self.vfo_offset_hz = 0.0;
+        if self.is_file_source() {
+            self.freq_input = format!("{:.6}", self.center_freq_hz / 1e6);
+        }
         self.doppler_hz = 0.0;
         self.doppler_rate_hz_s = 0.0;
         self.current_spectrum.clear();
@@ -387,8 +453,22 @@ impl MidoriApp {
             return;
         };
         let hz = freq_mhz * 1e6;
+
+        if self.is_file_source() && (self.is_connected || self.is_connecting) {
+            let max_offset = (self.sample_rate_hz / 2.0 - self.demod_bandwidth_hz() / 2.0).max(0.0);
+            let offset = (hz - self.center_freq_hz).clamp(-max_offset, max_offset);
+            self.vfo_offset_hz = offset;
+            self.freq_input = format!("{:.6}", (self.center_freq_hz + offset) / 1e6);
+            if let Some(tx) = &self.cmd_tx {
+                let _ = tx.try_send(WorkerCommand::SetVfoOffset(offset));
+            }
+            return;
+        }
+
         self.center_freq_hz = hz;
-        if let Some(tx) = &self.cmd_tx {
+        if (self.is_connected || self.is_connecting)
+            && let Some(tx) = &self.cmd_tx
+        {
             let _ = tx.try_send(WorkerCommand::SetFrequency(hz));
         }
     }
@@ -408,9 +488,8 @@ impl MidoriApp {
             self.error_msg = Some("stop recording before retuning".to_string());
             return;
         }
-        let current = self.freq_input.parse::<f64>().unwrap_or(120.0);
-        self.freq_input = format!("{:.3}", (current + delta_mhz).max(0.0));
-        self.send_frequency();
+        let current = self.tuned_freq_hz() / 1e6;
+        self.set_frequency_mhz((current + delta_mhz).max(0.0));
     }
 
     fn adjust_gain(&mut self, delta_db: f64) {
@@ -450,7 +529,9 @@ impl MidoriApp {
     }
 
     fn save_config(&mut self) {
-        if let Ok(mhz) = self.freq_input.parse::<f64>() {
+        if self.is_file_source() {
+            self.config.source.center_freq_hz = self.center_freq_hz;
+        } else if let Ok(mhz) = self.freq_input.parse::<f64>() {
             self.config.source.center_freq_hz = mhz * 1e6;
         }
         if let Ok(gain) = self.gain_input.parse::<f64>() {
@@ -460,6 +541,9 @@ impl MidoriApp {
             self.config.satellite.min_elevation_deg = elevation;
         }
 
+        self.config.source.kind = self.source_kind;
+        self.config.source.file_path = self.file_path.clone();
+        self.config.source.file_loop = self.file_loop;
         self.config.demod.mode = self.demod_mode;
         self.config.decoder.cw_enabled = self.cw_enabled;
         self.config.decoder.sstv_enabled = self.sstv_enabled;
@@ -497,10 +581,14 @@ impl MidoriApp {
         }
 
         let config = &self.config;
+        self.source_kind = config.source.kind;
+        self.file_path = config.source.file_path.clone();
+        self.file_loop = config.source.file_loop;
         self.freq_input = format!("{:.6}", config.source.center_freq_hz / 1e6);
         self.gain_input = format!("{:.1}", config.source.gain_db);
         self.center_freq_hz = config.source.center_freq_hz;
         self.sample_rate_hz = config.source.sample_rate_hz;
+        self.vfo_offset_hz = 0.0;
         self.demod_mode = config.demod.mode;
         self.cw_enabled = config.decoder.cw_enabled;
         self.sstv_enabled = config.decoder.sstv_enabled;
@@ -604,6 +692,18 @@ impl MidoriApp {
         self.passes.iter().find(|pass| pass.los > now)
     }
 
+    fn is_file_source(&self) -> bool {
+        self.source_kind == SourceKind::File
+    }
+
+    fn tuned_freq_hz(&self) -> f64 {
+        if self.is_file_source() {
+            self.center_freq_hz + self.vfo_offset_hz
+        } else {
+            self.center_freq_hz
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Data polling
     // -----------------------------------------------------------------------
@@ -625,11 +725,25 @@ impl MidoriApp {
                     self.is_connected = true;
                     self.center_freq_hz = spec.center_freq_hz;
                     self.sample_rate_hz = spec.sample_rate_hz;
-                    self.status_msg = format!(
-                        "Connected | {:.3} MHz | {:.3} MSPS",
-                        spec.center_freq_hz / 1e6,
-                        spec.sample_rate_hz / 1e6
-                    );
+                    if self.is_file_source() {
+                        self.freq_input =
+                            format!("{:.6}", (spec.center_freq_hz + self.vfo_offset_hz) / 1e6);
+                    } else {
+                        self.vfo_offset_hz = 0.0;
+                    }
+                    self.status_msg = if self.is_file_source() {
+                        format!(
+                            "File | {:.3} MHz | {:.3} MSPS",
+                            spec.center_freq_hz / 1e6,
+                            spec.sample_rate_hz / 1e6
+                        )
+                    } else {
+                        format!(
+                            "Connected | {:.3} MHz | {:.3} MSPS",
+                            spec.center_freq_hz / 1e6,
+                            spec.sample_rate_hz / 1e6
+                        )
+                    };
                     self.push_log(self.status_msg.clone());
                 }
                 WorkerEvent::Doppler {
@@ -656,6 +770,17 @@ impl MidoriApp {
                     if let Some(handle) = self.worker.take() {
                         let _ = handle.join();
                     }
+                }
+                WorkerEvent::FileEnded => {
+                    self.is_connected = false;
+                    self.is_connecting = false;
+                    self.is_recording = false;
+                    self.vfo_offset_hz = 0.0;
+                    if self.is_file_source() {
+                        self.freq_input = format!("{:.6}", self.center_freq_hz / 1e6);
+                    }
+                    self.status_msg = "file playback finished".to_string();
+                    self.push_log(self.status_msg.clone());
                 }
                 WorkerEvent::RecordingStarted(path) => {
                     self.is_recording = true;
@@ -908,7 +1033,11 @@ impl MidoriApp {
                 {
                     self.send_frequency();
                 }
-                ui.label("MHz");
+                ui.label(if self.is_file_source() && self.is_connected {
+                    "MHz (VFO)"
+                } else {
+                    "MHz"
+                });
                 if ui.small_button("-").on_hover_text("-10 kHz").clicked() {
                     self.adjust_freq(-0.01);
                 }
@@ -1022,15 +1151,23 @@ impl MidoriApp {
                     .monospace(),
                 );
                 ui.separator();
+                let centre_label = if self.is_file_source() { "CTR" } else { "LO" };
                 ui.label(
                     egui::RichText::new(format!(
-                        "LO {:.3} MHz   {:.3} MSPS   FFT {}",
+                        "{centre_label} {:.3} MHz   {:.3} MSPS   FFT {}",
                         self.center_freq_hz / 1e6,
                         self.sample_rate_hz / 1e6,
                         self.config.ui.fft_size
                     ))
                     .weak(),
                 );
+                if self.is_file_source() {
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(format!("VFO {:+.3} kHz", self.vfo_offset_hz / 1e3))
+                            .weak(),
+                    );
+                }
                 ui.separator();
                 ui.label(
                     egui::RichText::new(format!("GRID {}", self.grid_input.to_uppercase())).weak(),
@@ -1307,51 +1444,109 @@ impl MidoriApp {
                     {
                         self.disconnect();
                     }
-                } else if ui
-                    .add_sized(
-                        [ui.available_width(), 30.0],
-                        egui::Button::new("Connect Pluto"),
-                    )
-                    .clicked()
-                {
-                    self.connect();
+                } else {
+                    let start_label = if self.is_file_source() {
+                        "Start file"
+                    } else {
+                        "Connect Pluto"
+                    };
+                    if ui
+                        .add_sized(
+                            [ui.available_width(), 30.0],
+                            egui::Button::new(start_label),
+                        )
+                        .clicked()
+                    {
+                        self.connect();
+                    }
                 }
 
                 egui::CollapsingHeader::new("Source")
                     .default_open(true)
                     .show(ui, |ui| {
+                        let previous = self.source_kind;
                         ui.horizontal(|ui| {
-                            ui.label("Gain (dB)");
-                            let response = ui.add(
-                                egui::TextEdit::singleline(&mut self.gain_input)
-                                    .hint_text("60")
-                                    .desired_width(60.0),
+                            ui.label("Input");
+                            ui.selectable_value(&mut self.source_kind, SourceKind::Pluto, "Pluto");
+                            ui.selectable_value(&mut self.source_kind, SourceKind::File, "I/Q file");
+                        });
+                        if self.source_kind != previous && (self.is_connected || self.is_connecting)
+                        {
+                            self.status_msg = "Reconnect to change source".to_string();
+                        }
+
+                        if self.is_file_source() {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.file_path)
+                                    .hint_text("data/recording_437393500Hz.wav")
+                                    .desired_width(ui.available_width()),
                             );
-                            if response.lost_focus()
-                                || (response.has_focus()
-                                    && ui.input(|input| input.key_pressed(egui::Key::Enter)))
-                            {
-                                self.send_gain();
+                            ui.horizontal(|ui| {
+                                let from_name = frequency_from_path(&self.file_path);
+                                if ui
+                                    .add_enabled(from_name.is_some(), egui::Button::new("From filename"))
+                                    .clicked()
+                                    && let Some(mhz) = from_name
+                                {
+                                    self.freq_input = format!("{mhz:.6}");
+                                    self.center_freq_hz = mhz * 1e6;
+                                }
+                                ui.checkbox(&mut self.file_loop, "Loop");
+                            });
+                            if let Some(mhz) = frequency_from_path(&self.file_path) {
+                                ui.label(
+                                    egui::RichText::new(format!("filename centre: {mhz:.6} MHz"))
+                                        .weak(),
+                                );
+                            } else {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "set the centre from the filename or the frequency box",
+                                    )
+                                    .weak(),
+                                );
                             }
-                        });
-                        ui.horizontal(|ui| {
-                            if ui.small_button("-5").clicked() {
-                                self.adjust_gain(-5.0);
-                            }
-                            if ui.small_button("-1").clicked() {
-                                self.adjust_gain(-1.0);
-                            }
-                            if ui.small_button("+1").clicked() {
-                                self.adjust_gain(1.0);
-                            }
-                            if ui.small_button("+5").clicked() {
-                                self.adjust_gain(5.0);
-                            }
-                            if ui.small_button("Set").clicked() {
-                                self.send_gain();
-                            }
-                        });
-                        ui.label(egui::RichText::new("Port: RX1A / A_BALANCED").weak());
+                            ui.label(
+                                egui::RichText::new(
+                                    "RIFF/RF64 WAV, I/Q. Playback is real time; tune with the VFO after start.",
+                                )
+                                .weak(),
+                            );
+                        } else {
+                            ui.horizontal(|ui| {
+                                ui.label("Gain (dB)");
+                                let response = ui.add(
+                                    egui::TextEdit::singleline(&mut self.gain_input)
+                                        .hint_text("60")
+                                        .desired_width(60.0),
+                                );
+                                if response.lost_focus()
+                                    || (response.has_focus()
+                                        && ui.input(|input| input.key_pressed(egui::Key::Enter)))
+                                {
+                                    self.send_gain();
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                if ui.small_button("-5").clicked() {
+                                    self.adjust_gain(-5.0);
+                                }
+                                if ui.small_button("-1").clicked() {
+                                    self.adjust_gain(-1.0);
+                                }
+                                if ui.small_button("+1").clicked() {
+                                    self.adjust_gain(1.0);
+                                }
+                                if ui.small_button("+5").clicked() {
+                                    self.adjust_gain(5.0);
+                                }
+                                if ui.small_button("Set").clicked() {
+                                    self.send_gain();
+                                }
+                            });
+                            ui.label(egui::RichText::new("Port: RX1A / A_BALANCED").weak());
+                        }
+
                         ui.label(
                             egui::RichText::new(format!(
                                 "Sample rate: {:.3} MSPS",
@@ -1359,13 +1554,27 @@ impl MidoriApp {
                             ))
                             .weak(),
                         );
+                        let centre_label = if self.is_file_source() {
+                            "File centre"
+                        } else {
+                            "LO"
+                        };
                         ui.label(
                             egui::RichText::new(format!(
-                                "LO: {:.3} MHz",
+                                "{centre_label}: {:.3} MHz",
                                 self.center_freq_hz / 1e6
                             ))
                             .weak(),
                         );
+                        if self.is_file_source() {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "VFO offset: {:+.3} kHz",
+                                    self.vfo_offset_hz / 1e3
+                                ))
+                                .weak(),
+                            );
+                        }
                     });
 
                 egui::CollapsingHeader::new("Demod")
@@ -1482,6 +1691,14 @@ impl MidoriApp {
                             );
                         } else {
                             ui.label(egui::RichText::new("Doppler tracking off").weak());
+                        }
+                        if self.is_file_source() {
+                            ui.label(
+                                egui::RichText::new(
+                                    "file playback: Doppler is already present in the recording",
+                                )
+                                .weak(),
+                            );
                         }
                     });
 
@@ -1636,10 +1853,11 @@ impl MidoriApp {
             }
 
             let center_mhz = self.center_freq_hz / 1e6;
+            let vfo_mhz = (self.center_freq_hz + self.vfo_offset_hz) / 1e6;
             let half_bw_mhz = self.demod_bandwidth_hz() / 2.0 / 1e6;
             for (name, x) in [
-                ("VFO low", center_mhz - half_bw_mhz),
-                ("VFO high", center_mhz + half_bw_mhz),
+                ("VFO low", vfo_mhz - half_bw_mhz),
+                ("VFO high", vfo_mhz + half_bw_mhz),
             ] {
                 let edges = Line::new(
                     name,
@@ -1652,13 +1870,25 @@ impl MidoriApp {
             let vfo = Line::new(
                 "VFO",
                 PlotPoints::new(vec![
-                    [center_mhz, self.db_min as f64],
-                    [center_mhz, self.db_max as f64],
+                    [vfo_mhz, self.db_min as f64],
+                    [vfo_mhz, self.db_max as f64],
                 ]),
             )
             .color(egui::Color32::from_rgb(80, 220, 255))
             .width(1.0);
             plot_ui.line(vfo);
+            if (vfo_mhz - center_mhz).abs() > 1e-9 {
+                let lo = Line::new(
+                    "LO",
+                    PlotPoints::new(vec![
+                        [center_mhz, self.db_min as f64],
+                        [center_mhz, self.db_max as f64],
+                    ]),
+                )
+                .color(egui::Color32::from_rgb(70, 80, 95))
+                .width(0.8);
+                plot_ui.line(lo);
+            }
 
             if plot_ui.response().clicked()
                 && let Some(point) = plot_ui.pointer_coordinate()
@@ -1695,9 +1925,10 @@ impl MidoriApp {
 
         let painter = ui.painter();
         let half = (self.demod_bandwidth_hz() / 2.0 / self.sample_rate_hz) as f32;
-        let x_center = rect.center().x;
-        let x_low = rect.min.x + (0.5 - half) * rect.width();
-        let x_high = rect.min.x + (0.5 + half) * rect.width();
+        let center_fraction = 0.5 + (self.vfo_offset_hz / self.sample_rate_hz) as f32;
+        let x_center = rect.min.x + center_fraction * rect.width();
+        let x_low = x_center - half * rect.width();
+        let x_high = x_center + half * rect.width();
         painter.rect_filled(
             egui::Rect::from_min_max(
                 egui::pos2(x_low, rect.min.y),
@@ -1993,13 +2224,33 @@ fn run_worker(
     cmd_rx: Receiver<WorkerCommand>,
     stop: Arc<AtomicBool>,
 ) {
-    let source = match LibiioSource::open(Some(&options.source_uri)) {
-        Ok(source) => source,
-        Err(error) => {
-            eprintln!("[worker] connect failed: {error}");
-            let _ = event_tx.try_send(WorkerEvent::Fatal(format!("connect failed: {error}")));
-            return;
-        }
+    let source: Box<dyn IqSource> = match &options.source {
+        WorkerSource::Pluto { uri } => match LibiioSource::open(Some(uri)) {
+            Ok(source) => Box::new(source),
+            Err(error) => {
+                eprintln!("[worker] connect failed: {error}");
+                let _ = event_tx.try_send(WorkerEvent::Fatal(format!("connect failed: {error}")));
+                return;
+            }
+        },
+        WorkerSource::File { path, loop_file } => match WavIqSource::open(path, *loop_file) {
+            Ok(source) => {
+                let _ = event_tx.try_send(WorkerEvent::Info(format!(
+                    "file: {} | {} ch | {:.3} MSPS | {:.1} s{}",
+                    path.display(),
+                    source.file_spec().channels,
+                    source.file_spec().sample_rate_hz / 1e6,
+                    source.file_spec().frames as f64 / source.file_spec().sample_rate_hz,
+                    if *loop_file { " | loop" } else { "" }
+                )));
+                Box::new(source)
+            }
+            Err(error) => {
+                eprintln!("[worker] file open failed: {error}");
+                let _ = event_tx.try_send(WorkerEvent::Fatal(format!("file open failed: {error}")));
+                return;
+            }
+        },
     };
 
     let doppler = options
@@ -2057,8 +2308,11 @@ fn run_worker(
     }
 
     let channel = VfoChannel::new(vfo);
-    let mut session = LiveSession::new(config, Box::new(source), vec![Box::new(channel)], sinks);
+    let mut session = LiveSession::new(config, source, vec![Box::new(channel)], sinks);
     session.set_doppler_source(doppler);
+    if options.initial_vfo_offset_hz != 0.0 {
+        session.set_vfo_offset(options.initial_vfo_offset_hz);
+    }
     let _audio_output = audio_output;
 
     if let Err(error) = session.start() {
@@ -2100,6 +2354,15 @@ fn run_worker(
                         let _ =
                             event_tx.try_send(WorkerEvent::Error(format!("tune failed: {error}")));
                     }
+                }
+                WorkerCommand::SetVfoOffset(offset) => {
+                    if recorder_handle.is_recording() {
+                        let _ = event_tx.try_send(WorkerEvent::Error(
+                            "stop recording before retuning".to_string(),
+                        ));
+                        continue;
+                    }
+                    session.set_vfo_offset(offset);
                 }
                 WorkerCommand::SetGain(db) => {
                     if let Err(error) = session.set_gain(db) {
@@ -2148,6 +2411,11 @@ fn run_worker(
         }
 
         if stop.load(Ordering::SeqCst) {
+            break;
+        }
+
+        if session.source_finished() {
+            let _ = event_tx.try_send(WorkerEvent::FileEnded);
             break;
         }
 
@@ -2246,6 +2514,15 @@ fn format_bandwidth(hz: f64) -> String {
     } else {
         format!("{hz:.0} Hz")
     }
+}
+
+/// Extract a centre frequency from names like `recording_437393500Hz.wav`.
+fn frequency_from_path(path: &str) -> Option<f64> {
+    let stem = Path::new(path).file_stem()?.to_str()?;
+    let tail = stem.rsplit('_').next()?;
+    let digits = tail.strip_suffix("Hz")?;
+    let hz = digits.parse::<f64>().ok()?;
+    (hz > 0.0).then_some(hz / 1e6)
 }
 
 /// Convert a plugin image event into an egui texture source.
@@ -2446,5 +2723,14 @@ mod tests {
     #[test]
     fn rejects_bad_rgba8_length() {
         assert!(decode_image_update(ImageFormat::Rgba8, 2, 1, &[0; 4]).is_err());
+    }
+
+    #[test]
+    fn parses_centre_from_recording_filename() {
+        assert_eq!(
+            frequency_from_path("data/BOTAN_TLM_CW_437393500Hz.wav"),
+            Some(437.3935)
+        );
+        assert_eq!(frequency_from_path("no-frequency.wav"), None);
     }
 }

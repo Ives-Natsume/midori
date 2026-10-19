@@ -19,6 +19,10 @@ hound.workspace = true
 midori-core.workspace = true
 midori-dsp.workspace = true
 midori-plugin.workspace = true
+midori-source-file.workspace = true
 num-complex.workspace = true
 rustfft.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+midori-engine = { path = "../../crates/midori-engine" }

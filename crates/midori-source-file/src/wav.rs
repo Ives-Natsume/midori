@@ -222,6 +222,17 @@ impl WavIqReader {
     pub fn data_len(&self) -> u64 {
         self.data_len
     }
+
+    /// Rewind to the first frame without reopening the file.
+    pub fn rewind(&mut self) -> Result<()> {
+        self.reader.seek(SeekFrom::Start(self.data_offset))?;
+        self.frames_read = 0;
+        Ok(())
+    }
+
+    pub fn remaining_frames(&self) -> u64 {
+        self.spec.frames.saturating_sub(self.frames_read)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

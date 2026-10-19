@@ -43,10 +43,21 @@ pub enum DecoderTab {
     Log,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceKind {
+    #[default]
+    Pluto,
+    File,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SourceSettings {
+    pub kind: SourceKind,
     pub uri: String,
+    pub file_path: String,
+    pub file_loop: bool,
     pub center_freq_hz: f64,
     pub sample_rate_hz: f64,
     pub bandwidth_hz: f64,
@@ -59,7 +70,10 @@ pub struct SourceSettings {
 impl Default for SourceSettings {
     fn default() -> Self {
         Self {
+            kind: SourceKind::Pluto,
             uri: "usb:".to_string(),
+            file_path: String::new(),
+            file_loop: false,
             center_freq_hz: 100_000_000.0,
             sample_rate_hz: 2_400_000.0,
             bandwidth_hz: 2_400_000.0,

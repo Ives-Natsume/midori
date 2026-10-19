@@ -91,6 +91,30 @@ impl LiveSession {
         self.source.set_gain(db)
     }
 
+    /// Retune every channel inside the captured band without moving the LO.
+    /// File playback uses this for click-to-tune; live hardware can use it
+    /// later for a true digital VFO.
+    pub fn set_vfo_offset(&mut self, offset_hz: f64) {
+        for channel in &mut self.channels {
+            channel.set_offset(offset_hz);
+        }
+        if let Some(spec) = self.spec {
+            self.update_nominal_frequency(spec.center_freq_hz);
+        }
+    }
+
+    pub fn vfo_offset_hz(&self) -> f64 {
+        self.channels
+            .first()
+            .map(|channel| channel.config().offset_hz)
+            .unwrap_or(0.0)
+    }
+
+    /// True when a finite file source has delivered its last block.
+    pub fn source_finished(&self) -> bool {
+        self.source.is_finished()
+    }
+
     /// Tell the Doppler source which RF frequency the channels are tuned to.
     /// With a single VFO this is the LO plus the configured VFO offset.
     fn update_nominal_frequency(&mut self, center_freq_hz: f64) {

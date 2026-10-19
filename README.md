@@ -18,6 +18,8 @@ Doppler correction, recording, and plugins for SSTV/SSDV/FT4/CW.
 ## Current capabilities
 
 - ADALM-PLUTO / AD9361 source through libiio (USB or network URI).
+- RIFF/RF64 I/Q WAV playback in the GUI, paced to real time, with digital VFO
+  tuning inside the recorded band.
 - RX1A (`A_BALANCED`) port selection, manual gain, sample rate and bandwidth.
 - Internal `cf32` stream with sample-count timestamps.
 - SigMF recording and replay (`ci16_le`, `cf32_le`).
@@ -135,13 +137,25 @@ Predict ISS passes for a Maidenhead locator:
 
 The desktop UI uses a fixed three-column layout:
 
-- **Left — Radio**: source, gain, demod summary, FFT/waterfall info, recording,
-  satellite summary.
+- **Left — Radio**: source input (Pluto or I/Q file), gain, demod summary,
+  FFT/waterfall info, recording, satellite summary.
 - **Centre — Spectrum + waterfall**: stacked view with a draggable splitter.
   Click either view to retune; the VFO and passband are overlaid.
 - **Right — Decoders**: CW and SSTV controls, plugin list, decoder dock
   visibility.
 - **Bottom dock**: `CW`, `SSTV`, `Passes` planner, and `Log`.
+
+For an I/Q file, choose **Input → I/Q file**, enter a RIFF/RF64 WAV path, and
+press **From filename** to take the centre frequency from a name like
+`..._437393500Hz.wav`. **Start file** plays in real time. Clicking the spectrum
+moves the digital VFO inside the recording; the file centre/LO stays fixed.
+Use `MIDORI_FILE`, `MIDORI_VFO`, `MIDORI_AUTOCONNECT`, and `MIDORI_CW` for a
+hands-free replay test:
+
+```bash
+MIDORI_FILE=data/BOTAN_TLM_CW_437393500Hz.wav MIDORI_VFO=-13420 \
+  MIDORI_AUTOCONNECT=1 MIDORI_CW=1 ./target/release/midori-gui
+```
 
 The Passes tab loads a TLE file, converts a Maidenhead locator, and predicts
 the next 24 hours of passes with SGP4. The placeholder grid is `PM95`; pass
@@ -168,6 +182,19 @@ TLE paths; `config.example.toml` is the committed template.
 - **Reload config** re-reads the file without restarting the app. Source/demod
   changes still require a reconnect.
 
+To start in file mode from config:
+
+```toml
+[source]
+kind = "file"            # "pluto" or "file"
+file_path = "data/BOTAN_TLM_CW_437393500Hz.wav"
+file_loop = false
+center_freq_hz = 437_393_500
+```
+
+`center_freq_hz` is the recording centre for a file, not the VFO frequency.
+`MIDORI_FILE` and `MIDORI_VFO` are development shortcuts for the same thing.
+
 A platform-specific config directory will be added later. For now the file is
 in the workspace so it is easy to inspect while developing.
 
@@ -186,6 +213,7 @@ rejected by the firmware. Use a supported rate and decimate digitally.
 crates/
   midori-core/           # stream types, source trait, no hardware/UI deps
   midori-source-libiio/  # Pluto/AD9361 backend
+  midori-source-file/    # RIFF/RF64 I/Q WAV playback
   midori-dsp/            # spectrum, biquads, AM demodulator
   midori-sigmf/          # SigMF writer/reader
   midori-plugin/         # plugin manifest, events, host trait

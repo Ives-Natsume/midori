@@ -47,6 +47,16 @@ impl VfoChannel {
     pub fn current_offset_hz(&self) -> f64 {
         self.config.offset_hz + self.doppler_hz
     }
+
+    fn retune_demod(&mut self) {
+        let absolute = self.current_offset_hz();
+        match &mut self.demod {
+            Some(Demod::Am(demod)) => demod.set_offset(absolute),
+            Some(Demod::Fm(demod)) => demod.set_offset(absolute),
+            Some(Demod::Cw(demod)) => demod.set_offset(absolute),
+            None => {}
+        }
+    }
 }
 
 impl Channel for VfoChannel {
@@ -94,13 +104,12 @@ impl Channel for VfoChannel {
     fn set_doppler(&mut self, offset_hz: f64, rate_hz_s: f64) {
         self.doppler_hz = offset_hz;
         self.doppler_rate_hz_s = rate_hz_s;
-        let absolute = self.current_offset_hz();
-        match &mut self.demod {
-            Some(Demod::Am(demod)) => demod.set_offset(absolute),
-            Some(Demod::Fm(demod)) => demod.set_offset(absolute),
-            Some(Demod::Cw(demod)) => demod.set_offset(absolute),
-            None => {}
-        }
+        self.retune_demod();
+    }
+
+    fn set_offset(&mut self, offset_hz: f64) {
+        self.config.offset_hz = offset_hz;
+        self.retune_demod();
     }
 
     fn process(&mut self, iq: &IqBlock, out: &mut Vec<Frame>) -> Result<()> {

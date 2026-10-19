@@ -7,7 +7,10 @@
 version = 1
 
 [source]
+kind = "pluto"
 uri = "usb:"
+file_path = ""
+file_loop = false
 center_freq_hz = 100_000_000
 sample_rate_hz = 2_400_000
 bandwidth_hz = 2_400_000

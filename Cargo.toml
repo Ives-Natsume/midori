@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/midori-core",
     "crates/midori-source-libiio",
+    "crates/midori-source-file",
     "crates/midori-dsp",
     "crates/midori-sigmf",
     "crates/midori-plugin",
@@ -47,3 +48,4 @@ midori-orbit = { path = "crates/midori-orbit" }
 midori-plugin = { path = "crates/midori-plugin" }
 midori-sigmf = { path = "crates/midori-sigmf" }
 midori-source-libiio = { path = "crates/midori-source-libiio" }
+midori-source-file = { path = "crates/midori-source-file" }

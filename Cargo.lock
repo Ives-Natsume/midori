@@ -1967,6 +1967,7 @@ dependencies = [
  "midori-engine",
  "midori-orbit",
  "midori-plugin",
+ "midori-source-file",
  "midori-source-libiio",
  "png",
  "serde_json",
@@ -2054,7 +2055,9 @@ dependencies = [
  "hound",
  "midori-core",
  "midori-dsp",
+ "midori-engine",
  "midori-plugin",
+ "midori-source-file",
  "num-complex",
  "rustfft",
  "serde_json",
@@ -2083,6 +2086,15 @@ dependencies = [
  "midori-core",
  "num-complex",
  "serde_json",
+]
+
+[[package]]
+name = "midori-source-file"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hound",
+ "midori-core",
 ]
 
 [[package]]

@@ -307,6 +307,10 @@ pub trait Channel: Send {
     /// exposed in frame metadata.
     fn set_doppler(&mut self, _offset_hz: f64, _rate_hz_s: f64) {}
 
+    /// Retune the digital VFO inside the captured band. Used by file playback
+    /// and, eventually, click-to-tune without moving the hardware LO.
+    fn set_offset(&mut self, _offset_hz: f64) {}
+
     /// Process one source block. Implementations append zero or more frames.
     fn process(&mut self, iq: &IqBlock, out: &mut Vec<Frame>) -> anyhow::Result<()>;
 }
@@ -432,4 +436,10 @@ pub trait IqSource: Send {
     fn set_frequency(&mut self, hz: f64) -> anyhow::Result<()>;
 
     fn set_gain(&mut self, db: f64) -> anyhow::Result<()>;
+
+    /// True when a finite source (file playback) has delivered its last block.
+    /// Live sources keep returning false.
+    fn is_finished(&self) -> bool {
+        false
+    }
 }

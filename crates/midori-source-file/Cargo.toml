@@ -1,0 +1,13 @@
+[package]
+name = "midori-source-file"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+midori-core.workspace = true
+
+[dev-dependencies]
+hound.workspace = true

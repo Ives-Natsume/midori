@@ -23,6 +23,7 @@ midori-dsp.workspace = true
 midori-engine.workspace = true
 midori-orbit.workspace = true
 midori-plugin.workspace = true
+midori-source-file.workspace = true
 midori-source-libiio.workspace = true
 png.workspace = true
 serde_json.workspace = true

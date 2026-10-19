@@ -13,7 +13,6 @@
 use std::collections::VecDeque;
 use std::f64::consts::TAU;
 
-pub mod iq_wav;
 pub mod offline;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
