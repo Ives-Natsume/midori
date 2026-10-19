@@ -62,20 +62,7 @@ fn main() -> Result<()> {
                     continue;
                 }
                 samples_since_status += samples.len() as u64;
-                for event in decoder.process(&samples) {
-                    match event {
-                        MorseEvent::Char(character) => {
-                            line.push(character);
-                            trim_line(&mut line);
-                            send_text(&mut writer, &line)?;
-                        }
-                        MorseEvent::Word => {
-                            line.push(' ');
-                            trim_line(&mut line);
-                            send_text(&mut writer, &line)?;
-                        }
-                    }
-                }
+                send_events(&mut writer, &mut line, decoder.process(&samples))?;
                 if samples_since_status >= sample_rate as u64 {
                     samples_since_status = 0;
                     send_status(&mut writer, decoder.wpm())?;
@@ -85,6 +72,26 @@ fn main() -> Result<()> {
         }
     }
 
+    send_events(&mut writer, &mut line, decoder.flush())?;
+
+    Ok(())
+}
+
+fn send_events<W: Write>(writer: &mut W, line: &mut String, events: Vec<MorseEvent>) -> Result<()> {
+    for event in events {
+        match event {
+            MorseEvent::Char(character) => {
+                line.push(character);
+                trim_line(line);
+                send_text(writer, line)?;
+            }
+            MorseEvent::Word => {
+                line.push(' ');
+                trim_line(line);
+                send_text(writer, line)?;
+            }
+        }
+    }
     Ok(())
 }
 

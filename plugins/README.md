@@ -134,16 +134,44 @@ The engine/UI renders display events generically; plugins do not link egui.
 
 ## Reference plugin: CW
 
-`plugins/midori-plugin-cw` mixes the audio to 700 Hz, tracks the envelope and
-noise floor, estimates dot length adaptively, decodes Morse characters, and
-emits text display events. It is intentionally small, but it exercises the
-whole sidecar boundary.
+`plugins/midori-plugin-cw` mixes the audio to 700 Hz, tracks the keying
+envelope with an adaptive noise/signal floor, debounces short dropouts, merges
+fades inside a dash, locks the dot timing after acquisition, and emits decoded
+text. It is deliberately beacon-grade rather than contest-grade.
+
+Decode an I/Q recording without a radio or TLE:
+
+```bash
+cargo run --release -p midori-plugin-cw --bin midori-cw-decode -- \
+  data/BOTAN_TLM_CW_437393500Hz.wav --offset -13420
+```
+
+The offline tool supports RIFF and RF64 WAV, tracks the carrier drift directly
+from the signal (no SGP4/TLE), demodulates to audio at a 700 Hz BFO, and can
+optionally send the result through the real sidecar:
+
+```bash
+midori-cw-decode recording.wav --sidecar
+```
+
+The Botan (`JS1YPT`) regression fixture is a 12 kHz, 354 KiB mono WAV derived
+from a 16.24 s RF64 capture. It decodes as:
+
+```text
+BOTAN JS1YPTNI8763
+```
+
+The short capture contains the callsign header and the start of the telemetry
+field; the full 16-hex payload would need a longer recording or a repeat.
 
 ```bash
 cargo test -p midori-plugin-cw
-cargo build --release --workspace
-MIDORI_CW=1 MIDORI_AUTOCONNECT=1 ./target/release/midori-gui
+cargo test -p midori-plugin-cw --release --test botan -- --ignored
 ```
+
+The ignored test runs the complete RF64 → tracking → audio → decode pipeline
+against the local `data/BOTAN_TLM_CW_437393500Hz.wav` file. The 112 MB raw
+capture is gitignored; the small derived fixture is committed.
 
 ## Reference plugin: SSTV
 

@@ -2051,8 +2051,12 @@ name = "midori-plugin-cw"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hound",
  "midori-core",
+ "midori-dsp",
  "midori-plugin",
+ "num-complex",
+ "rustfft",
  "serde_json",
 ]
 

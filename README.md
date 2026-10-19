@@ -27,6 +27,9 @@ Doppler correction, recording, and plugins for SSTV/SSDV/FT4/CW.
 - FM channel demodulation (channelizer + polar discriminator + de-emphasis +
   audio low-pass + resample) to 16-bit PCM WAV.
 - CW product demodulation with a 700 Hz BFO, feeding the CW decoder plugin.
+- CW sidecar with adaptive timing, fade-tolerant keying, and offline I/Q WAV
+  decoding (`midori-cw-decode`) with signal-derived carrier tracking; validated
+  against a Botan `JS1YPT` telemetry capture without a TLE.
 - SSTV decoding sidecar (slowrx) for PD-120, PD-180, Robot 36/72, Robot 24,
   Martin 1/2, and Scottie 1/2/DX; images are shown in the SSTV tab and saved as
   PNG. PD-120 and Robot 36 are the primary validated modes.
@@ -241,6 +244,17 @@ requires a reconnect. For real CW, select the **CW** demod, tune the hardware
 LO to the carrier, and leave the VFO at zero offset; the core BFO places the
 carrier at 700 Hz.
 
+For a recording, the offline CW tool reads RIFF/RF64 I/Q WAV, tracks the
+carrier drift itself (no TLE needed), and can exercise the real sidecar:
+
+```bash
+./target/release/midori-cw-decode recording.wav --offset -13420
+./target/release/midori-cw-decode recording.wav --sidecar
+```
+
+The Botan (`JS1YPT`) test capture decodes as `BOTAN JS1YPTNI8763`; the raw
+112 MB capture is gitignored and a small 12 kHz fixture is used in CI.
+
 The SSTV sidecar uses [slowrx](https://github.com/jasonherald/slowrx.rs):
 
 ```bash
@@ -265,10 +279,12 @@ The plugin protocol and sidecar ABI are documented in
 ## Roadmap
 
 1. SSTV live preview, real ARISS regression recordings, then SSDV/APT.
-2. Pass Arm/AOS/LOS automation and automatic Doppler arming.
-3. SSB/CW voice demodulation, squelch, and filter controls.
-4. Click-to-tune digital VFOs and shareable presets.
-5. SigMF browse/playback, packaging, and cross-platform audio.
+2. CW live AFC/tone tracking so drifting carriers decode without offline
+   pre-compensation.
+3. Pass Arm/AOS/LOS automation and automatic Doppler arming.
+4. SSB/CW voice demodulation, squelch, and filter controls.
+5. Click-to-tune digital VFOs and shareable presets.
+6. SigMF browse/playback, packaging, and cross-platform audio.
 
 ## License
 
