@@ -134,10 +134,14 @@ The engine/UI renders display events generically; plugins do not link egui.
 
 ## Reference plugin: CW
 
-`plugins/midori-plugin-cw` mixes the audio to 700 Hz, tracks the keying
-envelope with an adaptive noise/signal floor, debounces short dropouts, merges
-fades inside a dash, locks the dot timing after acquisition, and emits decoded
-text. It is deliberately beacon-grade rather than contest-grade.
+`plugins/midori-plugin-cw` mixes the audio near the configured BFO (700 Hz by
+default), tracks small residual pitch errors, tracks the keying envelope with
+an adaptive noise/signal floor, debounces short dropouts, merges fades inside a
+dash, locks the dot timing after acquisition, and emits decoded text. It is
+deliberately beacon-grade rather than contest-grade. Optional `configure`
+parameters are `tone_hz`, `envelope_hz` (product-detector bandwidth; 50 Hz by
+default, the GUI uses 120 Hz), and `start_at_signal` (the GUI sets this after
+its leading-silence gate).
 
 Decode an I/Q recording without a radio or TLE:
 

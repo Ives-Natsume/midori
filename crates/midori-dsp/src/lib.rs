@@ -840,9 +840,457 @@ impl CwDemod {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Carrier tracking / automatic tuning
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy)]
+pub struct CarrierEstimate {
+    /// Carrier frequency relative to the tracker centre, in Hz.
+    pub residual_hz: f64,
+    /// Peak power above the local noise floor, in dB.
+    pub snr_db: f32,
+}
+
+/// Causal narrowband carrier tracker used for CW AFC.
+///
+/// The tracker keeps a wide complex channel centred on `center_hz`, decimates
+/// it to a low working rate, and measures the strongest peak in a short FFT
+/// window. The wide window means the tracker can keep a drifting carrier in
+/// view even when the narrow demodulator filter would have lost it. The
+/// caller decides how to translate the residual into a VFO/demod offset.
+pub struct CarrierTracker {
+    channelizer: ComplexChannelizer,
+    fft: Arc<dyn Fft<f32>>,
+    fft_size: usize,
+    window: Vec<f32>,
+    buffer: Vec<Complex32>,
+    work: Vec<Complex32>,
+    levels: Vec<f32>,
+    center_hz: f64,
+    search_hz: f64,
+    working_rate_hz: f64,
+    last_residual_hz: Option<f64>,
+    rejected: u8,
+}
+
+impl CarrierTracker {
+    pub fn new(input_rate_hz: f64, center_hz: f64, working_rate_hz: f64, search_hz: f64) -> Self {
+        let working_rate_hz = working_rate_hz.clamp(4_000.0, input_rate_hz.max(4_000.0));
+        let ratio = (input_rate_hz / working_rate_hz).max(1.0);
+        let decimation = ratio.round().max(1.0) as usize;
+        let actual_rate = input_rate_hz / decimation as f64;
+        let search_hz = search_hz.clamp(200.0, actual_rate * 0.45);
+        let channelizer =
+            ComplexChannelizer::new(input_rate_hz, actual_rate, center_hz, search_hz * 2.0);
+
+        // 2048 symbols at 12 kHz is ~170 ms and gives ~6 Hz bins. Parabolic
+        // interpolation gets the estimate close enough for a 700 Hz BFO and
+        // the decoder's 50 Hz envelope filter.
+        let fft_size = 2_048;
+        let mut planner = FftPlanner::new();
+        let fft = planner.plan_fft_forward(fft_size);
+        let window: Vec<f32> = (0..fft_size)
+            .map(|index| {
+                let x = index as f32 / (fft_size - 1) as f32;
+                0.5 - 0.5 * (std::f32::consts::TAU * x).cos()
+            })
+            .collect();
+
+        Self {
+            channelizer,
+            fft,
+            fft_size,
+            window,
+            buffer: Vec::with_capacity(fft_size * 2),
+            work: vec![Complex32::new(0.0, 0.0); fft_size],
+            levels: vec![0.0; fft_size],
+            center_hz,
+            search_hz,
+            working_rate_hz: actual_rate,
+            last_residual_hz: None,
+            rejected: 0,
+        }
+    }
+
+    pub fn center_hz(&self) -> f64 {
+        self.center_hz
+    }
+
+    pub fn search_hz(&self) -> f64 {
+        self.search_hz
+    }
+
+    pub fn working_rate_hz(&self) -> f64 {
+        self.working_rate_hz
+    }
+
+    /// Move the wide acquisition window and discard the partial FFT buffer.
+    pub fn set_center(&mut self, center_hz: f64) {
+        self.center_hz = center_hz;
+        self.channelizer.set_offset(center_hz);
+        self.buffer.clear();
+        self.last_residual_hz = None;
+        self.rejected = 0;
+    }
+
+    /// Feed IQ samples. Returns `Some` when a fresh estimate is available.
+    pub fn process(&mut self, input: &[Sample]) -> Option<CarrierEstimate> {
+        self.channelizer.process(input, &mut self.buffer);
+        let mut last = None;
+        // A source block can hold more than one FFT frame at low sample
+        // rates. Drain every complete frame so the buffer cannot grow without
+        // bound.
+        while self.buffer.len() >= self.fft_size {
+            if let Some(estimate) = self.process_frame() {
+                last = Some(estimate);
+            }
+        }
+        last
+    }
+
+    fn process_frame(&mut self) -> Option<CarrierEstimate> {
+        // Subtract the complex mean to remove LO leakage/DC without losing
+        // keyed tones (a continuous carrier at exactly DC is not interesting:
+        // it is already on the VFO).
+        let mean = self.buffer[..self.fft_size]
+            .iter()
+            .fold(Complex32::new(0.0, 0.0), |acc, sample| acc + *sample)
+            / self.fft_size as f32;
+        for (dst, (sample, window)) in self
+            .work
+            .iter_mut()
+            .zip(self.buffer[..self.fft_size].iter().zip(self.window.iter()))
+        {
+            *dst = (*sample - mean) * *window;
+        }
+        self.fft.process(&mut self.work);
+
+        let bin_hz = self.working_rate_hz / self.fft_size as f64;
+        let half = self.fft_size / 2;
+        for (index, value) in self.work.iter().enumerate() {
+            self.levels[index] = (10.0 * (value.norm_sqr() as f64 + 1e-20).log10()) as f32;
+        }
+        let noise = median(&self.levels);
+
+        let mut best_index = 0usize;
+        let mut best_power = f32::NEG_INFINITY;
+        for index in 0..self.fft_size {
+            let signed = if index <= half {
+                index as i64
+            } else {
+                index as i64 - self.fft_size as i64
+            };
+            let frequency = signed as f64 * bin_hz;
+            // Ignore the exact DC bin and the extreme edges of the channel.
+            if frequency.abs() <= bin_hz * 1.5 || frequency.abs() > self.search_hz {
+                continue;
+            }
+            if self.levels[index] > best_power {
+                best_power = self.levels[index];
+                best_index = index;
+            }
+        }
+
+        // A CW carrier is a strong narrow peak. Requiring 18 dB over the local
+        // median rejects key-up noise peaks that would otherwise throw the VFO
+        // onto an unrelated signal.
+        let threshold = 18.0;
+        let mut result = None;
+        if best_power.is_finite() && best_power - noise >= threshold {
+            let mut delta = 0.0f64;
+            if best_index > 0 && best_index + 1 < self.fft_size {
+                let y0 = self.levels[best_index - 1] as f64;
+                let y1 = self.levels[best_index] as f64;
+                let y2 = self.levels[best_index + 1] as f64;
+                let denominator = y0 - 2.0 * y1 + y2;
+                if denominator.abs() > 1e-9 {
+                    delta = (0.5 * (y0 - y2) / denominator).clamp(-0.5, 0.5);
+                }
+            }
+            let signed = if best_index <= half {
+                best_index as f64
+            } else {
+                best_index as f64 - self.fft_size as f64
+            };
+            let residual_hz = (signed + delta) * bin_hz;
+
+            // A CW carrier drifts slowly. Reject a peak that is not close to
+            // the previous accepted track, but allow reacquisition after a
+            // short run of rejects (for example after a retune).
+            let continuous = self
+                .last_residual_hz
+                .is_none_or(|last| (residual_hz - last).abs() <= 120.0);
+            if continuous {
+                self.last_residual_hz = Some(residual_hz);
+                self.rejected = 0;
+                result = Some(CarrierEstimate {
+                    residual_hz,
+                    snr_db: best_power - noise,
+                });
+            } else {
+                self.rejected += 1;
+                if self.rejected >= 8 {
+                    self.last_residual_hz = Some(residual_hz);
+                    self.rejected = 0;
+                    result = Some(CarrierEstimate {
+                        residual_hz,
+                        snr_db: best_power - noise,
+                    });
+                }
+            }
+        }
+
+        self.buffer.drain(..self.fft_size);
+        result
+    }
+}
+
+/// Coarse whole-band narrowband peak scanner used by GUI auto-tune.
+///
+/// It mirrors the offline CW offset estimator: collect high-resolution FFT
+/// frames, then prefer the first frame with a strong peak over the single
+/// strongest frame. That starting point is much better for a drifting carrier
+/// than the peak of a max-hold spectrum.
+#[derive(Debug, Clone, Copy)]
+struct OffsetPeak {
+    frequency_hz: f64,
+    power: f64,
+    snr_db: f32,
+}
+
+pub struct OffsetScan {
+    sample_rate_hz: f64,
+    fft_size: usize,
+    fft: Arc<dyn Fft<f32>>,
+    window: Vec<f32>,
+    carry: Vec<Sample>,
+    work: Vec<Complex32>,
+    bins: Vec<usize>,
+    levels: Vec<f32>,
+    frames: Vec<OffsetPeak>,
+    max_frames: usize,
+}
+
+impl OffsetScan {
+    pub fn new(sample_rate_hz: f64, fft_size: usize, scan_range_hz: f64) -> Self {
+        let fft_size = fft_size.max(256).next_power_of_two();
+        let mut planner = FftPlanner::new();
+        let fft = planner.plan_fft_forward(fft_size);
+        let window: Vec<f32> = (0..fft_size)
+            .map(|index| {
+                let x = index as f32 / (fft_size - 1) as f32;
+                0.5 - 0.5 * (std::f32::consts::TAU * x).cos()
+            })
+            .collect();
+        let scan_range_hz = scan_range_hz.clamp(1_000.0, sample_rate_hz * 0.45);
+        let bin_hz = sample_rate_hz / fft_size as f64;
+        let half = fft_size / 2;
+        let bins: Vec<usize> = (0..fft_size)
+            .filter(|&index| {
+                let frequency = if index <= half {
+                    index as f64 * bin_hz
+                } else {
+                    (index as f64 - fft_size as f64) * bin_hz
+                };
+                frequency.abs() >= 500.0
+                    && frequency.abs() <= sample_rate_hz / 2.0 - 1_000.0
+                    && frequency.abs() <= scan_range_hz
+            })
+            .collect();
+
+        Self {
+            sample_rate_hz,
+            fft_size,
+            fft,
+            window,
+            carry: Vec::with_capacity(fft_size * 2),
+            work: vec![Complex32::new(0.0, 0.0); fft_size],
+            levels: vec![0.0; bins.len()],
+            bins,
+            frames: Vec::new(),
+            max_frames: 1_024,
+        }
+    }
+
+    pub fn fft_size(&self) -> usize {
+        self.fft_size
+    }
+
+    pub fn frames(&self) -> usize {
+        self.frames.len()
+    }
+
+    pub fn process(&mut self, input: &[Sample]) {
+        self.carry.extend_from_slice(input);
+        while self.carry.len() >= self.fft_size && self.frames.len() < self.max_frames {
+            for (dst, (sample, window)) in self
+                .work
+                .iter_mut()
+                .zip(self.carry[..self.fft_size].iter().zip(self.window.iter()))
+            {
+                *dst = *sample * *window;
+            }
+            self.fft.process(&mut self.work);
+
+            let bin_hz = self.sample_rate_hz / self.fft_size as f64;
+            let half = self.fft_size / 2;
+            let mut best_index = 0usize;
+            let mut best_power = f64::NEG_INFINITY;
+            for (slot, &index) in self.bins.iter().enumerate() {
+                let power = self.work[index].norm_sqr() as f64;
+                self.levels[slot] = (10.0 * (power + 1e-30).log10()) as f32;
+                if power > best_power {
+                    best_power = power;
+                    best_index = index;
+                }
+            }
+            if self.bins.is_empty() || !best_power.is_finite() || best_power <= 0.0 {
+                self.carry.drain(..self.fft_size);
+                continue;
+            }
+
+            let noise = median(&self.levels);
+            let peak_db = (10.0 * (best_power + 1e-30).log10()) as f32;
+            let snr_db = peak_db - noise;
+
+            let mut refined = if best_index <= half {
+                best_index as f64 * bin_hz
+            } else {
+                (best_index as f64 - self.fft_size as f64) * bin_hz
+            };
+            if best_index > 0 && best_index + 1 < self.fft_size {
+                let y0 = (self.work[best_index - 1].norm_sqr() as f64 + 1e-12).log10();
+                let y1 = (best_power + 1e-12).log10();
+                let y2 = (self.work[best_index + 1].norm_sqr() as f64 + 1e-12).log10();
+                let denominator = y0 - 2.0 * y1 + y2;
+                if denominator.abs() > 1e-9 {
+                    refined += (0.5 * (y0 - y2) / denominator).clamp(-0.5, 0.5) * bin_hz;
+                }
+            }
+
+            self.frames.push(OffsetPeak {
+                frequency_hz: refined,
+                power: best_power,
+                snr_db,
+            });
+            self.carry.drain(..self.fft_size);
+        }
+
+        if self.frames.len() >= self.max_frames {
+            self.carry.clear();
+        }
+    }
+
+    /// First strong peak, falling back to the strongest qualifying frame.
+    ///
+    /// A noise-only scan produces peaks about 10 dB above the median; requiring
+    /// 15 dB and either two frames or one 20 dB peak prevents auto-tune from
+    /// inventing a frequency when no CW signal is present.
+    pub fn result(&self) -> Option<f64> {
+        const MIN_SNR_DB: f32 = 15.0;
+        let strong: Vec<&OffsetPeak> = self
+            .frames
+            .iter()
+            .filter(|peak| peak.snr_db >= MIN_SNR_DB)
+            .collect();
+        if strong.len() < 2 && !strong.iter().any(|peak| peak.snr_db >= 20.0) {
+            return None;
+        }
+        let max_power = strong.iter().map(|peak| peak.power).fold(0.0f64, f64::max);
+        if max_power <= 0.0 {
+            return None;
+        }
+        for peak in strong {
+            if peak.power > 0.55 * max_power {
+                return Some(peak.frequency_hz);
+            }
+        }
+        self.frames
+            .iter()
+            .max_by(|a, b| a.power.total_cmp(&b.power))
+            .map(|peak| peak.frequency_hz)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn complex_tone(sample_rate: f64, frequency: f64, count: usize, amplitude: f32) -> Vec<Sample> {
+        let mut phase = 0.0f64;
+        let mut samples = Vec::with_capacity(count);
+        for _ in 0..count {
+            samples.push(Sample::new(
+                (phase.cos() as f32) * amplitude,
+                (phase.sin() as f32) * amplitude,
+            ));
+            phase += std::f64::consts::TAU * frequency / sample_rate;
+            if phase > std::f64::consts::TAU {
+                phase -= std::f64::consts::TAU;
+            }
+        }
+        samples
+    }
+
+    #[test]
+    fn carrier_tracker_measures_a_tone_offset() {
+        let sample_rate = 240_000.0;
+        let tone = 1_234.0;
+        let samples = complex_tone(sample_rate, tone, 240_000, 0.2);
+        let mut tracker = CarrierTracker::new(sample_rate, 0.0, 12_000.0, 3_000.0);
+        let mut estimate = None;
+        for block in samples.chunks(8_192) {
+            if let Some(value) = tracker.process(block) {
+                estimate = Some(value);
+            }
+        }
+        let estimate = estimate.expect("estimate");
+        assert!(
+            (estimate.residual_hz - tone).abs() < 20.0,
+            "tracked {} Hz, expected {tone} Hz",
+            estimate.residual_hz
+        );
+    }
+
+    #[test]
+    fn offset_scan_finds_a_narrowband_tone() {
+        let sample_rate = 240_000.0;
+        let tone = -12_345.0;
+        let samples = complex_tone(sample_rate, tone, 240_000 * 2, 0.2);
+        let mut scan = OffsetScan::new(sample_rate, 32_768, 100_000.0);
+        for block in samples.chunks(32_768) {
+            scan.process(block);
+        }
+        let estimate = scan.result().expect("peak");
+        assert!(
+            (estimate - tone).abs() < 100.0,
+            "scanned {estimate} Hz, expected {tone} Hz"
+        );
+    }
+
+    #[test]
+    fn offset_scan_rejects_noise_only() {
+        let sample_rate = 240_000.0;
+        let mut state = 0x1234_5678u32;
+        let mut samples = Vec::with_capacity(480_000);
+        for _ in 0..480_000 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let i = ((state >> 8) as f32 / 16_777_216.0 - 0.5) * 0.1;
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let q = ((state >> 8) as f32 / 16_777_216.0 - 0.5) * 0.1;
+            samples.push(Sample::new(i, q));
+        }
+        let mut scan = OffsetScan::new(sample_rate, 32_768, 100_000.0);
+        for block in samples.chunks(32_768) {
+            scan.process(block);
+        }
+        assert!(
+            scan.result().is_none(),
+            "noise-only scan invented {:?}",
+            scan.result()
+        );
+    }
 
     #[test]
     fn spectrum_peak_is_at_tone_bin() {

@@ -25,10 +25,12 @@ Doppler correction, recording, and plugins for SSTV/SSDV/FT4/CW.
   to 16-bit PCM WAV.
 - FM channel demodulation (channelizer + polar discriminator + de-emphasis +
   audio low-pass + resample) to 16-bit PCM WAV.
-- CW product demodulation with a 700 Hz BFO, feeding the CW decoder plugin.
-- CW sidecar with adaptive timing, fade-tolerant keying, and offline I/Q WAV
-  decoding (`midori-cw-decode`) with signal-derived carrier tracking; validated
-  against a Botan `JS1YPT` telemetry capture without a TLE.
+- CW product demodulation with a 700 Hz BFO, feeding the CW decoder plugin,
+  plus a real-time carrier AFC and a 4 s band scan for auto-tuning.
+- CW sidecar with adaptive tone/timing, fade-tolerant keying, leading-silence
+  gating, and offline I/Q WAV decoding (`midori-cw-decode`) with
+  signal-derived carrier tracking; validated against a Botan `JS1YPT` telemetry
+  capture without a TLE.
 - SSTV decoding sidecar (slowrx) for PD-120, PD-180, Robot 36/72, Robot 24,
   Martin 1/2, and Scottie 1/2/DX; images are shown in the SSTV tab and saved as
   PNG. PD-120 and Robot 36 are the primary validated modes.
@@ -37,8 +39,9 @@ Doppler correction, recording, and plugins for SSTV/SSDV/FT4/CW.
 - Live FM/AM/CW audio through `cpal`, driven by the same `VfoChannel` used for
   offline captures, with a simple AGC.
 - egui desktop UI with a fixed three-column layout, stacked spectrum/waterfall,
-  click-to-tune, a bottom CW/pass/log dock, demod selection, and one-click
-  SigMF recording.
+  click-to-tune, per-mode RF bandwidth controls, a waterfall that can follow or
+  independently show the spectrum zoom, a stable dB scale, a bottom
+  CW/pass/log dock, demod selection, and one-click SigMF recording.
 - Core contracts for frames, digital VFOs, channels, sinks, sessions, and
   out-of-process decoder plugins.
 - Out-of-process sidecar host with a length-prefixed JSON/binary protocol.
@@ -137,9 +140,17 @@ The desktop UI uses a fixed three-column layout:
 - **Left — Radio**: source input (Pluto or I/Q file), gain, demod summary,
   FFT/waterfall info, recording, satellite summary.
 - **Centre — Spectrum + waterfall**: stacked view with a draggable splitter.
-  Click either view to retune; the VFO and passband are overlaid.
-- **Right — Decoders**: CW and SSTV controls, plugin list, decoder dock
-  visibility.
+  Click either view to retune; the VFO and passband are overlaid. The
+  spectrum dB scale is fixed by the **FFT / Waterfall** dB-min/max controls, so
+  replaying a recording does not make the y axis jump. **Waterfall follows
+  spectrum zoom** crops the waterfall to the spectrum view; when it is off the
+  full band is shown and yellow boundary lines mark the spectrum view.
+- **Right — Decoders**: CW enable, AFC and **Auto tune CW carrier** (with a
+  warning when no narrowband CW signal is found), SSTV controls, plugin list,
+  decoder dock visibility.
+- **Left — Demod**: editable RF bandwidth, audio bandwidth, and FM
+  de-emphasis. Changes are applied to the running session after a short
+  debounce (no reconnect needed).
 - **Bottom dock**: `CW`, `SSTV`, `Passes` planner, and `Log`.
 
 For an I/Q file, choose **Input → I/Q file**, enter a RIFF/RF64 WAV path, and
@@ -263,11 +274,14 @@ cargo build --release --workspace
 MIDORI_AUTOCONNECT=1 MIDORI_CW=1 ./target/release/midori-gui
 ```
 
-It assumes a 700 Hz CW tone and writes decoded text into the CW panel. Enable
-the **CW decoder** checkbox before connecting; changing it while connected
-requires a reconnect. For real CW, select the **CW** demod, tune the hardware
-LO to the carrier, and leave the VFO at zero offset; the core BFO places the
-carrier at 700 Hz.
+It writes decoded text into the CW panel. Enable the **CW decoder** checkbox
+before connecting; changing it while connected requires a reconnect. For real
+CW, select the **CW** demod and either tune near the carrier and let **AFC**
+pull it in, or press **Auto tune CW carrier** to scan the band for a narrowband
+peak. The AFC keeps a drifting satellite carrier on the 700 Hz BFO, and the
+plugin also tracks small residual pitch errors. The default CW channel is
+2 kHz wide, which is more tolerant of drift than the old 500 Hz setting; the
+bandwidth is editable in the Demod panel.
 
 For a recording, the offline CW tool reads RIFF/RF64 I/Q WAV, tracks the
 carrier drift itself (no TLE needed), and can exercise the real sidecar:
@@ -304,12 +318,10 @@ The plugin protocol and sidecar ABI are documented in
 ## Roadmap
 
 1. SSTV live preview, real ARISS regression recordings, then SSDV/APT.
-2. CW live AFC/tone tracking so drifting carriers decode without offline
-   pre-compensation.
-3. Pass Arm/AOS/LOS automation and automatic Doppler arming.
-4. SSB/CW voice demodulation, squelch, and filter controls.
-5. Click-to-tune digital VFOs and shareable presets.
-6. SigMF browse/playback, packaging, and cross-platform audio.
+2. Pass Arm/AOS/LOS automation and automatic Doppler arming.
+3. SSB/CW voice demodulation, squelch, and filter presets.
+4. Shareable receiver presets and SigMF browse/playback.
+5. Packaging and cross-platform audio.
 
 ## License
 

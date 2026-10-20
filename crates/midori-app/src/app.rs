@@ -6,8 +6,8 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -17,9 +17,13 @@ use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
 
 use midori_config::{AppConfig, Colormap, DecoderTab, SourceKind, Theme};
-use midori_core::{DemodMode, IqSource, Session, Sink, SourceConfig, StreamSpec, VfoConfig};
+use midori_core::{
+    Channel, DemodMode, IqSource, Session, Sink, SourceConfig, StreamSpec, VfoConfig,
+};
 use midori_dsp::median;
-use midori_engine::{LiveSession, PluginHandle, PluginSink, RecorderSink, VfoChannel, plugin_sink};
+use midori_engine::{
+    CwStartGateSink, LiveSession, PluginHandle, PluginSink, RecorderSink, VfoChannel, plugin_sink,
+};
 use midori_orbit::{GridSquare, Pass, PassPredictor, Sgp4Doppler, Tle};
 use midori_plugin::{
     DisplayUpdate, ImageFormat, InputSpec, Manifest, OutputKind, PROTOCOL_VERSION, PluginEvent,
@@ -29,7 +33,7 @@ use midori_source_file::WavIqSource;
 use midori_source_libiio::LibiioSource;
 
 use crate::audio::{AudioOutput, AudioSink};
-use crate::sinks::SpectrumSink;
+use crate::sinks::{AutoTuneSink, AutoTuneState, SpectrumSink};
 
 // ---------------------------------------------------------------------------
 // Worker messages
@@ -46,14 +50,28 @@ enum WorkerCommand {
     SetFrequency(f64),
     SetVfoOffset(f64),
     SetGain(f64),
+    SetDemod(DemodUpdate),
+    SetCwAfc(bool),
+    AutoTune,
     StartRecording(PathBuf),
     StopRecording,
     Stop,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct DemodUpdate {
+    mode: DemodMode,
+    bandwidth_hz: f64,
+    audio_bandwidth_hz: f64,
+    deemphasis_us: f64,
+    bfo_hz: f64,
+    channel_rate_hz: f64,
+}
+
 struct WorkerOptions {
     source: WorkerSource,
     cw_enabled: bool,
+    cw_afc: bool,
     cw_tone_hz: f64,
     sstv_enabled: bool,
     sstv_output_dir: PathBuf,
@@ -92,6 +110,12 @@ enum WorkerEvent {
         source: PluginSource,
         event: PluginEvent,
     },
+    VfoOffset {
+        offset_hz: f64,
+    },
+    AutoTuneDone {
+        offset_hz: Option<f64>,
+    },
     FileEnded,
     RecordingStarted(PathBuf),
     RecordingError(String),
@@ -126,9 +150,12 @@ pub struct MidoriApp {
     db_min: f32,
     db_max: f32,
     colormap: Colormap,
+    reset_spectrum_view: bool,
+    spectrum_view_x: Option<(f64, f64)>,
 
     waterfall_rows: VecDeque<Vec<f32>>,
     waterfall_texture: Option<egui::TextureHandle>,
+    waterfall_follow: bool,
 
     freq_input: String,
     gain_input: String,
@@ -141,8 +168,11 @@ pub struct MidoriApp {
     decoder_tab: DecoderTab,
     decoder_dock_open: bool,
     cw_enabled: bool,
+    cw_afc: bool,
     cw_text: String,
     cw_status: String,
+    auto_tune_status: String,
+    auto_tune_failed: bool,
     sstv_enabled: bool,
     sstv_status: String,
     sstv_progress: f32,
@@ -168,6 +198,9 @@ pub struct MidoriApp {
     recording_path: Option<PathBuf>,
     status_msg: String,
     error_msg: Option<String>,
+
+    demod_dirty: bool,
+    last_demod_change: Instant,
 }
 
 impl Default for MidoriApp {
@@ -210,7 +243,9 @@ impl Default for MidoriApp {
         let grid_input = config.satellite.grid.clone();
         let min_elev_input = format!("{:.1}", config.satellite.min_elevation_deg);
         let cw_enabled = config.decoder.cw_enabled;
+        let cw_afc = config.decoder.cw_afc;
         let sstv_enabled = config.decoder.sstv_enabled;
+        let waterfall_follow = config.ui.waterfall_follow_spectrum;
         let doppler_tracking =
             std::env::var_os("MIDORI_DOPPLER").is_some() || config.satellite.doppler_tracking;
 
@@ -232,8 +267,11 @@ impl Default for MidoriApp {
             db_min,
             db_max,
             colormap,
+            reset_spectrum_view: false,
+            spectrum_view_x: None,
             waterfall_rows: VecDeque::with_capacity(waterfall_capacity),
             waterfall_texture: None,
+            waterfall_follow,
             freq_input: format!("{:.6}", center_freq_hz / 1e6),
             gain_input: format!("{gain_db:.1}"),
             demod_mode,
@@ -244,8 +282,11 @@ impl Default for MidoriApp {
             decoder_tab,
             decoder_dock_open,
             cw_enabled: std::env::var_os("MIDORI_CW").is_some() || cw_enabled,
+            cw_afc,
             cw_text: String::new(),
             cw_status: "idle".to_string(),
+            auto_tune_status: String::new(),
+            auto_tune_failed: false,
             sstv_enabled: std::env::var_os("MIDORI_SSTV").is_some() || sstv_enabled,
             sstv_status: "idle".to_string(),
             sstv_progress: 0.0,
@@ -269,6 +310,8 @@ impl Default for MidoriApp {
             recording_path: None,
             status_msg: "Not connected".to_string(),
             error_msg: None,
+            demod_dirty: false,
+            last_demod_change: Instant::now() - Duration::from_secs(1),
         }
     }
 }
@@ -350,6 +393,7 @@ impl MidoriApp {
         let cw_tone_hz = self.config.demod.cw.bfo_hz;
         let fft_size = self.config.ui.fft_size;
         let cw_enabled = self.cw_enabled;
+        let cw_afc = self.cw_afc;
         let sstv_enabled = self.sstv_enabled;
         let sstv_output_dir = std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
@@ -368,6 +412,7 @@ impl MidoriApp {
         let options = WorkerOptions {
             source: worker_source,
             cw_enabled,
+            cw_afc,
             cw_tone_hz,
             sstv_enabled,
             sstv_output_dir,
@@ -393,6 +438,9 @@ impl MidoriApp {
                 self.is_connecting = true;
                 self.is_connected = false;
                 self.error_msg = None;
+                self.demod_dirty = false;
+                self.auto_tune_status.clear();
+                self.auto_tune_failed = false;
                 self.status_msg = if self.is_file_source() {
                     "Opening I/Q file...".to_string()
                 } else {
@@ -429,6 +477,9 @@ impl MidoriApp {
         self.current_spectrum.clear();
         self.waterfall_rows.clear();
         self.waterfall_texture = None;
+        self.spectrum_view_x = None;
+        self.auto_tune_status.clear();
+        self.auto_tune_failed = false;
         self.error_msg = None;
         self.status_msg = "Disconnected".to_string();
     }
@@ -466,9 +517,13 @@ impl MidoriApp {
         }
 
         self.center_freq_hz = hz;
+        // A hardware retune starts with a fresh digital VFO. This also clears
+        // any AFC correction from the previous frequency.
+        self.vfo_offset_hz = 0.0;
         if (self.is_connected || self.is_connecting)
             && let Some(tx) = &self.cmd_tx
         {
+            let _ = tx.try_send(WorkerCommand::SetVfoOffset(0.0));
             let _ = tx.try_send(WorkerCommand::SetFrequency(hz));
         }
     }
@@ -480,6 +535,53 @@ impl MidoriApp {
         };
         if let Some(tx) = &self.cmd_tx {
             let _ = tx.try_send(WorkerCommand::SetGain(gain_db));
+        }
+    }
+
+    fn send_demod_update(&mut self) {
+        self.config.demod.mode = self.demod_mode;
+        let params = self.config.demod.params(self.demod_mode);
+        let update = DemodUpdate {
+            mode: self.demod_mode,
+            bandwidth_hz: params.bandwidth_hz,
+            audio_bandwidth_hz: params.audio_bandwidth_hz,
+            deemphasis_us: params.deemphasis_us,
+            bfo_hz: params.bfo_hz,
+            channel_rate_hz: params.channel_rate_hz,
+        };
+        if let Some(tx) = &self.cmd_tx
+            && tx.try_send(WorkerCommand::SetDemod(update)).is_err()
+        {
+            self.error_msg = Some("could not send demod update".to_string());
+        }
+    }
+
+    fn mark_demod_dirty(&mut self) {
+        self.demod_dirty = true;
+        self.last_demod_change = Instant::now();
+    }
+
+    fn send_cw_afc(&mut self) {
+        if let Some(tx) = &self.cmd_tx {
+            let _ = tx.try_send(WorkerCommand::SetCwAfc(self.cw_afc));
+        }
+    }
+
+    fn start_auto_tune(&mut self) {
+        if !self.is_connected || self.is_recording {
+            self.auto_tune_status = "connect and stop recording first".to_string();
+            return;
+        }
+        self.auto_tune_status = format!(
+            "scanning 4 s (±{:.0} kHz) for a CW carrier...",
+            self.auto_tune_span_khz()
+        );
+        self.auto_tune_failed = false;
+        if let Some(tx) = &self.cmd_tx
+            && tx.try_send(WorkerCommand::AutoTune).is_err()
+        {
+            self.auto_tune_status = "could not start the scan".to_string();
+            self.error_msg = Some(self.auto_tune_status.clone());
         }
     }
 
@@ -546,6 +648,7 @@ impl MidoriApp {
         self.config.source.file_loop = self.file_loop;
         self.config.demod.mode = self.demod_mode;
         self.config.decoder.cw_enabled = self.cw_enabled;
+        self.config.decoder.cw_afc = self.cw_afc;
         self.config.decoder.sstv_enabled = self.sstv_enabled;
         self.config.ui.spectrum_ratio = self.spectrum_ratio;
         self.config.ui.decoder_tab = self.decoder_tab;
@@ -553,6 +656,7 @@ impl MidoriApp {
         self.config.ui.db_min = self.db_min;
         self.config.ui.db_max = self.db_max;
         self.config.ui.colormap = self.colormap;
+        self.config.ui.waterfall_follow_spectrum = self.waterfall_follow;
         self.config.satellite.tle_path = self.tle_path.clone();
         self.config.satellite.grid = self.grid_input.clone();
         self.config.satellite.doppler_tracking = self.doppler_tracking;
@@ -591,13 +695,17 @@ impl MidoriApp {
         self.vfo_offset_hz = 0.0;
         self.demod_mode = config.demod.mode;
         self.cw_enabled = config.decoder.cw_enabled;
+        self.cw_afc = config.decoder.cw_afc;
         self.sstv_enabled = config.decoder.sstv_enabled;
         self.spectrum_ratio = config.ui.spectrum_ratio;
+        self.waterfall_follow = config.ui.waterfall_follow_spectrum;
         self.decoder_tab = config.ui.decoder_tab;
         self.decoder_dock_open = config.ui.decoder_dock_open;
         self.db_min = config.ui.db_min;
         self.db_max = config.ui.db_max;
         self.colormap = config.ui.colormap;
+        self.spectrum_view_x = None;
+        self.demod_dirty = false;
         self.tle_path = config.satellite.tle_path.clone();
         self.grid_input = config.satellite.grid.clone();
         self.min_elev_input = format!("{:.1}", config.satellite.min_elevation_deg);
@@ -697,11 +805,7 @@ impl MidoriApp {
     }
 
     fn tuned_freq_hz(&self) -> f64 {
-        if self.is_file_source() {
-            self.center_freq_hz + self.vfo_offset_hz
-        } else {
-            self.center_freq_hz
-        }
+        self.center_freq_hz + self.vfo_offset_hz
     }
 
     // -----------------------------------------------------------------------
@@ -812,6 +916,34 @@ impl MidoriApp {
                 WorkerEvent::Plugin { source, event } => {
                     self.handle_plugin_event(source, event, ctx)
                 }
+                WorkerEvent::VfoOffset { offset_hz } => {
+                    self.vfo_offset_hz = offset_hz;
+                    if self.is_file_source() && ctx.memory(|memory| memory.focused().is_none()) {
+                        self.freq_input = format!("{:.6}", (self.center_freq_hz + offset_hz) / 1e6);
+                    }
+                }
+                WorkerEvent::AutoTuneDone { offset_hz } => match offset_hz {
+                    Some(offset) => {
+                        self.vfo_offset_hz = offset;
+                        self.auto_tune_failed = false;
+                        self.auto_tune_status =
+                            format!("carrier found: {:+.1} Hz from centre", offset);
+                        if self.is_file_source() && ctx.memory(|memory| memory.focused().is_none())
+                        {
+                            self.freq_input =
+                                format!("{:.6}", (self.center_freq_hz + offset) / 1e6);
+                        }
+                        self.push_log(self.auto_tune_status.clone());
+                    }
+                    None => {
+                        self.auto_tune_failed = true;
+                        self.auto_tune_status = format!(
+                            "no CW signal found within ±{:.0} kHz; check the band/antenna or retune the LO",
+                            self.auto_tune_span_khz()
+                        );
+                        self.push_log(self.auto_tune_status.clone());
+                    }
+                },
             }
         }
     }
@@ -996,13 +1128,7 @@ impl MidoriApp {
     // -----------------------------------------------------------------------
 
     fn demod_bandwidth_hz(&self) -> f64 {
-        match self.demod_mode {
-            DemodMode::Fm => 200_000.0,
-            DemodMode::Am => 6_000.0,
-            DemodMode::Cw => 500.0,
-            DemodMode::Sstv => 15_000.0,
-            _ => 15_000.0,
-        }
+        self.config.demod.params(self.demod_mode).bandwidth_hz
     }
 
     fn demod_label(&self) -> &'static str {
@@ -1013,6 +1139,18 @@ impl MidoriApp {
             DemodMode::Sstv => "SSTV",
             _ => "?",
         }
+    }
+
+    fn auto_tune_color(&self) -> egui::Color32 {
+        if self.auto_tune_failed {
+            egui::Color32::from_rgb(235, 175, 80)
+        } else {
+            egui::Color32::from_rgb(120, 220, 180)
+        }
+    }
+
+    fn auto_tune_span_khz(&self) -> f64 {
+        (self.sample_rate_hz * 0.45).min(100_000.0) / 1e3
     }
 
     fn draw_receiver_strip(&mut self, ctx: &egui::Context) {
@@ -1051,8 +1189,11 @@ impl MidoriApp {
                 ui.selectable_value(&mut self.demod_mode, DemodMode::Am, "AM");
                 ui.selectable_value(&mut self.demod_mode, DemodMode::Cw, "CW");
                 ui.selectable_value(&mut self.demod_mode, DemodMode::Sstv, "SSTV");
-                if self.demod_mode != previous_demod && (self.is_connected || self.is_connecting) {
-                    self.status_msg = "Reconnect to apply demod mode".to_string();
+                if self.demod_mode != previous_demod {
+                    self.config.demod.mode = self.demod_mode;
+                    self.mark_demod_dirty();
+                    self.auto_tune_status.clear();
+                    self.auto_tune_failed = false;
                 }
 
                 ui.separator();
@@ -1161,11 +1302,17 @@ impl MidoriApp {
                     ))
                     .weak(),
                 );
-                if self.is_file_source() {
+                if self.is_file_source() || self.vfo_offset_hz.abs() >= 1.0 {
                     ui.separator();
                     ui.label(
                         egui::RichText::new(format!("VFO {:+.3} kHz", self.vfo_offset_hz / 1e3))
                             .weak(),
+                    );
+                }
+                if self.cw_afc && self.demod_mode == DemodMode::Cw {
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("AFC").color(egui::Color32::from_rgb(120, 220, 180)),
                     );
                 }
                 ui.separator();
@@ -1252,7 +1399,16 @@ impl MidoriApp {
         ui.horizontal(|ui| {
             ui.heading("CW");
             ui.label(&self.cw_status);
+            if self.cw_afc && self.demod_mode == DemodMode::Cw {
+                ui.label(
+                    egui::RichText::new(format!("AFC {:+.1} Hz", self.vfo_offset_hz))
+                        .color(egui::Color32::from_rgb(120, 220, 180)),
+                );
+            }
         });
+        if !self.auto_tune_status.is_empty() {
+            ui.label(egui::RichText::new(&self.auto_tune_status).color(self.auto_tune_color()));
+        }
         egui::ScrollArea::vertical()
             .stick_to_bottom(true)
             .show(ui, |ui| {
@@ -1566,11 +1722,16 @@ impl MidoriApp {
                             ))
                             .weak(),
                         );
-                        if self.is_file_source() {
+                        if self.is_file_source() || self.vfo_offset_hz.abs() >= 1.0 {
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "VFO offset: {:+.3} kHz",
-                                    self.vfo_offset_hz / 1e3
+                                    "VFO offset: {:+.3} kHz{}",
+                                    self.vfo_offset_hz / 1e3,
+                                    if self.cw_afc && self.demod_mode == DemodMode::Cw {
+                                        " (AFC)"
+                                    } else {
+                                        ""
+                                    }
                                 ))
                                 .weak(),
                             );
@@ -1585,24 +1746,91 @@ impl MidoriApp {
                             self.demod_label(),
                             format_bandwidth(self.demod_bandwidth_hz())
                         ));
-                        ui.label(
-                            egui::RichText::new(match self.demod_mode {
-                                DemodMode::Fm => {
-                                    format!(
-                                        "de-emphasis {:.0} µs",
-                                        self.config.demod.params(self.demod_mode).deemphasis_us
-                                    )
+
+                        let mut changed = false;
+                        {
+                            let params = self.config.demod.params_mut(self.demod_mode);
+                            ui.horizontal(|ui| {
+                                ui.label("RF bandwidth");
+                                let mut bandwidth_khz = params.bandwidth_hz / 1_000.0;
+                                let response = ui.add(
+                                    egui::DragValue::new(&mut bandwidth_khz)
+                                        .range(0.1..=2_000.0)
+                                        .speed(0.5)
+                                        .suffix(" kHz"),
+                                );
+                                if response.changed() {
+                                    params.bandwidth_hz =
+                                        (bandwidth_khz * 1_000.0).clamp(100.0, 2_000_000.0);
+                                    changed = true;
                                 }
-                                DemodMode::Sstv => "FM · 3 kHz audio · no de-emphasis".to_string(),
-                                DemodMode::Cw => format!(
-                                    "BFO {:.0} Hz",
-                                    self.config.demod.params(self.demod_mode).bfo_hz
-                                ),
-                                DemodMode::Am => "envelope detector".to_string(),
-                                _ => String::new(),
-                            })
-                            .weak(),
-                        );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Audio bandwidth");
+                                let mut audio_hz = params.audio_bandwidth_hz;
+                                let response = ui.add(
+                                    egui::DragValue::new(&mut audio_hz)
+                                        .range(100.0..=24_000.0)
+                                        .speed(50.0)
+                                        .suffix(" Hz"),
+                                );
+                                if response.changed() {
+                                    params.audio_bandwidth_hz =
+                                        audio_hz.clamp(100.0, params.audio_rate_hz * 0.45);
+                                    changed = true;
+                                }
+                            });
+                            match self.demod_mode {
+                                DemodMode::Fm => {
+                                    ui.horizontal(|ui| {
+                                        ui.label("De-emphasis");
+                                        let mut deemph = params.deemphasis_us;
+                                        let response = ui.add(
+                                            egui::DragValue::new(&mut deemph)
+                                                .range(0.0..=500.0)
+                                                .speed(1.0)
+                                                .suffix(" µs"),
+                                        );
+                                        if response.changed() {
+                                            params.deemphasis_us = deemph;
+                                            changed = true;
+                                        }
+                                    });
+                                }
+                                DemodMode::Cw => {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "BFO {:.0} Hz (set demod.cw.bfo_hz in config)",
+                                            params.bfo_hz
+                                        ))
+                                        .weak(),
+                                    );
+                                }
+                                DemodMode::Am => {
+                                    ui.label(
+                                        egui::RichText::new("envelope detector").weak(),
+                                    );
+                                }
+                                DemodMode::Sstv => {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "FM · 3 kHz audio · no de-emphasis",
+                                        )
+                                        .weak(),
+                                    );
+                                }
+                                _ => {}
+                            }
+                        }
+                        if changed {
+                            self.mark_demod_dirty();
+                        }
+                        if self.demod_dirty && (self.is_connected || self.is_connecting) {
+                            ui.label(
+                                egui::RichText::new("changes apply automatically")
+                                    .weak(),
+                            );
+                        }
                         let mut agc = false;
                         let mut squelch = false;
                         ui.add_enabled(false, egui::Checkbox::new(&mut agc, "AGC"));
@@ -1616,13 +1844,38 @@ impl MidoriApp {
                             egui::RichText::new(format!("FFT {} · Hann", self.config.ui.fft_size))
                                 .weak(),
                         );
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "range {:.0} .. {:.0} dBFS",
-                                self.db_min, self.db_max
-                            ))
-                            .weak(),
+                        ui.horizontal(|ui| {
+                            ui.label("dB min");
+                            ui.add(
+                                egui::DragValue::new(&mut self.db_min)
+                                    .range(-200.0..=-10.0)
+                                    .speed(1.0),
+                            );
+                            ui.label("max");
+                            ui.add(
+                                egui::DragValue::new(&mut self.db_max)
+                                    .range(-100.0..=0.0)
+                                    .speed(1.0),
+                            );
+                        });
+                        if self.db_max <= self.db_min + 10.0 {
+                            self.db_max = self.db_min + 10.0;
+                        }
+                        ui.checkbox(
+                            &mut self.waterfall_follow,
+                            "Waterfall follows spectrum zoom",
                         );
+                        if !self.waterfall_follow {
+                            ui.label(
+                                egui::RichText::new(
+                                    "yellow lines mark the spectrum view on the full-band waterfall",
+                                )
+                                .weak(),
+                            );
+                        }
+                        if ui.button("Reset spectrum view").clicked() {
+                            self.reset_spectrum_view = true;
+                        }
                         ui.label(
                             egui::RichText::new(format!("colormap {:?}", self.colormap)).weak(),
                         );
@@ -1746,7 +1999,37 @@ impl MidoriApp {
                         {
                             self.status_msg = "Reconnect to apply CW decoder".to_string();
                         }
+                        let previous_afc = self.cw_afc;
+                        ui.checkbox(&mut self.cw_afc, "AFC (track carrier drift)");
+                        if self.cw_afc != previous_afc && (self.is_connected || self.is_connecting)
+                        {
+                            self.send_cw_afc();
+                        }
+                        if ui
+                            .add_enabled(
+                                self.is_connected && !self.is_recording,
+                                egui::Button::new("Auto tune CW carrier"),
+                            )
+                            .on_hover_text(
+                                "Scan a 4 s window within ±100 kHz of the LO and move the digital VFO to the strongest narrowband peak",
+                            )
+                            .clicked()
+                        {
+                            self.start_auto_tune();
+                        }
                         ui.label(format!("Status: {}", self.cw_status));
+                        if !self.auto_tune_status.is_empty() {
+                            ui.label(
+                                egui::RichText::new(&self.auto_tune_status)
+                                    .color(self.auto_tune_color()),
+                            );
+                        }
+                        if self.demod_mode != DemodMode::Cw {
+                            ui.label(
+                                egui::RichText::new("select the CW demod to decode")
+                                    .color(egui::Color32::from_rgb(220, 180, 90)),
+                            );
+                        }
                         ui.label(egui::RichText::new("output in the bottom CW tab").weak());
                     });
 
@@ -1833,17 +2116,27 @@ impl MidoriApp {
 
     fn draw_spectrum(&mut self, ui: &mut egui::Ui) {
         let mut tune_to = None;
+        let reset = self.reset_spectrum_view;
+        self.reset_spectrum_view = false;
+
         let plot = Plot::new("spectrum_plot")
             .x_axis_label("Frequency (MHz)")
             .y_axis_label("Power (dBFS)")
+            .auto_bounds([true, false])
             .include_y(self.db_min as f64)
             .include_y(self.db_max as f64)
-            .allow_drag(true)
-            .allow_zoom(true)
+            .allow_drag([true, false])
+            .allow_zoom([true, false])
             .show_axes([true, true])
             .label_formatter(|_name, value| format!("{:.4} MHz\n{:.1} dBFS", value.x, value.y));
+        let plot = if reset { plot.reset() } else { plot };
 
-        plot.show(ui, |plot_ui| {
+        let plot_response = plot.show(ui, |plot_ui| {
+            // The dB scale is a receiver setting, not a data-driven range.
+            // Forcing it every frame stops the y axis from jumping with the
+            // signal when replaying recordings.
+            plot_ui.set_plot_bounds_y(self.db_min as f64..=self.db_max as f64);
+
             if !self.current_spectrum.is_empty() {
                 let points = PlotPoints::new(self.current_spectrum.clone());
                 let line = Line::new("Power", points)
@@ -1897,6 +2190,11 @@ impl MidoriApp {
             }
         });
 
+        let bounds = plot_response.transform.bounds();
+        if bounds.is_valid_x() {
+            self.spectrum_view_x = Some((bounds.min()[0], bounds.max()[0]));
+        }
+
         if let Some(mhz) = tune_to {
             self.set_frequency_mhz(mhz);
         }
@@ -1919,31 +2217,111 @@ impl MidoriApp {
             .allocate_response(available, egui::Sense::click())
             .on_hover_cursor(egui::CursorIcon::Crosshair);
         let rect = response.rect;
-        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        let full_min = (self.center_freq_hz - self.sample_rate_hz / 2.0) / 1e6;
+        let full_max = (self.center_freq_hz + self.sample_rate_hz / 2.0) / 1e6;
+        let full_span = (full_max - full_min).max(1e-12);
+
+        let mut view_min = full_min;
+        let mut view_max = full_max;
+        if self.waterfall_follow
+            && let Some((low, high)) = self.spectrum_view_x
+        {
+            let low = low.max(full_min);
+            let high = high.min(full_max);
+            if high - low > full_span * 1e-6 {
+                view_min = low;
+                view_max = high;
+            }
+        }
+        let span = (view_max - view_min).max(1e-12);
+        let uv = egui::Rect::from_min_max(
+            egui::pos2(
+                ((view_min - full_min) / full_span).clamp(0.0, 1.0) as f32,
+                0.0,
+            ),
+            egui::pos2(
+                ((view_max - full_min) / full_span).clamp(0.0, 1.0) as f32,
+                1.0,
+            ),
+        );
         ui.painter()
             .image(texture_id, rect, uv, egui::Color32::WHITE);
 
         let painter = ui.painter();
-        let half = (self.demod_bandwidth_hz() / 2.0 / self.sample_rate_hz) as f32;
-        let center_fraction = 0.5 + (self.vfo_offset_hz / self.sample_rate_hz) as f32;
-        let x_center = rect.min.x + center_fraction * rect.width();
-        let x_low = x_center - half * rect.width();
-        let x_high = x_center + half * rect.width();
-        painter.rect_filled(
-            egui::Rect::from_min_max(
-                egui::pos2(x_low, rect.min.y),
-                egui::pos2(x_high, rect.max.y),
-            ),
-            0.0,
-            egui::Color32::from_rgba_unmultiplied(30, 200, 255, 18),
-        );
-        painter.line_segment(
-            [
-                egui::pos2(x_center, rect.min.y),
-                egui::pos2(x_center, rect.max.y),
-            ],
-            egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 220, 255)),
-        );
+        let x_of = |frequency_mhz: f64| {
+            rect.min.x + ((frequency_mhz - view_min) / span) as f32 * rect.width()
+        };
+        let vfo_mhz = (self.center_freq_hz + self.vfo_offset_hz) / 1e6;
+        let half_bw_mhz = self.demod_bandwidth_hz() / 2.0 / 1e6;
+        let x_center = x_of(vfo_mhz);
+        let x_low = x_of(vfo_mhz - half_bw_mhz).clamp(rect.min.x, rect.max.x);
+        let x_high = x_of(vfo_mhz + half_bw_mhz).clamp(rect.min.x, rect.max.x);
+        if x_low < rect.max.x && x_high > rect.min.x {
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(x_low, rect.min.y),
+                    egui::pos2(x_high, rect.max.y),
+                ),
+                0.0,
+                egui::Color32::from_rgba_unmultiplied(30, 200, 255, 18),
+            );
+        }
+        if (rect.min.x..=rect.max.x).contains(&x_center) {
+            painter.line_segment(
+                [
+                    egui::pos2(x_center, rect.min.y),
+                    egui::pos2(x_center, rect.max.y),
+                ],
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 220, 255)),
+            );
+        }
+
+        // In independent mode the waterfall keeps the full captured band. Mark
+        // the part that the spectrum plot is currently showing.
+        if !self.waterfall_follow
+            && let Some((low, high)) = self.spectrum_view_x
+        {
+            let low = low.max(full_min);
+            let high = high.min(full_max);
+            if high - low > full_span * 1e-6 {
+                let x_low = rect.min.x + ((low - full_min) / full_span) as f32 * rect.width();
+                let x_high = rect.min.x + ((high - full_min) / full_span) as f32 * rect.width();
+                let shade = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 90);
+                if x_low > rect.min.x {
+                    painter.rect_filled(
+                        egui::Rect::from_min_max(rect.min, egui::pos2(x_low, rect.max.y)),
+                        0.0,
+                        shade,
+                    );
+                }
+                if x_high < rect.max.x {
+                    painter.rect_filled(
+                        egui::Rect::from_min_max(egui::pos2(x_high, rect.min.y), rect.max),
+                        0.0,
+                        shade,
+                    );
+                }
+                let stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(230, 200, 80));
+                painter.line_segment(
+                    [egui::pos2(x_low, rect.min.y), egui::pos2(x_low, rect.max.y)],
+                    stroke,
+                );
+                painter.line_segment(
+                    [
+                        egui::pos2(x_high, rect.min.y),
+                        egui::pos2(x_high, rect.max.y),
+                    ],
+                    stroke,
+                );
+                painter.text(
+                    egui::pos2((x_low + x_high) * 0.5, rect.min.y + 4.0),
+                    egui::Align2::CENTER_TOP,
+                    format!("spectrum view {low:.3}–{high:.3} MHz"),
+                    egui::FontId::proportional(10.0),
+                    egui::Color32::from_rgb(230, 200, 80),
+                );
+            }
+        }
 
         let steps = 5;
         for i in 0..=steps {
@@ -1961,8 +2339,7 @@ impl MidoriApp {
 
         for i in 0..=4 {
             let t = i as f32 / 4.0;
-            let frequency =
-                self.center_freq_hz / 1e6 + (t as f64 - 0.5) * self.sample_rate_hz / 1e6;
+            let frequency = view_min + t as f64 * span;
             let x = rect.min.x + t * rect.width();
             painter.text(
                 egui::pos2(x, rect.max.y - 2.0),
@@ -1973,12 +2350,25 @@ impl MidoriApp {
             );
         }
 
+        if self.spectrum_view_x.is_some() {
+            painter.text(
+                egui::pos2(rect.min.x + 6.0, rect.min.y + 4.0),
+                egui::Align2::LEFT_TOP,
+                if self.waterfall_follow {
+                    "waterfall: follows spectrum"
+                } else {
+                    "waterfall: full band"
+                },
+                egui::FontId::proportional(10.0),
+                egui::Color32::from_gray(170),
+            );
+        }
+
         if response.clicked()
             && let Some(position) = response.interact_pointer_pos()
         {
             let fraction = ((position.x - rect.min.x) / rect.width()).clamp(0.0, 1.0);
-            let frequency =
-                self.center_freq_hz / 1e6 + (fraction as f64 - 0.5) * self.sample_rate_hz / 1e6;
+            let frequency = view_min + fraction as f64 * span;
             self.set_frequency_mhz(frequency);
         }
     }
@@ -2024,6 +2414,14 @@ impl eframe::App for MidoriApp {
         self.poll_events(ctx);
         self.poll_data(ctx);
         self.handle_keyboard(ctx);
+
+        if self.demod_dirty
+            && (self.is_connected || self.is_connecting)
+            && self.last_demod_change.elapsed() >= Duration::from_millis(250)
+        {
+            self.demod_dirty = false;
+            self.send_demod_update();
+        }
 
         if self.is_connected || self.is_connecting {
             ctx.request_repaint_after(Duration::from_millis(16));
@@ -2098,7 +2496,13 @@ fn start_cw_plugin(
         let _ = event_tx.try_send(WorkerEvent::Error(format!("CW plugin start: {error}")));
         return None;
     }
-    if let Err(error) = plugin.configure(&serde_json::json!({"tone_hz": tone_hz})) {
+    if let Err(error) = plugin.configure(&serde_json::json!({
+        "tone_hz": tone_hz,
+        // The live GUI AFC leaves a few Hz of residual offset; a wider
+        // envelope keeps that from turning into keying ripple.
+        "envelope_hz": 120.0,
+        "start_at_signal": true,
+    })) {
         let _ = plugin.stop();
         let _ = event_tx.try_send(WorkerEvent::Error(format!("CW plugin configure: {error}")));
         return None;
@@ -2280,34 +2684,35 @@ fn run_worker(
     }
 
     let mut plugin_handles: Vec<(PluginSource, PluginHandle)> = Vec::new();
-    let mut plugin_sinks: Vec<PluginSink> = Vec::new();
+    let mut plugin_sinks: Vec<Box<dyn Sink>> = Vec::new();
     if options.cw_enabled
         && let Some((sink, handle)) = start_cw_plugin(&event_tx, options.cw_tone_hz)
     {
-        plugin_sinks.push(sink);
+        plugin_sinks.push(Box::new(CwStartGateSink::new(sink)));
         plugin_handles.push((PluginSource::Cw, handle));
     }
     if options.sstv_enabled
         && let Some((sink, handle)) =
             start_sstv_plugin(&event_tx, options.sstv_output_dir.as_path())
     {
-        plugin_sinks.push(sink);
+        plugin_sinks.push(Box::new(sink));
         plugin_handles.push((PluginSource::Sstv, handle));
     }
 
     let (recorder_sink, recorder_handle) = RecorderSink::new();
+    let auto_tune_state = Arc::new(Mutex::new(AutoTuneState::Idle));
     let mut sinks: Vec<Box<dyn Sink>> = vec![
         Box::new(SpectrumSink::new(options.fft_size, data_tx)),
         Box::new(recorder_sink),
+        Box::new(AutoTuneSink::new(Arc::clone(&auto_tune_state))),
     ];
-    for sink in plugin_sinks {
-        sinks.push(Box::new(sink));
-    }
+    sinks.extend(plugin_sinks);
     if let Some(producer) = audio_producer {
         sinks.push(Box::new(AudioSink::new(producer)));
     }
 
-    let channel = VfoChannel::new(vfo);
+    let mut channel = VfoChannel::new(vfo.clone());
+    channel.set_afc(options.cw_afc);
     let mut session = LiveSession::new(config, source, vec![Box::new(channel)], sinks);
     session.set_doppler_source(doppler);
     if options.initial_vfo_offset_hz != 0.0 {
@@ -2340,6 +2745,9 @@ fn run_worker(
     let mut plugin_events = 0u64;
     let track_doppler = doppler_active;
     let mut last_doppler_event: Option<Instant> = None;
+    let mut cw_afc_enabled = options.cw_afc;
+    let mut last_vfo_offset = session.vfo_offset_hz();
+    let mut last_vfo_event: Option<Instant> = None;
     while !stop.load(Ordering::SeqCst) {
         while let Ok(command) = cmd_rx.try_recv() {
             match command {
@@ -2363,11 +2771,56 @@ fn run_worker(
                         continue;
                     }
                     session.set_vfo_offset(offset);
+                    vfo.offset_hz = offset;
+                    last_vfo_offset = offset;
                 }
                 WorkerCommand::SetGain(db) => {
                     if let Err(error) = session.set_gain(db) {
                         let _ =
                             event_tx.try_send(WorkerEvent::Error(format!("gain failed: {error}")));
+                    }
+                }
+                WorkerCommand::SetDemod(update) => {
+                    vfo.demod = update.mode;
+                    vfo.bandwidth_hz = update.bandwidth_hz;
+                    vfo.audio_bandwidth_hz = update.audio_bandwidth_hz;
+                    vfo.deemphasis_us = update.deemphasis_us;
+                    vfo.bfo_hz = update.bfo_hz;
+                    vfo.channel_rate_hz = update.channel_rate_hz;
+                    vfo.offset_hz = session.vfo_offset_hz();
+                    match session.reconfigure_vfo(vfo.clone()) {
+                        Ok(()) => {
+                            let _ = event_tx.try_send(WorkerEvent::Info(format!(
+                                "demod {} · RF BW {:.1} kHz",
+                                format_demod(update.mode),
+                                update.bandwidth_hz / 1e3
+                            )));
+                        }
+                        Err(error) => {
+                            let _ = event_tx.try_send(WorkerEvent::Error(format!(
+                                "demod update failed: {error}"
+                            )));
+                        }
+                    }
+                }
+                WorkerCommand::SetCwAfc(enabled) => {
+                    cw_afc_enabled = enabled;
+                    session.set_afc(enabled);
+                    let _ = event_tx.try_send(WorkerEvent::Info(format!(
+                        "CW AFC {}",
+                        if enabled { "enabled" } else { "disabled" }
+                    )));
+                }
+                WorkerCommand::AutoTune => {
+                    if recorder_handle.is_recording() {
+                        let _ = event_tx.try_send(WorkerEvent::Error(
+                            "stop recording before auto tuning".to_string(),
+                        ));
+                    } else {
+                        *auto_tune_state.lock().unwrap() = AutoTuneState::Scanning;
+                        let _ = event_tx.try_send(WorkerEvent::Info(
+                            "auto tune: scanning 4 s for a narrowband carrier".to_string(),
+                        ));
                     }
                 }
                 WorkerCommand::StartRecording(path) => {
@@ -2423,6 +2876,39 @@ fn run_worker(
             eprintln!("[worker] receive failed: {error}");
             let _ = event_tx.try_send(WorkerEvent::Fatal(format!("receive failed: {error}")));
             break;
+        }
+
+        let tune_result = {
+            let mut state = auto_tune_state.lock().unwrap();
+            if let AutoTuneState::Done(result) = *state {
+                *state = AutoTuneState::Idle;
+                Some(result)
+            } else {
+                None
+            }
+        };
+        if let Some(result) = tune_result {
+            if let Some(offset) = result
+                && !recorder_handle.is_recording()
+            {
+                session.set_vfo_offset(offset);
+                vfo.offset_hz = offset;
+                last_vfo_offset = offset;
+                last_vfo_event = Some(Instant::now());
+                let _ = event_tx.try_send(WorkerEvent::VfoOffset { offset_hz: offset });
+            }
+            let _ = event_tx.try_send(WorkerEvent::AutoTuneDone { offset_hz: result });
+        }
+
+        let offset = session.vfo_offset_hz();
+        let due = (offset - last_vfo_offset).abs() > 0.5
+            || (cw_afc_enabled
+                && last_vfo_event.is_none_or(|last| last.elapsed() >= Duration::from_secs(1)));
+        if due {
+            last_vfo_offset = offset;
+            last_vfo_event = Some(Instant::now());
+            vfo.offset_hz = offset;
+            let _ = event_tx.try_send(WorkerEvent::VfoOffset { offset_hz: offset });
         }
 
         if track_doppler {
@@ -2513,6 +2999,17 @@ fn format_bandwidth(hz: f64) -> String {
         format!("{:.1} kHz", hz / 1_000.0)
     } else {
         format!("{hz:.0} Hz")
+    }
+}
+
+fn format_demod(mode: DemodMode) -> &'static str {
+    match mode {
+        DemodMode::Fm => "FM",
+        DemodMode::Am => "AM",
+        DemodMode::Cw => "CW",
+        DemodMode::Sstv => "SSTV",
+        DemodMode::Usb => "USB",
+        DemodMode::Lsb => "LSB",
     }
 }
 

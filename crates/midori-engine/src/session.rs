@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use midori_core::{
     Channel, DopplerSource, Frame, IqSource, Session, SessionStats, Sink, SourceConfig, StreamSpec,
+    VfoConfig,
 };
 
 pub struct LiveSession {
@@ -108,6 +109,26 @@ impl LiveSession {
             .first()
             .map(|channel| channel.config().offset_hz)
             .unwrap_or(0.0)
+    }
+
+    /// Enable or disable a channel-provided automatic carrier tracker.
+    pub fn set_afc(&mut self, enabled: bool) {
+        for channel in &mut self.channels {
+            channel.set_afc(enabled);
+        }
+    }
+
+    /// Rebuild every channel in place after a demod/bandwidth change, keeping
+    /// the source and sinks running.
+    pub fn reconfigure_vfo(&mut self, config: VfoConfig) -> Result<()> {
+        let Some(spec) = self.spec else {
+            return Ok(());
+        };
+        for channel in &mut self.channels {
+            channel.reconfigure(config.clone(), &spec)?;
+        }
+        self.update_nominal_frequency(spec.center_freq_hz);
+        Ok(())
     }
 
     /// True when a finite file source has delivered its last block.

@@ -24,7 +24,9 @@ fn main() -> Result<()> {
 
     let mut sample_rate = 48_000.0;
     let mut tone_hz = 700.0;
-    let mut decoder = MorseDecoder::new(sample_rate, tone_hz);
+    let mut envelope_hz = 50.0;
+    let mut start_at_signal = false;
+    let mut decoder = MorseDecoder::new_with_envelope(sample_rate, tone_hz, envelope_hz);
     let mut line = String::new();
     let mut configured = false;
     let mut samples_since_status = 0u64;
@@ -42,7 +44,17 @@ fn main() -> Result<()> {
                     if let Some(value) = params.get("tone_hz").and_then(Value::as_f64) {
                         tone_hz = value;
                     }
-                    decoder = MorseDecoder::new(sample_rate, tone_hz);
+                    if let Some(value) = params.get("envelope_hz").and_then(Value::as_f64) {
+                        envelope_hz = value;
+                    }
+                    start_at_signal = params
+                        .get("start_at_signal")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    decoder = MorseDecoder::new_with_envelope(sample_rate, tone_hz, envelope_hz);
+                    if start_at_signal {
+                        decoder.assume_signal();
+                    }
                     configured = true;
                     write_json(&mut writer, &json!({ "type": "ready" }))?;
                 }
@@ -51,7 +63,11 @@ fn main() -> Result<()> {
                         && (value - sample_rate).abs() > 1.0
                     {
                         sample_rate = value;
-                        decoder = MorseDecoder::new(sample_rate, tone_hz);
+                        decoder =
+                            MorseDecoder::new_with_envelope(sample_rate, tone_hz, envelope_hz);
+                        if start_at_signal {
+                            decoder.assume_signal();
+                        }
                     }
                 }
                 Some("shutdown") => break,
@@ -65,7 +81,7 @@ fn main() -> Result<()> {
                 send_events(&mut writer, &mut line, decoder.process(&samples))?;
                 if samples_since_status >= sample_rate as u64 {
                     samples_since_status = 0;
-                    send_status(&mut writer, decoder.wpm())?;
+                    send_status(&mut writer, decoder.wpm(), decoder.tone_hz())?;
                 }
             }
             WireMessage::SoftBits { .. } | WireMessage::Bytes { .. } => {}
@@ -113,10 +129,10 @@ fn send_text<W: Write>(writer: &mut W, line: &str) -> Result<()> {
     write_json(writer, &serde_json::to_value(event)?)
 }
 
-fn send_status<W: Write>(writer: &mut W, wpm: f32) -> Result<()> {
+fn send_status<W: Write>(writer: &mut W, wpm: f32, tone_hz: f32) -> Result<()> {
     let event = PluginEvent::Status {
         level: StatusLevel::Info,
-        message: format!("{wpm:.0} WPM"),
+        message: format!("{wpm:.0} WPM · {tone_hz:.0} Hz"),
     };
     write_json(writer, &serde_json::to_value(event)?)
 }

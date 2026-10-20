@@ -2,12 +2,17 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use midori_core::{BlockFlags, Frame, FrameMeta, StreamData};
+use midori_core::{
+    BlockFlags, Channel, DemodMode, Frame, FrameMeta, Session, SourceConfig, StreamData, VfoConfig,
+};
+use midori_dsp::OffsetScan;
+use midori_engine::{CwStartGateSink, LiveSession, VfoChannel, plugin_sink};
 use midori_plugin::{
     DisplayUpdate, InputSpec, Manifest, OutputKind, PluginEvent, PluginHost, SidecarPlugin,
 };
 use midori_plugin_cw::offline::{OfflineConfig, demodulate_wav};
 use midori_plugin_cw::{MorseDecoder, MorseEvent};
+use midori_source_file::{WavIqReader, WavIqSource};
 
 const FIXTURE_SAMPLE_RATE: u32 = 12_000;
 
@@ -131,6 +136,128 @@ fn cw_sidecar_decodes_botan_fixture() {
 
     plugin.stop().expect("stop");
     assert_botan(&text);
+}
+
+/// Full GUI-style path: scan the band, set the VFO, then let the receiver AFC
+/// follow the carrier while the sidecar decodes. This reproduces the way the
+/// GUI worker drives `VfoChannel` and the CW sidecar.
+#[test]
+#[ignore = "needs the local 112 MB Botan I/Q capture and runs in real time"]
+fn gui_style_afc_decodes_botan_raw_iq() {
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/BOTAN_TLM_CW_437393500Hz.wav");
+    if !path.exists() {
+        eprintln!("skipping: {} not found", path.display());
+        return;
+    }
+
+    // Coarse auto-tune: scan the first four seconds for a narrowband peak.
+    let mut reader = WavIqReader::open(&path).expect("open wav");
+    let file_spec = reader.spec();
+    let mut scan = OffsetScan::new(file_spec.sample_rate_hz, 32_768, 100_000.0);
+    let target = (file_spec.sample_rate_hz * 4.0) as usize;
+    let mut scanned = 0usize;
+    while scanned < target {
+        let block = reader.read_iq(32_768).expect("read IQ");
+        if block.is_empty() {
+            break;
+        }
+        scanned += block.len();
+        scan.process(&block);
+    }
+    let auto_offset = scan.result().expect("auto-tune carrier");
+    eprintln!("auto tuned to {auto_offset:+.1} Hz");
+
+    let source = WavIqSource::open(&path, false).expect("source");
+    // Keep the file at real time so the sidecar's bounded queue does not drop
+    // audio while the test thread runs as fast as it can.
+    let source_config = SourceConfig {
+        center_freq_hz: 437_393_500.0,
+        buffer_samples: 32_768,
+        ..SourceConfig::default()
+    };
+    let vfo = VfoConfig {
+        id: 0,
+        offset_hz: auto_offset,
+        bandwidth_hz: 2_000.0,
+        demod: DemodMode::Cw,
+        audio_rate_hz: 48_000.0,
+        channel_rate_hz: 240_000.0,
+        audio_bandwidth_hz: 2_000.0,
+        deemphasis_us: 0.0,
+        bfo_hz: 700.0,
+    };
+    let mut channel = VfoChannel::new(vfo);
+    channel.set_afc(true);
+
+    let manifest = Manifest {
+        name: "cw".to_string(),
+        version: "0.1.0".to_string(),
+        protocol: midori_plugin::PROTOCOL_VERSION,
+        command: vec![env!("CARGO_BIN_EXE_midori-plugin-cw").to_string()],
+        input: InputSpec::Audio {
+            sample_rate_hz: 48_000.0,
+            channels: 1,
+        },
+        outputs: vec![OutputKind::Display, OutputKind::Packets],
+        params: vec![],
+    };
+    let mut plugin = SidecarPlugin::new(manifest).expect("manifest");
+    plugin.start().expect("start");
+    plugin
+        .configure(&serde_json::json!({
+            "tone_hz": 700.0,
+            "envelope_hz": 120.0,
+            "start_at_signal": true,
+        }))
+        .expect("configure");
+    let (sink, handle) = plugin_sink(Box::new(plugin));
+
+    let mut session = LiveSession::new(
+        source_config,
+        Box::new(source),
+        vec![Box::new(channel)],
+        vec![Box::new(CwStartGateSink::new(sink))],
+    );
+    session.start().expect("start session");
+    let mut last_print = Instant::now();
+    while !session.source_finished() {
+        session.step().expect("step");
+        if last_print.elapsed() >= Duration::from_millis(500) {
+            last_print = Instant::now();
+            eprintln!("vfo {:+.1} Hz", session.vfo_offset_hz());
+        }
+    }
+    session.stop().expect("stop session");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut text = String::new();
+    while Instant::now() < deadline {
+        while let Ok(Some(event)) = handle.try_recv() {
+            match event {
+                PluginEvent::Display {
+                    update: DisplayUpdate::Text { lines, .. },
+                } => text = lines.join("\n"),
+                PluginEvent::Error { message, .. } => panic!("plugin error: {message}"),
+                _ => {}
+            }
+        }
+        if text.contains("8763") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = handle.stop();
+    println!("decoded: {text:?}");
+    // The live GUI path uses a wider envelope and a start gate, so the first
+    // element of the callsign is sometimes ambiguous. The header and the
+    // telemetry prefix are the meaningful checks here; the fixture tests above
+    // cover the exact `BOTAN JS1YPT` decode on the offline path.
+    assert!(text.contains("BOTAN"), "missing BOTAN in {text:?}");
+    assert!(
+        text.contains("8763"),
+        "missing telemetry prefix in {text:?}"
+    );
 }
 
 #[test]

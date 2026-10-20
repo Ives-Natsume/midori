@@ -311,6 +311,17 @@ pub trait Channel: Send {
     /// and, eventually, click-to-tune without moving the hardware LO.
     fn set_offset(&mut self, _offset_hz: f64) {}
 
+    /// Enable or disable an automatic carrier tracker for channels that support
+    /// one. The default implementation ignores the request.
+    fn set_afc(&mut self, _enabled: bool) {}
+
+    /// Rebuild the channel in place with a new VFO/demod configuration. The
+    /// default implementation ignores the request, so simple channels keep
+    /// working unchanged.
+    fn reconfigure(&mut self, _config: VfoConfig, _spec: &StreamSpec) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Process one source block. Implementations append zero or more frames.
     fn process(&mut self, iq: &IqBlock, out: &mut Vec<Frame>) -> anyhow::Result<()>;
 }

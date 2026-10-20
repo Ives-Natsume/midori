@@ -121,8 +121,11 @@ impl DemodParams {
 
     fn cw() -> Self {
         Self {
-            bandwidth_hz: 500.0,
-            channel_rate_hz: 48_000.0,
+            // A 500 Hz filter is fragile with a few tens of Hz of residual
+            // tuning error and a drifting satellite carrier. 2 kHz still
+            // rejects nearby signals but keeps the keying sidebands intact.
+            bandwidth_hz: 2_000.0,
+            channel_rate_hz: 240_000.0,
             audio_rate_hz: 48_000.0,
             audio_bandwidth_hz: 2_000.0,
             deemphasis_us: 0.0,
@@ -179,13 +182,34 @@ impl DemodSettings {
             _ => &self.fm,
         }
     }
+
+    pub fn params_mut(&mut self, mode: DemodMode) -> &mut DemodParams {
+        match mode {
+            DemodMode::Am => &mut self.am,
+            DemodMode::Cw => &mut self.cw,
+            DemodMode::Sstv => &mut self.sstv,
+            _ => &mut self.fm,
+        }
+    }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DecoderSettings {
     pub cw_enabled: bool,
+    /// Keep the CW carrier centred on the BFO with a real-time AFC.
+    pub cw_afc: bool,
     pub sstv_enabled: bool,
+}
+
+impl Default for DecoderSettings {
+    fn default() -> Self {
+        Self {
+            cw_enabled: false,
+            cw_afc: true,
+            sstv_enabled: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,6 +228,10 @@ pub struct UiSettings {
     pub fft_size: usize,
     pub waterfall_rows: usize,
     pub waterfall_width: usize,
+    /// Crop the waterfall to the spectrum plot's visible frequency range.
+    /// When false the waterfall always shows the full captured band and marks
+    /// the spectrum view with boundary lines.
+    pub waterfall_follow_spectrum: bool,
 }
 
 impl Default for UiSettings {
@@ -222,6 +250,7 @@ impl Default for UiSettings {
             fft_size: 4_096,
             waterfall_rows: 200,
             waterfall_width: 1_024,
+            waterfall_follow_spectrum: true,
         }
     }
 }
@@ -426,6 +455,8 @@ mod tests {
         assert_eq!(config.source.center_freq_hz, 100_000_000.0);
         assert_eq!(config.ui.spectrum_ratio, 0.6);
         assert_eq!(config.ui.decoder_tab, DecoderTab::Passes);
+        assert!(config.decoder.cw_afc);
+        assert!(config.ui.waterfall_follow_spectrum);
         assert!(config.satellite.grid.is_empty());
     }
 
