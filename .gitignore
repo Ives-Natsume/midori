@@ -4,3 +4,6 @@
 /config.toml
 /.cargo/config.toml
 .DS_Store
+
+# Local session notes
+HANDOVER.md

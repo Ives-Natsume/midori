@@ -12,9 +12,6 @@ Doppler correction, recording, and plugins for SSTV/SSDV/FT4/CW.
 > `crates/`. The old Python audio loopback is archived outside this
 > repository; the original nested `pluto_rs` prototype was removed.
 >
-> **Handover/status:** see [`HANDOVER.md`](HANDOVER.md) for the current state,
-> known limitations, and next engineering steps.
-
 ## Current capabilities
 
 - ADALM-PLUTO / AD9361 source through libiio (USB or network URI).
