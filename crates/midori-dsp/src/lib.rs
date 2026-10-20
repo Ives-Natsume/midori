@@ -724,6 +724,129 @@ impl FmDemod {
 }
 
 // ---------------------------------------------------------------------------
+// BPSK / data channel
+// ---------------------------------------------------------------------------
+
+/// Configuration for a complex data channel.
+///
+/// This is the receive side of a linear BPSK downlink: the channel is mixed to
+/// baseband, low-pass filtered, decimated, and resampled to a fixed complex
+/// rate. Carrier recovery, timing recovery, FEC, and framing belong to the
+/// decoder plugin, not to this stage.
+#[derive(Debug, Clone, Copy)]
+pub struct BpskDemodConfig {
+    pub input_rate_hz: f64,
+    /// Intermediate rate after channel selection. The channelizer rounds the
+    /// decimation to an integer.
+    pub channel_rate_hz: f64,
+    /// Complex output rate expected by the decoder.
+    pub output_rate_hz: f64,
+    /// Channel offset relative to the capture centre.
+    pub offset_hz: f64,
+    /// RF bandwidth of the data channel.
+    pub channel_bandwidth_hz: f64,
+}
+
+impl Default for BpskDemodConfig {
+    fn default() -> Self {
+        Self {
+            input_rate_hz: 2_400_000.0,
+            channel_rate_hz: 48_000.0,
+            output_rate_hz: 48_000.0,
+            offset_hz: 0.0,
+            channel_bandwidth_hz: 30_000.0,
+        }
+    }
+}
+
+/// Channelize and resample IQ for an external data decoder.
+///
+/// The output is complex baseband at [`BpskDemodConfig::output_rate_hz`]. A
+/// small linear resampler bridges the integer decimation of
+/// [`ComplexChannelizer`] to the decoder's nominal rate. At 9k6 the signal is
+/// already band-limited well below the output rate, so this is transparent in
+/// practice while keeping the stage allocation-free after start-up.
+pub struct BpskDemod {
+    channelizer: ComplexChannelizer,
+    channel_rate_hz: f64,
+    output_rate_hz: f64,
+    baseband: Vec<Complex32>,
+    resample_step: f64,
+    input_index: f64,
+    resample_next: f64,
+    previous: Option<Complex32>,
+}
+
+impl BpskDemod {
+    pub fn new(config: BpskDemodConfig) -> Self {
+        let channelizer = ComplexChannelizer::new(
+            config.input_rate_hz,
+            config.channel_rate_hz,
+            config.offset_hz,
+            config.channel_bandwidth_hz,
+        );
+        let channel_rate_hz = channelizer.output_rate_hz();
+        let output_rate_hz = config.output_rate_hz.max(1.0);
+
+        Self {
+            channelizer,
+            channel_rate_hz,
+            output_rate_hz,
+            baseband: Vec::new(),
+            resample_step: channel_rate_hz / output_rate_hz,
+            input_index: 0.0,
+            resample_next: 1.0,
+            previous: None,
+        }
+    }
+
+    pub fn output_rate_hz(&self) -> f64 {
+        self.output_rate_hz
+    }
+
+    pub fn channel_rate_hz(&self) -> f64 {
+        self.channel_rate_hz
+    }
+
+    /// Retune the channel NCO while keeping filter and resampler state.
+    pub fn set_offset(&mut self, offset_hz: f64) {
+        self.channelizer.set_offset(offset_hz);
+    }
+
+    /// Append complex baseband samples to `output` at the configured rate.
+    pub fn process(&mut self, input: &[Sample], output: &mut Vec<Complex32>) {
+        self.baseband.clear();
+        self.channelizer.process(input, &mut self.baseband);
+
+        for index in 0..self.baseband.len() {
+            let sample = self.baseband[index];
+            let Some(previous) = self.previous else {
+                self.previous = Some(sample);
+                continue;
+            };
+
+            self.input_index += 1.0;
+            while self.resample_next <= self.input_index {
+                let frac = (self.resample_next - (self.input_index - 1.0)).clamp(0.0, 1.0);
+                let re = previous.re as f64 + (sample.re as f64 - previous.re as f64) * frac;
+                let im = previous.im as f64 + (sample.im as f64 - previous.im as f64) * frac;
+                output.push(Complex32::new(re as f32, im as f32));
+                self.resample_next += self.resample_step;
+            }
+            self.previous = Some(sample);
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.channelizer.reset();
+        self.baseband.clear();
+        self.input_index = 0.0;
+        self.resample_next = 1.0;
+        self.previous = None;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CW demodulator
 // ---------------------------------------------------------------------------
 

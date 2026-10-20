@@ -18,6 +18,8 @@
 use std::io::{Read, Write};
 
 use anyhow::{Result, bail};
+use midori_core::Sample;
+use num_complex::Complex32;
 use serde_json::Value;
 
 pub const HEADER_LEN: usize = 21;
@@ -27,6 +29,7 @@ pub const KIND_JSON: u8 = 1;
 pub const KIND_AUDIO: u8 = 2;
 pub const KIND_SOFTBITS: u8 = 3;
 pub const KIND_BYTES: u8 = 4;
+pub const KIND_IQ: u8 = 5;
 
 #[derive(Debug, Clone)]
 pub enum WireMessage {
@@ -45,6 +48,11 @@ pub enum WireMessage {
         seq: u64,
         timestamp_ns: f64,
         bytes: Vec<u8>,
+    },
+    Iq {
+        seq: u64,
+        timestamp_ns: f64,
+        samples: Vec<Sample>,
     },
 }
 
@@ -82,6 +90,23 @@ pub fn write_bytes<W: Write>(
     bytes: &[u8],
 ) -> Result<()> {
     write_frame(writer, KIND_BYTES, seq, timestamp_ns, bytes)
+}
+
+/// Write interleaved complex samples as f32 LE pairs. This is the sidecar IQ
+/// path: decoders receive baseband IQ at a rate they request in their
+/// manifest, so they do not need to know about the SDR's sample rate.
+pub fn write_iq<W: Write>(
+    writer: &mut W,
+    seq: u64,
+    timestamp_ns: f64,
+    samples: &[Sample],
+) -> Result<()> {
+    let mut payload = Vec::with_capacity(samples.len() * 8);
+    for sample in samples {
+        payload.extend_from_slice(&sample.re.to_le_bytes());
+        payload.extend_from_slice(&sample.im.to_le_bytes());
+    }
+    write_frame(writer, KIND_IQ, seq, timestamp_ns, &payload)
 }
 
 fn write_frame<W: Write>(
@@ -145,6 +170,25 @@ pub fn read_message<R: Read>(reader: &mut R) -> Result<WireMessage> {
             timestamp_ns,
             bytes: payload,
         }),
+        KIND_IQ => {
+            if !payload.len().is_multiple_of(8) {
+                bail!("IQ frame length is not a multiple of 8");
+            }
+            let samples = payload
+                .chunks_exact(8)
+                .map(|chunk| {
+                    Complex32::new(
+                        f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]),
+                        f32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]),
+                    )
+                })
+                .collect();
+            Ok(WireMessage::Iq {
+                seq,
+                timestamp_ns,
+                samples,
+            })
+        }
         other => bail!("unknown plugin frame kind {other}"),
     }
 }
@@ -182,6 +226,26 @@ mod tests {
                 assert_eq!(samples, vec![0.25, -0.5, 0.0]);
             }
             _ => panic!("expected audio"),
+        }
+    }
+
+    #[test]
+    fn iq_roundtrip() {
+        let samples = [Complex32::new(0.5, -0.25), Complex32::new(-1.0, 0.0)];
+        let mut buffer = Vec::new();
+        write_iq(&mut buffer, 9, 42.0, &samples).unwrap();
+        let message = read_message(&mut Cursor::new(buffer)).unwrap();
+        match message {
+            WireMessage::Iq {
+                seq,
+                timestamp_ns,
+                samples: decoded,
+            } => {
+                assert_eq!(seq, 9);
+                assert_eq!(timestamp_ns, 42.0);
+                assert_eq!(decoded, samples.to_vec());
+            }
+            _ => panic!("expected IQ"),
         }
     }
 }

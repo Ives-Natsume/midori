@@ -84,7 +84,7 @@ fn main() -> Result<()> {
                     send_status(&mut writer, decoder.wpm(), decoder.tone_hz())?;
                 }
             }
-            WireMessage::SoftBits { .. } | WireMessage::Bytes { .. } => {}
+            WireMessage::SoftBits { .. } | WireMessage::Bytes { .. } | WireMessage::Iq { .. } => {}
         }
     }
 

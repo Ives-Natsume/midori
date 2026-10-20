@@ -75,6 +75,10 @@ struct WorkerOptions {
     cw_tone_hz: f64,
     sstv_enabled: bool,
     sstv_output_dir: PathBuf,
+    ssdv_enabled: bool,
+    ssdv_crc_inits: Vec<String>,
+    ssdv_frame_header_len: usize,
+    ssdv_audio_if: bool,
     fft_size: usize,
     doppler: Option<DopplerOptions>,
     initial_vfo_offset_hz: f64,
@@ -89,6 +93,7 @@ enum WorkerSource {
 enum PluginSource {
     Cw,
     Sstv,
+    Ssdv,
 }
 
 struct DopplerOptions {
@@ -179,6 +184,14 @@ pub struct MidoriApp {
     sstv_image_title: String,
     sstv_image_png: Option<Vec<u8>>,
     sstv_texture: Option<egui::TextureHandle>,
+    ssdv_enabled: bool,
+    ssdv_crc_inits_input: String,
+    ssdv_frame_header_len: u32,
+    ssdv_status: String,
+    ssdv_progress: f32,
+    ssdv_image_title: String,
+    ssdv_image_png: Option<Vec<u8>>,
+    ssdv_texture: Option<egui::TextureHandle>,
 
     tle_path: String,
     grid_input: String,
@@ -245,6 +258,9 @@ impl Default for MidoriApp {
         let cw_enabled = config.decoder.cw_enabled;
         let cw_afc = config.decoder.cw_afc;
         let sstv_enabled = config.decoder.sstv_enabled;
+        let ssdv_enabled = config.decoder.ssdv_enabled;
+        let ssdv_crc_inits = config.decoder.ssdv_crc_inits.clone();
+        let ssdv_frame_header_len = config.decoder.ssdv_frame_header_len as u32;
         let waterfall_follow = config.ui.waterfall_follow_spectrum;
         let doppler_tracking =
             std::env::var_os("MIDORI_DOPPLER").is_some() || config.satellite.doppler_tracking;
@@ -293,6 +309,18 @@ impl Default for MidoriApp {
             sstv_image_title: String::new(),
             sstv_image_png: None,
             sstv_texture: None,
+            ssdv_enabled: std::env::var_os("MIDORI_SSDV").is_some() || ssdv_enabled,
+            ssdv_crc_inits_input: if ssdv_crc_inits.is_empty() {
+                "0xFFFFFFFF".to_string()
+            } else {
+                ssdv_crc_inits.join(", ")
+            },
+            ssdv_frame_header_len,
+            ssdv_status: "idle".to_string(),
+            ssdv_progress: 0.0,
+            ssdv_image_title: String::new(),
+            ssdv_image_png: None,
+            ssdv_texture: None,
             tle_path,
             grid_input,
             min_elev_input,
@@ -337,6 +365,10 @@ impl MidoriApp {
         if self.is_connected || self.is_connecting {
             return;
         }
+        // `disconnect` clears the transient state, including the VFO offset.
+        // Keep a file replay's initial offset across the implicit disconnect
+        // so MIDORI_VFO / a previous file tuning still starts where expected.
+        let initial_vfo_offset_hz = self.vfo_offset_hz;
         self.disconnect();
 
         let Ok(freq_mhz) = self.freq_input.parse::<f64>() else {
@@ -359,9 +391,11 @@ impl MidoriApp {
             buffer_samples: source.buffer_samples,
         };
         self.center_freq_hz = freq_mhz * 1e6;
-        if !self.is_file_source() {
-            self.vfo_offset_hz = 0.0;
-        }
+        self.vfo_offset_hz = if self.is_file_source() {
+            initial_vfo_offset_hz
+        } else {
+            0.0
+        };
 
         let worker_source = if self.is_file_source() {
             if self.file_path.trim().is_empty() {
@@ -395,6 +429,10 @@ impl MidoriApp {
         let cw_enabled = self.cw_enabled;
         let cw_afc = self.cw_afc;
         let sstv_enabled = self.sstv_enabled;
+        let ssdv_enabled = self.ssdv_enabled;
+        let ssdv_crc_inits = split_list(&self.ssdv_crc_inits_input);
+        let ssdv_frame_header_len = self.ssdv_frame_header_len as usize;
+        let ssdv_audio_if = self.demod_mode == DemodMode::BpskIf;
         let sstv_output_dir = std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join("captures");
@@ -416,6 +454,10 @@ impl MidoriApp {
             cw_tone_hz,
             sstv_enabled,
             sstv_output_dir,
+            ssdv_enabled,
+            ssdv_crc_inits,
+            ssdv_frame_header_len,
+            ssdv_audio_if,
             fft_size,
             doppler,
             initial_vfo_offset_hz: if self.is_file_source() {
@@ -650,6 +692,9 @@ impl MidoriApp {
         self.config.decoder.cw_enabled = self.cw_enabled;
         self.config.decoder.cw_afc = self.cw_afc;
         self.config.decoder.sstv_enabled = self.sstv_enabled;
+        self.config.decoder.ssdv_enabled = self.ssdv_enabled;
+        self.config.decoder.ssdv_crc_inits = split_list(&self.ssdv_crc_inits_input);
+        self.config.decoder.ssdv_frame_header_len = self.ssdv_frame_header_len as usize;
         self.config.ui.spectrum_ratio = self.spectrum_ratio;
         self.config.ui.decoder_tab = self.decoder_tab;
         self.config.ui.decoder_dock_open = self.decoder_dock_open;
@@ -697,6 +742,13 @@ impl MidoriApp {
         self.cw_enabled = config.decoder.cw_enabled;
         self.cw_afc = config.decoder.cw_afc;
         self.sstv_enabled = config.decoder.sstv_enabled;
+        self.ssdv_enabled = config.decoder.ssdv_enabled;
+        self.ssdv_crc_inits_input = if config.decoder.ssdv_crc_inits.is_empty() {
+            "0xFFFFFFFF".to_string()
+        } else {
+            config.decoder.ssdv_crc_inits.join(", ")
+        };
+        self.ssdv_frame_header_len = config.decoder.ssdv_frame_header_len as u32;
         self.spectrum_ratio = config.ui.spectrum_ratio;
         self.waterfall_follow = config.ui.waterfall_follow_spectrum;
         self.decoder_tab = config.ui.decoder_tab;
@@ -957,6 +1009,7 @@ impl MidoriApp {
         match source {
             PluginSource::Cw => self.handle_cw_plugin_event(event),
             PluginSource::Sstv => self.handle_sstv_plugin_event(event, ctx),
+            PluginSource::Ssdv => self.handle_ssdv_plugin_event(event, ctx),
         }
     }
 
@@ -1057,6 +1110,65 @@ impl MidoriApp {
         }
     }
 
+    fn handle_ssdv_plugin_event(&mut self, event: PluginEvent, ctx: &egui::Context) {
+        match event {
+            PluginEvent::Display { update } => match update {
+                DisplayUpdate::Image {
+                    title,
+                    format,
+                    width,
+                    height,
+                    bytes,
+                } => match decode_image_update(format, width, height, &bytes) {
+                    Ok(image) => {
+                        self.ssdv_texture = Some(ctx.load_texture(
+                            format!("ssdv-{title}"),
+                            image,
+                            egui::TextureOptions::LINEAR,
+                        ));
+                        self.ssdv_image_png = (format == ImageFormat::Png).then_some(bytes);
+                        self.ssdv_image_title = title.clone();
+                        self.ssdv_status = format!("{title}: image ready");
+                        if title.contains("(complete)") {
+                            self.ssdv_progress = 1.0;
+                            self.push_log(format!("SSDV image decoded: {title}"));
+                        }
+                        self.decoder_tab = DecoderTab::Ssdv;
+                        self.decoder_dock_open = true;
+                    }
+                    Err(error) => {
+                        self.ssdv_status = format!("image decode failed: {error}");
+                        self.push_log(self.ssdv_status.clone());
+                    }
+                },
+                DisplayUpdate::Progress { title, fraction } => {
+                    self.ssdv_progress = fraction.clamp(0.0, 1.0);
+                    self.ssdv_status = format!("{title} ({:.0}%)", fraction * 100.0);
+                }
+                DisplayUpdate::Text { lines, .. } => {
+                    self.ssdv_status = lines.join(" ");
+                }
+                DisplayUpdate::Table { columns, rows, .. } => {
+                    self.ssdv_status = format!("{} ({} rows)", columns.join(" | "), rows.len());
+                }
+            },
+            PluginEvent::Status { message, .. } => {
+                self.ssdv_status = message.clone();
+                self.push_log(format!("SSDV: {message}"));
+            }
+            PluginEvent::Error { message, fatal } => {
+                self.ssdv_status = if fatal {
+                    format!("fatal: {message}")
+                } else {
+                    message.clone()
+                };
+                self.push_log(format!("SSDV plugin: {message}"));
+                self.error_msg = Some(message);
+            }
+            PluginEvent::Packet { .. } => {}
+        }
+    }
+
     fn poll_data(&mut self, ctx: &egui::Context) {
         let Some(rx) = &self.data_rx else { return };
 
@@ -1137,6 +1249,8 @@ impl MidoriApp {
             DemodMode::Am => "AM",
             DemodMode::Cw => "CW",
             DemodMode::Sstv => "SSTV",
+            DemodMode::Bpsk => "BPSK",
+            DemodMode::BpskIf => "BPSK IF",
             _ => "?",
         }
     }
@@ -1189,6 +1303,9 @@ impl MidoriApp {
                 ui.selectable_value(&mut self.demod_mode, DemodMode::Am, "AM");
                 ui.selectable_value(&mut self.demod_mode, DemodMode::Cw, "CW");
                 ui.selectable_value(&mut self.demod_mode, DemodMode::Sstv, "SSTV");
+                ui.selectable_value(&mut self.demod_mode, DemodMode::Bpsk, "BPSK");
+                ui.selectable_value(&mut self.demod_mode, DemodMode::BpskIf, "BPSK IF")
+                    .on_hover_text("mono 48 kHz, 12 kHz real-IF recording");
                 if self.demod_mode != previous_demod {
                     self.config.demod.mode = self.demod_mode;
                     self.mark_demod_dirty();
@@ -1374,6 +1491,7 @@ impl MidoriApp {
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.decoder_tab, DecoderTab::Cw, "CW");
                     ui.selectable_value(&mut self.decoder_tab, DecoderTab::Sstv, "SSTV");
+                    ui.selectable_value(&mut self.decoder_tab, DecoderTab::Ssdv, "SSDV");
                     ui.selectable_value(&mut self.decoder_tab, DecoderTab::Passes, "Passes");
                     ui.selectable_value(&mut self.decoder_tab, DecoderTab::Log, "Log");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1388,6 +1506,7 @@ impl MidoriApp {
                 match self.decoder_tab {
                     DecoderTab::Cw => self.draw_cw_tab(ui),
                     DecoderTab::Sstv => self.draw_sstv_tab(ui),
+                    DecoderTab::Ssdv => self.draw_ssdv_tab(ui),
                     DecoderTab::Passes => self.draw_passes_tab(ui),
                     DecoderTab::Log => self.draw_log_tab(ui),
                 }
@@ -1426,52 +1545,56 @@ impl MidoriApp {
     }
 
     fn draw_sstv_tab(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.heading("SSTV");
-            ui.label(&self.sstv_status);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        let mut save = false;
+        let mut clear = false;
+        ui.columns(2, |columns| {
+            let info = &mut columns[0];
+            info.heading("SSTV");
+            info.label(&self.sstv_status);
+            info.horizontal(|ui| {
                 if ui
                     .add_enabled(self.sstv_image_png.is_some(), egui::Button::new("Save PNG"))
                     .clicked()
                 {
-                    self.save_sstv_png();
+                    save = true;
                 }
                 if self.sstv_texture.is_some() && ui.small_button("Clear").clicked() {
-                    self.sstv_texture = None;
-                    self.sstv_image_png = None;
-                    self.sstv_image_title.clear();
-                    self.sstv_progress = 0.0;
+                    clear = true;
                 }
             });
-        });
-        if self.sstv_progress > 0.0 && self.sstv_progress < 1.0 {
-            ui.add(
-                egui::ProgressBar::new(self.sstv_progress)
-                    .desired_height(8.0)
-                    .show_percentage(),
-            );
-        }
-        ui.separator();
-
-        let Some(texture) = &self.sstv_texture else {
-            ui.label(
+            if self.sstv_progress > 0.0 && self.sstv_progress < 1.0 {
+                info.add(
+                    egui::ProgressBar::new(self.sstv_progress)
+                        .desired_height(8.0)
+                        .show_percentage(),
+                );
+            }
+            info.separator();
+            info.label(
                 egui::RichText::new(
-                    "Enable the SSTV decoder, select the SSTV demod, then tune an FM SSTV signal.\n\
-                     PD-120 and Robot 36 are the primary test modes. Images are saved to captures/.",
+                    "Select the SSTV demod and tune an FM SSTV signal.\n\
+                     VIS is detected automatically; PD-120 and Robot 36 are the primary modes.\n\
+                     Images are saved to captures/.",
                 )
                 .weak(),
             );
-            return;
-        };
 
-        let available = ui.available_size();
-        let original = texture.size_vec2();
-        let scale = (available.x / original.x)
-            .min(available.y / original.y)
-            .clamp(0.05, 1.0);
-        let size = original * scale;
-        let image = egui::Image::new(egui::load::SizedTexture::new(texture.id(), size));
-        ui.add(image).on_hover_text(&self.sstv_image_title);
+            draw_decoder_image(
+                &mut columns[1],
+                self.sstv_texture.as_ref(),
+                &self.sstv_image_title,
+                "SSTV image",
+            );
+        });
+        if save {
+            self.save_sstv_png();
+        }
+        if clear {
+            self.sstv_texture = None;
+            self.sstv_image_png = None;
+            self.sstv_image_title.clear();
+            self.sstv_progress = 0.0;
+        }
     }
 
     fn save_sstv_png(&mut self) {
@@ -1500,6 +1623,91 @@ impl MidoriApp {
             Err(error) => {
                 let message = format!("saving {}: {error}", path.display());
                 self.sstv_status = message.clone();
+                self.push_log(message.clone());
+                self.error_msg = Some(message);
+            }
+        }
+    }
+
+    fn draw_ssdv_tab(&mut self, ui: &mut egui::Ui) {
+        let mut save = false;
+        let mut clear = false;
+        ui.columns(2, |columns| {
+            let info = &mut columns[0];
+            info.heading("SSDV");
+            info.label(&self.ssdv_status);
+            info.horizontal(|ui| {
+                if ui
+                    .add_enabled(self.ssdv_image_png.is_some(), egui::Button::new("Save PNG"))
+                    .clicked()
+                {
+                    save = true;
+                }
+                if self.ssdv_texture.is_some() && ui.small_button("Clear").clicked() {
+                    clear = true;
+                }
+            });
+            if self.ssdv_progress > 0.0 && self.ssdv_progress < 1.0 {
+                info.add(
+                    egui::ProgressBar::new(self.ssdv_progress)
+                        .desired_height(8.0)
+                        .show_percentage(),
+                );
+            }
+            info.separator();
+            info.label(
+                egui::RichText::new(
+                    "Select the BPSK 9k6 demod and tune the image downlink.\n\
+                     The decoder accepts 218-byte DSLWP packets and classic 256-byte SSDV.\n\
+                     JPEG/PNG and packet dumps are saved to captures/.",
+                )
+                .weak(),
+            );
+
+            draw_decoder_image(
+                &mut columns[1],
+                self.ssdv_texture.as_ref(),
+                &self.ssdv_image_title,
+                "SSDV image",
+            );
+        });
+        if save {
+            self.save_ssdv_png();
+        }
+        if clear {
+            self.ssdv_texture = None;
+            self.ssdv_image_png = None;
+            self.ssdv_image_title.clear();
+            self.ssdv_progress = 0.0;
+        }
+    }
+
+    fn save_ssdv_png(&mut self) {
+        let Some(bytes) = &self.ssdv_image_png else {
+            return;
+        };
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        let path = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("captures")
+            .join(format!("ssdv_manual_{stamp}.png"));
+        if let Some(parent) = path.parent()
+            && let Err(error) = std::fs::create_dir_all(parent)
+        {
+            self.ssdv_status = format!("creating {}: {error}", parent.display());
+            return;
+        }
+        match std::fs::write(&path, bytes) {
+            Ok(()) => {
+                self.ssdv_status = format!("saved {}", path.display());
+                self.push_log(self.ssdv_status.clone());
+            }
+            Err(error) => {
+                let message = format!("saving {}: {error}", path.display());
+                self.ssdv_status = message.clone();
                 self.push_log(message.clone());
                 self.error_msg = Some(message);
             }
@@ -1819,6 +2027,22 @@ impl MidoriApp {
                                         .weak(),
                                     );
                                 }
+                                DemodMode::Bpsk => {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "complex output · 9k6 BPSK data/SSDV",
+                                        )
+                                        .weak(),
+                                    );
+                                }
+                                DemodMode::BpskIf => {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "mono 48 kHz real IF · 12 kHz center · pass-through",
+                                        )
+                                        .weak(),
+                                    );
+                                }
                                 _ => {}
                             }
                         }
@@ -2056,6 +2280,65 @@ impl MidoriApp {
                         );
                     });
 
+                egui::CollapsingHeader::new("SSDV")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        let previous_enabled = self.ssdv_enabled;
+                        let previous_crc = self.ssdv_crc_inits_input.clone();
+                        let previous_header = self.ssdv_frame_header_len;
+                        ui.checkbox(&mut self.ssdv_enabled, "SSDV decoder (DSLWP / classic)");
+                        if self.ssdv_enabled != previous_enabled
+                            && (self.is_connected || self.is_connecting)
+                        {
+                            self.status_msg = "Reconnect to apply SSDV decoder".to_string();
+                        }
+                        ui.label(format!("Status: {}", self.ssdv_status));
+                        ui.horizontal(|ui| {
+                            ui.label("CRC init");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.ssdv_crc_inits_input)
+                                    .hint_text("0xFFFFFFFF, 0x4EE4FDE1")
+                                    .desired_width(170.0),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Frame header");
+                            ui.add(
+                                egui::DragValue::new(&mut self.ssdv_frame_header_len)
+                                    .range(0..=5)
+                                    .suffix(" B"),
+                            );
+                        });
+                        if (self.ssdv_crc_inits_input != previous_crc
+                            || self.ssdv_frame_header_len != previous_header)
+                            && (self.is_connected || self.is_connecting)
+                        {
+                            self.status_msg =
+                                "Reconnect to apply SSDV CRC/header parameters".to_string();
+                        }
+                        ui.label(
+                            egui::RichText::new(
+                                "CRC polynomial is fixed; the initial value is stream-specific.\n\
+                                 223-byte CCSDS frames default to a 5-byte header.\n\
+                                 Images are saved to captures/.",
+                            )
+                            .weak(),
+                        );
+                        if self.ssdv_enabled
+                            && !matches!(
+                                self.demod_mode,
+                                DemodMode::Bpsk | DemodMode::BpskIf
+                            )
+                        {
+                            ui.label(
+                                egui::RichText::new(
+                                    "select BPSK (IQ) or BPSK IF (real 12 kHz IF)",
+                                )
+                                .color(egui::Color32::from_rgb(220, 180, 90)),
+                            );
+                        }
+                    });
+
                 egui::CollapsingHeader::new("Plugins")
                     .default_open(true)
                     .show(ui, |ui| {
@@ -2075,7 +2358,15 @@ impl MidoriApp {
                                 "disabled"
                             }
                         ));
-                        ui.label(egui::RichText::new("more: APT · SSDV · FT4").weak());
+                        ui.label(format!(
+                            "SSDV: {}",
+                            if self.ssdv_enabled {
+                                "enabled"
+                            } else {
+                                "disabled"
+                            }
+                        ));
+                        ui.label(egui::RichText::new("more: APT · FT4").weak());
                     });
 
                 ui.add_space(6.0);
@@ -2576,6 +2867,84 @@ fn start_sstv_plugin(
     Some((sink, handle))
 }
 
+fn ssdv_plugin_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("MIDORI_SSDV_PLUGIN") {
+        return Some(PathBuf::from(path));
+    }
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let name = if cfg!(windows) {
+        "midori-plugin-ssdv.exe"
+    } else {
+        "midori-plugin-ssdv"
+    };
+    let path = dir.join(name);
+    path.exists().then_some(path)
+}
+
+fn start_ssdv_plugin(
+    event_tx: &Sender<WorkerEvent>,
+    output_dir: &Path,
+    crc_inits: &[String],
+    frame_header_len: usize,
+    audio_if: bool,
+) -> Option<(PluginSink, PluginHandle)> {
+    let Some(path) = ssdv_plugin_path() else {
+        let _ = event_tx.try_send(WorkerEvent::Error(
+            "SSDV plugin binary not found; build the workspace first".to_string(),
+        ));
+        return None;
+    };
+
+    let input = if audio_if {
+        InputSpec::Audio {
+            sample_rate_hz: 48_000.0,
+            channels: 1,
+        }
+    } else {
+        InputSpec::Iq {
+            sample_rate_hz: 48_000.0,
+            center_freq_hz: None,
+        }
+    };
+    let manifest = Manifest {
+        name: "ssdv".to_string(),
+        version: "0.1.0".to_string(),
+        protocol: PROTOCOL_VERSION,
+        command: vec![path.display().to_string()],
+        input,
+        outputs: vec![OutputKind::Display],
+        params: vec![],
+    };
+
+    let mut plugin = match SidecarPlugin::new(manifest) {
+        Ok(plugin) => plugin,
+        Err(error) => {
+            let _ = event_tx.try_send(WorkerEvent::Error(format!("SSDV plugin manifest: {error}")));
+            return None;
+        }
+    };
+    if let Err(error) = plugin.start() {
+        let _ = event_tx.try_send(WorkerEvent::Error(format!("SSDV plugin start: {error}")));
+        return None;
+    }
+    if let Err(error) = plugin.configure(&serde_json::json!({
+        "output_dir": output_dir.display().to_string(),
+        "input": if audio_if { "audio-if" } else { "iq" },
+        "crc_inits": crc_inits,
+        "frame_header_len": frame_header_len,
+    })) {
+        let _ = plugin.stop();
+        let _ = event_tx.try_send(WorkerEvent::Error(format!(
+            "SSDV plugin configure: {error}"
+        )));
+        return None;
+    }
+
+    let (sink, handle) = plugin_sink(Box::new(plugin));
+    Some((sink, handle))
+}
+
 fn build_doppler(
     options: &DopplerOptions,
     event_tx: &Sender<WorkerEvent>,
@@ -2673,7 +3042,12 @@ fn run_worker(
     };
 
     if let Some(producer) = &audio_producer {
-        vfo.audio_rate_hz = producer.sample_rate_hz() as f64;
+        // Audio modes follow the sound card rate. The BPSK channels are data
+        // paths: they keep the configured 48 kHz rate regardless of the
+        // default output device.
+        if !matches!(vfo.demod, DemodMode::Bpsk | DemodMode::BpskIf) {
+            vfo.audio_rate_hz = producer.sample_rate_hz() as f64;
+        }
     }
     if let Some(output) = &audio_output {
         eprintln!(
@@ -2698,6 +3072,18 @@ fn run_worker(
         plugin_sinks.push(Box::new(sink));
         plugin_handles.push((PluginSource::Sstv, handle));
     }
+    if options.ssdv_enabled
+        && let Some((sink, handle)) = start_ssdv_plugin(
+            &event_tx,
+            options.sstv_output_dir.as_path(),
+            &options.ssdv_crc_inits,
+            options.ssdv_frame_header_len,
+            options.ssdv_audio_if,
+        )
+    {
+        plugin_sinks.push(Box::new(sink));
+        plugin_handles.push((PluginSource::Ssdv, handle));
+    }
 
     let (recorder_sink, recorder_handle) = RecorderSink::new();
     let auto_tune_state = Arc::new(Mutex::new(AutoTuneState::Idle));
@@ -2708,7 +3094,10 @@ fn run_worker(
     ];
     sinks.extend(plugin_sinks);
     if let Some(producer) = audio_producer {
-        sinks.push(Box::new(AudioSink::new(producer)));
+        // A real-IF data stream is not listening audio.
+        if !options.ssdv_audio_if {
+            sinks.push(Box::new(AudioSink::new(producer)));
+        }
     }
 
     let mut channel = VfoChannel::new(vfo.clone());
@@ -3008,6 +3397,8 @@ fn format_demod(mode: DemodMode) -> &'static str {
         DemodMode::Am => "AM",
         DemodMode::Cw => "CW",
         DemodMode::Sstv => "SSTV",
+        DemodMode::Bpsk => "BPSK",
+        DemodMode::BpskIf => "BPSK IF",
         DemodMode::Usb => "USB",
         DemodMode::Lsb => "LSB",
     }
@@ -3020,6 +3411,40 @@ fn frequency_from_path(path: &str) -> Option<f64> {
     let digits = tail.strip_suffix("Hz")?;
     let hz = digits.parse::<f64>().ok()?;
     (hz > 0.0).then_some(hz / 1e6)
+}
+
+fn split_list(text: &str) -> Vec<String> {
+    text.split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn draw_decoder_image(
+    ui: &mut egui::Ui,
+    texture: Option<&egui::TextureHandle>,
+    title: &str,
+    placeholder: &str,
+) {
+    ui.separator();
+    let Some(texture) = texture else {
+        ui.centered_and_justified(|ui| {
+            ui.label(egui::RichText::new(placeholder).weak());
+        });
+        return;
+    };
+
+    let available = ui.available_size();
+    let original = texture.size_vec2();
+    let scale = (available.x / original.x)
+        .min(available.y / original.y)
+        .clamp(0.05, 1.0);
+    let size = original * scale;
+    ui.centered_and_justified(|ui| {
+        let image = egui::Image::new(egui::load::SizedTexture::new(texture.id(), size));
+        ui.add(image).on_hover_text(title);
+    });
 }
 
 /// Convert a plugin image event into an egui texture source.

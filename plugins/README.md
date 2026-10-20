@@ -56,6 +56,7 @@ Kinds:
 | 2 | mono audio, f32 LE samples |
 | 3 | soft bits / LLR bytes |
 | 4 | framed or raw bytes |
+| 5 | interleaved complex IQ, f32 LE `(re, im)` pairs |
 
 Control messages are JSON objects with a `type` field:
 
@@ -84,8 +85,13 @@ The `doppler_hz` field is the correction currently applied to the VFO. The
 plugin receives a stream that is already corrected; it may implement residual
 AFC/tone tracking, but it must not compute SGP4 or retune hardware.
 
-Raw IQ streams are not enabled for sidecars yet. When they are added they will
-use shared memory; the current audio/byte path is pipe-friendly.
+IQ sidecars are supported, but they receive the **channelized** complex output
+of a digital VFO, not the multi-megasample source block. A plugin that declares
+`{"type":"iq","sample_rate_hz":48000}` is only sent IQ frames carrying a
+`vfo_id`; the core's VFO/Doppler stage has already selected and resampled the
+signal. For 9k6 BPSK, add a 30 kHz BPSK channel and request 48 kHz. The data
+plane is still a pipe (`kind = 5`, 8 bytes per sample); shared memory is only
+needed if a future decoder asks for wideband IQ.
 
 ## Timeouts and backpressure
 
@@ -209,13 +215,68 @@ cargo run --release -p midori-plugin-sstv --bin midori-sstv-decode -- \
   recording.wav --out-dir captures
 ```
 
+## Reference plugin: SSDV
+
+`plugins/midori-plugin-ssdv` decodes SSDV image streams. It parses 223-byte
+CCSDS frames, 218-byte DSLWP packets, and classic 256-byte packets, reassembles
+each image with gap filling, and emits PNG display events. For the 9k6
+BPSK/CCSDS link it can take the BPSK channel's 48 kHz complex baseband and run
+OpenHoshimi's Viterbi / RS(255,223) soundmodem (validated with ASRTU-1); the
+SSDV layer itself is link-agnostic. It also writes the JPEG,
+PNG, and a per-image concatenation of received packets to `captures/`.
+
+The SSDV CRC32 polynomial (`0xEDB88320`) and final XOR are fixed, but the
+initial value differs between implementations. It is supplied by the caller,
+not selected by a satellite name: classic SSDV uses `0xFFFFFFFF`, ASRTU-1 /
+DSLWP uses `0x4EE4FDE1`, and some JAMX/BY-04 streams use `0x6AAAC1C5`.
+Multiple values can be supplied and are tried in order. The 223-byte CCSDS
+frame header length is also configurable (default 5 bytes). The offline tool
+also handles mono 48 kHz, 12 kHz real-IF audio through the soundmodem's `i16`
+input; the live sidecar uses the lossless IQ path.
+
+```bash
+MIDORI_AUTOCONNECT=1 MIDORI_SSDV=1 ./target/release/midori-gui
+```
+
+Select **BPSK** for zero-IF I/Q, or **BPSK IF** for a mono 48 kHz / 12 kHz
+real-IF recording, and enable **SSDV decoder**. Set the stream's CRC32 initial
+value(s) and frame header length in the SSDV panel; these are not selected by
+satellite name. The VFO must sit on the image downlink
+(436.210 MHz for the ASRTU-1 example). The sidecar accepts raw input for
+offline work:
+
+```bash
+cargo run --release -p midori-plugin-ssdv --bin midori-ssdv-decode -- \
+  recording.wav --offset 750000 --crc-init 0x4EE4FDE1 --out-dir captures
+
+cargo run --release -p midori-plugin-ssdv --bin midori-ssdv-decode -- \
+  ASRTU1_IF.wav --audio-if --crc-init 0x4EE4FDE1 --out-dir captures
+
+cargo run --release -p midori-plugin-ssdv --bin midori-ssdv-decode -- \
+  asrtu1_frames.b64 --crc-init 0x4EE4FDE1 --out-dir captures
+```
+
+The raw path accepts 223-byte CCSDS frames, 218-byte DSLWP packets, 256-byte
+classic SSDV packets, or a base64 dump of any of these. The regression fixture
+is a real ASRTU-1 pass from BG7ZDQ/ASRTU_Series_Receiver (MIT). Local ignored
+tests also cover a full ASRTU-1 zero-IF I/Q pass and a BY-04 12 kHz-IF
+recording with both CRC initial values and 640x480 images:
+
+```bash
+cargo test -p midori-plugin-ssdv --release --test asrtu_live -- --ignored
+```
+
+The sidecar links GPL-3.0-or-later OpenHoshimi crates and therefore is
+GPL-3.0-or-later itself. It is deliberately out of process so the rest of
+Midori can remain MIT/Apache-2.0. See `midori-plugin-ssdv/NOTICE.md`.
+
 ## Writing a plugin
 
 The minimal Rust implementation uses `midori-plugin`:
 
 1. Read the `hello`/`configure`/`stream` messages from stdin.
 2. Write `ready` after configuration.
-3. Process `audio` frames.
+3. Process `audio`, `iq`, soft-bit, or byte frames declared by the manifest.
 4. Write JSON events with `kind = 1` frames.
 
 Any language can implement the same framing. Keep the data plane binary and

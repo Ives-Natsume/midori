@@ -36,6 +36,17 @@ Doppler correction, recording, and plugins for SSTV/SSDV/FT4/CW.
   PNG. PD-120 and Robot 36 are the primary validated modes.
 - Offline SSTV decoding from WAV (`midori-sstv-decode`) for testing without a
   transmitter.
+- Complex BPSK channel mode (30 kHz in, 48 kHz IQ out) and a **BPSK IF**
+  pass-through mode for mono 48 kHz / 12 kHz real-IF recordings, with the same
+  digital VFO and SGP4 Doppler path as the audio modes.
+- Generic SSDV sidecar: OpenHoshimi's 9k6 BPSK/CCSDS soundmodem, DSLWP
+  218-byte and classic 256-byte SSDV packets, image reassembly with gap
+  filling, JPEG/PNG output, and a preview in the SSDV tab. The CRC32 initial
+  value and CCSDS frame header length are supplied by the user rather than
+  baked in per satellite.
+- Offline SSDV decoding from I/Q WAV, 48 kHz mono 12 kHz-IF audio, or raw
+  packet/frame dumps (`midori-ssdv-decode`), validated against real ASRTU-1
+  and BY-04 passes.
 - Live FM/AM/CW audio through `cpal`, driven by the same `VfoChannel` used for
   offline captures, with a simple AGC.
 - egui desktop UI with a fixed three-column layout, stacked spectrum/waterfall,
@@ -104,6 +115,26 @@ Inspect the capture and print the strongest bins:
 ./target/release/midori spectrum captures/airband_120m --top 20
 ```
 
+Decode an ASRTU-1 SSDV recording (9k6 BPSK). For a zero-IF I/Q capture, give
+the signal offset inside the recording:
+
+```bash
+./target/release/midori-ssdv-decode recording.wav --offset 750000 --out-dir captures
+```
+
+For the reference receiver's mono 48 kHz, 12 kHz real-IF recordings:
+
+```bash
+./target/release/midori-ssdv-decode ASRTU1_IF.wav --audio-if --out-dir captures
+```
+
+Decode a raw dump of 223-byte CCSDS frames, 218-byte DSLWP packets, or
+256-byte classic SSDV packets:
+
+```bash
+./target/release/midori-ssdv-decode asrtu1_frames.b64 --out-dir captures
+```
+
 Demodulate an AM channel to audio:
 
 ```bash
@@ -146,12 +177,17 @@ The desktop UI uses a fixed three-column layout:
   spectrum zoom** crops the waterfall to the spectrum view; when it is off the
   full band is shown and yellow boundary lines mark the spectrum view.
 - **Right — Decoders**: CW enable, AFC and **Auto tune CW carrier** (with a
-  warning when no narrowband CW signal is found), SSTV controls, plugin list,
-  decoder dock visibility.
+  warning when no narrowband CW signal is found), SSTV and SSDV controls
+  (including the SSDV CRC initial value and CCSDS frame header length),
+  plugin list, decoder dock visibility.
 - **Left — Demod**: editable RF bandwidth, audio bandwidth, and FM
-  de-emphasis. Changes are applied to the running session after a short
+  de-emphasis; **BPSK** selects the complex 48 kHz data channel, and
+  **BPSK IF** passes a mono 48 kHz / 12 kHz real-IF recording straight to the
+  data decoder. Changes are applied to the running session after a short
   debounce (no reconnect needed).
-- **Bottom dock**: `CW`, `SSTV`, `Passes` planner, and `Log`.
+- **Bottom dock**: `CW`, `SSTV`, `SSDV`, `Passes` planner, and `Log`. The
+  SSTV and SSDV tabs split vertically: status/controls on the left, decoded
+  image on the right.
 
 For an I/Q file, choose **Input → I/Q file**, enter a RIFF/RF64 WAV path, and
 press **From filename** to take the centre frequency from a name like
@@ -233,6 +269,7 @@ crates/
 plugins/
   midori-plugin-cw/      # reference CW decoder sidecar
   midori-plugin-sstv/    # SSTV sidecar + offline WAV decoder
+  midori-plugin-ssdv/    # ASRTU-1 SSDV sidecar + offline decoder (GPL)
 ```
 
 The old Python audio-loopback experiment is archived at
@@ -258,6 +295,8 @@ The old Python audio-loopback experiment is archived at
   different languages, licenses, and failure modes. A sidecar supervisor with
   typed streams (`IQ`, `Audio`, `SoftBits`, `Bytes`) keeps the core clean.
   Plugins emit text/image/table display events rather than linking egui.
+  IQ sidecars receive a channelized 48 kHz complex stream, not the wideband
+  source, so the VFO and Doppler correction still apply.
 - **The core has no UI dependency.** The CLI and egui app are both consumers;
   a remote or Tauri client can use the same engine later.
 
@@ -315,9 +354,63 @@ Without a transmitter or radio, decode a WAV recording offline:
 The plugin protocol and sidecar ABI are documented in
 [`plugins/README.md`](plugins/README.md).
 
+### SSDV
+
+`plugins/midori-plugin-ssdv` decodes SSDV image streams. It accepts 223-byte
+CCSDS frames, 218-byte DSLWP packets, and classic 256-byte SSDV packets. For
+the 9k6 BPSK/CCSDS link it can take the **BPSK** channel's 48 kHz complex
+baseband and run OpenHoshimi's Viterbi/RS(255,223) soundmodem (validated with
+ASRTU-1). It then reassembles the JPEG scan data, filling missing packets, and
+emits PNG image events. The SSDV layer itself is link-agnostic.
+
+Select **BPSK** for a zero-IF I/Q recording, or **BPSK IF** for a mono 48 kHz
+recording with the signal at a 12 kHz intermediate frequency. Then tune the
+image downlink and enable **SSDV decoder**. Set the stream's CRC32 initial value(s)
+in the SSDV panel; for ASRTU-1/DSLWP that is `0x4EE4FDE1`, while classic SSDV
+uses `0xFFFFFFFF`. The polynomial is fixed by SSDV; only the initial value
+differs between implementations. The 223-byte frame header length defaults to
+5 bytes. Images,
+JPEGs, and per-image packet dumps are written to `captures/`.
+
+```bash
+MIDORI_AUTOCONNECT=1 MIDORI_SSDV=1 ./target/release/midori-gui
+```
+
+Decode without hardware:
+
+```bash
+# Zero-IF I/Q WAV, SSDV signal at +750 kHz
+./target/release/midori-ssdv-decode recording.wav --offset 750000 \
+  --crc-init 0x4EE4FDE1
+
+# Mono 48 kHz, 12 kHz real-IF recording
+./target/release/midori-ssdv-decode ASRTU1_IF.wav --audio-if \
+  --crc-init 0x4EE4FDE1
+
+# Raw 223-byte CCSDS frames (or 218-byte DSLWP / 256-byte SSDV packets)
+./target/release/midori-ssdv-decode asrtu1_frames.b64 --crc-init 0x4EE4FDE1
+```
+
+The fixture in `plugins/midori-plugin-ssdv/tests/fixtures/` is a real
+ASRTU-1 pass (image ID 43, 320x240) from
+[BG7ZDQ/ASRTU_Series_Receiver](https://github.com/BG7ZDQ/ASRTU_Series_Receiver).
+The decoder has also been checked against local ASRTU-1 zero-IF I/Q and
+BY-04 12 kHz-IF captures. BY-04 accepts both `0x4EE4FDE1` and the alternate
+`0x6AAAC1C5` initial value; pass both to `--crc-init` if needed. Those large
+recordings are not committed; the ignored tests are:
+
+```bash
+cargo test -p midori-plugin-ssdv --release --test asrtu_live -- --ignored
+```
+
+This sidecar links the GPL-3.0-or-later OpenHoshimi crates for its
+soundmodem and JPEG assembler, so the sidecar itself is GPL-3.0-or-later and
+stays out of process. The rest of Midori remains MIT/Apache-2.0. See
+`plugins/midori-plugin-ssdv/NOTICE.md`.
+
 ## Roadmap
 
-1. SSTV live preview, real ARISS regression recordings, then SSDV/APT.
+1. SSTV live preview, real ARISS regression recordings, then APT.
 2. Pass Arm/AOS/LOS automation and automatic Doppler arming.
 3. SSB/CW voice demodulation, squelch, and filter presets.
 4. Shareable receiver presets and SigMF browse/playback.
@@ -325,5 +418,8 @@ The plugin protocol and sidecar ABI are documented in
 
 ## License
 
-Intended to be MIT OR Apache-2.0. License files and the final choice will be
+The core and the CW/SSTV plugins are intended to be MIT OR Apache-2.0.
+`plugins/midori-plugin-ssdv` is GPL-3.0-or-later because it uses the GPL
+OpenHoshimi soundmodem and SSDV JPEG assembler; it runs as a separate
+process. License files and the final choice for the MIT/Apache parts will be
 added before the first public release.

@@ -22,11 +22,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError, bounded};
-use midori_core::{Frame, FrameMeta, StreamData};
+use midori_core::{Frame, FrameMeta, StreamData, StreamKind};
 use serde_json::{Value, json};
 
 use crate::wire::{
-    WireMessage, read_message, write_audio, write_bytes, write_json, write_soft_bits,
+    WireMessage, read_message, write_audio, write_bytes, write_iq, write_json, write_soft_bits,
 };
 use crate::{Manifest, PROTOCOL_VERSION, PluginEvent, PluginHost};
 
@@ -60,6 +60,11 @@ enum Outbound {
         seq: u64,
         timestamp_ns: f64,
         bytes: Arc<[u8]>,
+    },
+    Iq {
+        seq: u64,
+        timestamp_ns: f64,
+        samples: Arc<[midori_core::Sample]>,
     },
 }
 
@@ -115,6 +120,11 @@ impl SidecarPlugin {
                             timestamp_ns,
                             bytes,
                         } => write_bytes(&mut writer, seq, timestamp_ns, &bytes),
+                        Outbound::Iq {
+                            seq,
+                            timestamp_ns,
+                            samples,
+                        } => write_iq(&mut writer, seq, timestamp_ns, &samples),
                     };
                     if result.is_err() {
                         break;
@@ -197,6 +207,15 @@ impl SidecarPlugin {
 impl PluginHost for SidecarPlugin {
     fn manifest(&self) -> &Manifest {
         &self.manifest
+    }
+
+    fn input_kind(&self) -> StreamKind {
+        match &self.manifest.input {
+            crate::InputSpec::Iq { .. } => StreamKind::Iq,
+            crate::InputSpec::Audio { .. } => StreamKind::Audio,
+            crate::InputSpec::SoftBits { .. } => StreamKind::SoftBits,
+            crate::InputSpec::Bytes { .. } => StreamKind::Bytes,
+        }
     }
 
     fn start(&mut self) -> Result<()> {
@@ -382,7 +401,22 @@ impl PluginHost for SidecarPlugin {
                     Err(TrySendError::Disconnected(_)) => bail!("plugin writer has stopped"),
                 }
             }
-            StreamData::Iq(_) => bail!("IQ sidecar streams are not supported yet"),
+            StreamData::Iq(samples) => {
+                if !matches!(&self.manifest.input, crate::InputSpec::Iq { .. }) {
+                    bail!("plugin '{}' does not accept IQ", self.manifest.name);
+                }
+                self.ensure_stream("iq", &meta)?;
+                let message = Outbound::Iq {
+                    seq: meta.seq,
+                    timestamp_ns: Self::timestamp(&meta),
+                    samples,
+                };
+                match outbound.try_send(message) {
+                    Ok(()) => Ok(()),
+                    Err(TrySendError::Full(_)) => bail!("plugin outbound queue is full"),
+                    Err(TrySendError::Disconnected(_)) => bail!("plugin writer has stopped"),
+                }
+            }
         }
     }
 

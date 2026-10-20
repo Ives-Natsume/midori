@@ -38,6 +38,7 @@ pub enum Colormap {
 pub enum DecoderTab {
     Cw,
     Sstv,
+    Ssdv,
     #[default]
     Passes,
     Log,
@@ -143,6 +144,20 @@ impl DemodParams {
             bfo_hz: 700.0,
         }
     }
+
+    fn bpsk() -> Self {
+        Self {
+            // A 9k6 BPSK link with RRC roll-off 0.35. A 30 kHz channel keeps
+            // both sidebands and the FLL pull-in range; the output rate is
+            // the 48 kHz IQ stream the data decoder expects.
+            bandwidth_hz: 30_000.0,
+            channel_rate_hz: 48_000.0,
+            audio_rate_hz: 48_000.0,
+            audio_bandwidth_hz: 30_000.0,
+            deemphasis_us: 0.0,
+            bfo_hz: 700.0,
+        }
+    }
 }
 
 impl Default for DemodParams {
@@ -155,10 +170,36 @@ impl Default for DemodParams {
 #[serde(default)]
 pub struct DemodSettings {
     pub mode: DemodMode,
+    #[serde(default = "default_fm_params")]
     pub fm: DemodParams,
+    #[serde(default = "default_am_params")]
     pub am: DemodParams,
+    #[serde(default = "default_cw_params")]
     pub cw: DemodParams,
+    #[serde(default = "default_sstv_params")]
     pub sstv: DemodParams,
+    #[serde(default = "default_bpsk_params")]
+    pub bpsk: DemodParams,
+}
+
+fn default_fm_params() -> DemodParams {
+    DemodParams::fm()
+}
+
+fn default_am_params() -> DemodParams {
+    DemodParams::am()
+}
+
+fn default_cw_params() -> DemodParams {
+    DemodParams::cw()
+}
+
+fn default_sstv_params() -> DemodParams {
+    DemodParams::sstv()
+}
+
+fn default_bpsk_params() -> DemodParams {
+    DemodParams::bpsk()
 }
 
 impl Default for DemodSettings {
@@ -169,6 +210,7 @@ impl Default for DemodSettings {
             am: DemodParams::am(),
             cw: DemodParams::cw(),
             sstv: DemodParams::sstv(),
+            bpsk: DemodParams::bpsk(),
         }
     }
 }
@@ -179,6 +221,7 @@ impl DemodSettings {
             DemodMode::Am => &self.am,
             DemodMode::Cw => &self.cw,
             DemodMode::Sstv => &self.sstv,
+            DemodMode::Bpsk | DemodMode::BpskIf => &self.bpsk,
             _ => &self.fm,
         }
     }
@@ -188,6 +231,7 @@ impl DemodSettings {
             DemodMode::Am => &mut self.am,
             DemodMode::Cw => &mut self.cw,
             DemodMode::Sstv => &mut self.sstv,
+            DemodMode::Bpsk | DemodMode::BpskIf => &mut self.bpsk,
             _ => &mut self.fm,
         }
     }
@@ -200,6 +244,13 @@ pub struct DecoderSettings {
     /// Keep the CW carrier centred on the BFO with a real-time AFC.
     pub cw_afc: bool,
     pub sstv_enabled: bool,
+    pub ssdv_enabled: bool,
+    /// CRC32 initial values accepted for SSDV packets. The polynomial and
+    /// final XOR are fixed; different SSDV implementations use different
+    /// initial values.
+    pub ssdv_crc_inits: Vec<String>,
+    /// Bytes before the 218-byte SSDV packet inside a 223-byte CCSDS frame.
+    pub ssdv_frame_header_len: usize,
 }
 
 impl Default for DecoderSettings {
@@ -208,6 +259,9 @@ impl Default for DecoderSettings {
             cw_enabled: false,
             cw_afc: true,
             sstv_enabled: false,
+            ssdv_enabled: false,
+            ssdv_crc_inits: vec!["0xFFFFFFFF".to_string()],
+            ssdv_frame_header_len: 5,
         }
     }
 }
@@ -458,6 +512,12 @@ mod tests {
         assert!(config.decoder.cw_afc);
         assert!(config.ui.waterfall_follow_spectrum);
         assert!(config.satellite.grid.is_empty());
+        assert_eq!(config.demod.bpsk.bandwidth_hz, 30_000.0);
+        assert_eq!(config.demod.bpsk.audio_rate_hz, 48_000.0);
+        assert!(!config.decoder.ssdv_enabled);
+        assert_eq!(config.decoder.ssdv_crc_inits, vec!["0xFFFFFFFF"]);
+        assert_eq!(config.decoder.ssdv_frame_header_len, 5);
+        assert_eq!(config.ui.decoder_tab, DecoderTab::Passes);
     }
 
     #[test]

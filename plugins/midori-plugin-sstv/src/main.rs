@@ -86,7 +86,7 @@ fn main() -> Result<()> {
                     send_event(&mut writer, event)?;
                 }
             }
-            WireMessage::SoftBits { .. } | WireMessage::Bytes { .. } => {}
+            WireMessage::SoftBits { .. } | WireMessage::Bytes { .. } | WireMessage::Iq { .. } => {}
         }
     }
 

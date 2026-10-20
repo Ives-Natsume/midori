@@ -1,0 +1,30 @@
+[package]
+name = "midori-plugin-ssdv"
+version.workspace = true
+edition.workspace = true
+# This sidecar links GPL-3.0-or-later OpenHoshimi crates (soundmodem/SSDV
+# JPEG assembly). Keeping it as a separate process lets the rest of Midori
+# stay MIT/Apache-2.0. See NOTICE.md.
+license = "GPL-3.0-or-later"
+repository.workspace = true
+
+[[bin]]
+name = "midori-plugin-ssdv"
+path = "src/main.rs"
+
+[[bin]]
+name = "midori-ssdv-decode"
+path = "src/offline.rs"
+
+[dependencies]
+anyhow.workspace = true
+base64 = "0.22"
+jpeg-decoder = "0.3"
+midori-core.workspace = true
+midori-dsp.workspace = true
+midori-plugin.workspace = true
+midori-source-file.workspace = true
+openhoshimi-codec = { git = "https://github.com/IzumiChino/OpenHoshimi", rev = "8cbd3f646731bcde8eb1b55b042ce9c74f225455" }
+openhoshimi-soundmodem = { git = "https://github.com/IzumiChino/OpenHoshimi", rev = "8cbd3f646731bcde8eb1b55b042ce9c74f225455" }
+png.workspace = true
+serde_json.workspace = true

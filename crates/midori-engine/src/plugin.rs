@@ -6,11 +6,12 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow};
-use midori_core::{Frame, Sink, StreamData};
+use midori_core::{Frame, Sink, StreamKind};
 use midori_plugin::{PluginEvent, PluginHost};
 
 pub struct PluginSink {
     host: Arc<Mutex<Box<dyn PluginHost>>>,
+    input_kind: StreamKind,
     dropped: u64,
 }
 
@@ -20,10 +21,12 @@ pub struct PluginHandle {
 }
 
 pub fn plugin_sink(host: Box<dyn PluginHost>) -> (PluginSink, PluginHandle) {
+    let input_kind = host.input_kind();
     let host = Arc::new(Mutex::new(host));
     (
         PluginSink {
             host: Arc::clone(&host),
+            input_kind,
             dropped: 0,
         },
         PluginHandle { host },
@@ -32,7 +35,13 @@ pub fn plugin_sink(host: Box<dyn PluginHost>) -> (PluginSink, PluginHandle) {
 
 impl Sink for PluginSink {
     fn on_frame(&mut self, frame: Frame) -> Result<()> {
-        if !matches!(&frame.data, StreamData::Audio(_)) {
+        if frame.data.kind() != self.input_kind {
+            return Ok(());
+        }
+        // The session fans raw source IQ to every sink as well as channel
+        // frames. An IQ plugin wants the selected VFO's complex baseband, not
+        // the multi-megasample wideband block, so ignore frames without a VFO.
+        if self.input_kind == StreamKind::Iq && frame.meta.vfo_id.is_none() {
             return Ok(());
         }
         let mut host = self

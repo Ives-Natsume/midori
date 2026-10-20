@@ -54,10 +54,29 @@ audio_bandwidth_hz = 3_000
 deemphasis_us = 0
 bfo_hz = 700
 
+[demod.bpsk]
+# 9k6 BPSK/SSDV: 30 kHz channel, 48 kHz complex output.
+# Set [demod] mode = "bpsk_if" to pass a mono 48 kHz / 12 kHz real-IF
+# recording through instead (the BPSK IF mode reuses these parameters).
+bandwidth_hz = 30_000
+channel_rate_hz = 48_000
+audio_rate_hz = 48_000
+audio_bandwidth_hz = 30_000
+deemphasis_us = 0
+bfo_hz = 700
+
 [decoder]
 cw_enabled = false
 cw_afc = true
 sstv_enabled = false
+ssdv_enabled = false
+# SSDV CRC32 initial values. The polynomial is fixed by SSDV; implementations
+# differ in the initial value. Classic SSDV uses 0xFFFFFFFF; ASRTU-1/DSLWP
+# uses 0x4EE4FDE1 and BY-04/JAMX uses 0x6AAAC1C5. Add the values your stream
+# needs (the decoder tries each one).
+ssdv_crc_inits = ["0xFFFFFFFF"]
+# Bytes before the 218-byte SSDV packet in a 223-byte CCSDS frame.
+ssdv_frame_header_len = 5
 
 [ui]
 spectrum_ratio = 0.55

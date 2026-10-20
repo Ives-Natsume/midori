@@ -4,17 +4,21 @@ use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use midori_core::{
-    Channel, DemodMode, Frame, FrameMeta, IqBlock, StreamData, StreamSpec, VfoConfig,
+    Channel, DemodMode, Frame, FrameMeta, IqBlock, Sample, StreamData, StreamSpec, VfoConfig,
 };
 use midori_dsp::{
-    AmDemod, AmDemodConfig, AudioAgc, CarrierTracker, CwDemod, CwDemodConfig, FmDemod,
-    FmDemodConfig,
+    AmDemod, AmDemodConfig, AudioAgc, BpskDemod, BpskDemodConfig, CarrierTracker, CwDemod,
+    CwDemodConfig, FmDemod, FmDemodConfig,
 };
 
 enum Demod {
     Am(AmDemod),
     Fm(FmDemod),
     Cw(CwDemod),
+    Bpsk(BpskDemod),
+    /// 12 kHz real-IF pass-through. No mixing or filtering: the source file is
+    /// already the audio-IF stream expected by the 9k6 decoder.
+    IfAudio,
 }
 
 /// One digital channel inside a session.
@@ -25,6 +29,7 @@ pub struct VfoChannel {
     seq: u64,
     audio_start_sample: u64,
     audio_scratch: Vec<f32>,
+    iq_scratch: Vec<Sample>,
     /// Current Doppler shift added to the configured VFO offset.
     doppler_hz: f64,
     doppler_rate_hz_s: f64,
@@ -45,6 +50,7 @@ impl VfoChannel {
             seq: 0,
             audio_start_sample: 0,
             audio_scratch: Vec::new(),
+            iq_scratch: Vec::new(),
             doppler_hz: 0.0,
             doppler_rate_hz_s: 0.0,
             spec: None,
@@ -116,7 +122,8 @@ impl VfoChannel {
             Some(Demod::Am(demod)) => demod.set_offset(absolute),
             Some(Demod::Fm(demod)) => demod.set_offset(absolute),
             Some(Demod::Cw(demod)) => demod.set_offset(absolute),
-            None => {}
+            Some(Demod::Bpsk(demod)) => demod.set_offset(absolute),
+            Some(Demod::IfAudio) | None => {}
         }
     }
 }
@@ -153,6 +160,14 @@ impl Channel for VfoChannel {
                 bfo_hz: self.config.bfo_hz,
                 audio_bandwidth_hz: self.config.audio_bandwidth_hz,
             })),
+            DemodMode::Bpsk => Demod::Bpsk(BpskDemod::new(BpskDemodConfig {
+                input_rate_hz: spec.sample_rate_hz,
+                channel_rate_hz: self.config.channel_rate_hz,
+                output_rate_hz: self.config.audio_rate_hz,
+                offset_hz,
+                channel_bandwidth_hz: self.config.bandwidth_hz,
+            })),
+            DemodMode::BpskIf => Demod::IfAudio,
             other => bail!("demod mode {other:?} is not implemented yet"),
         };
 
@@ -203,15 +218,76 @@ impl Channel for VfoChannel {
     fn process(&mut self, iq: &IqBlock, out: &mut Vec<Frame>) -> Result<()> {
         self.track_carrier(iq);
 
+        let tuned_freq_hz = iq.spec.center_freq_hz + self.current_offset_hz();
+
         let Some(demod) = &mut self.demod else {
             return Ok(());
         };
+
+        // A real-IF source is already the mono audio stream the 9k6 decoder
+        // expects. Pass the real part through and skip audio AGC.
+        if matches!(demod, Demod::IfAudio) {
+            self.audio_scratch.clear();
+            self.audio_scratch
+                .extend(iq.samples.iter().map(|sample| sample.re));
+            if self.audio_scratch.is_empty() {
+                return Ok(());
+            }
+            let meta = FrameMeta {
+                seq: self.seq,
+                start_sample: self.audio_start_sample,
+                timestamp_ns: iq.timestamp_ns,
+                sample_rate_hz: iq.spec.sample_rate_hz,
+                center_freq_hz: iq.spec.center_freq_hz,
+                nominal_freq_hz: iq.spec.center_freq_hz,
+                bandwidth_hz: iq.spec.sample_rate_hz,
+                vfo_id: Some(self.config.id),
+                doppler_hz: self.doppler_hz,
+                doppler_rate_hz_s: self.doppler_rate_hz_s,
+                flags: iq.flags,
+            };
+            self.seq += 1;
+            self.audio_start_sample += self.audio_scratch.len() as u64;
+            let audio: Arc<[f32]> = Arc::from(self.audio_scratch.as_slice());
+            out.push(Frame::new(meta, StreamData::Audio(audio)));
+            return Ok(());
+        }
+
+        // A BPSK channel is not demodulated here: the decoder wants complex
+        // baseband so it can run its own carrier/timing loops and FEC. Keep
+        // the same VFO/Doppler metadata as the audio paths.
+        if let Demod::Bpsk(demod) = demod {
+            self.iq_scratch.clear();
+            demod.process(&iq.samples, &mut self.iq_scratch);
+            if self.iq_scratch.is_empty() {
+                return Ok(());
+            }
+            let meta = FrameMeta {
+                seq: self.seq,
+                start_sample: self.audio_start_sample,
+                timestamp_ns: iq.timestamp_ns,
+                sample_rate_hz: demod.output_rate_hz(),
+                center_freq_hz: tuned_freq_hz,
+                nominal_freq_hz: iq.spec.center_freq_hz + self.config.offset_hz,
+                bandwidth_hz: self.config.bandwidth_hz,
+                vfo_id: Some(self.config.id),
+                doppler_hz: self.doppler_hz,
+                doppler_rate_hz_s: self.doppler_rate_hz_s,
+                flags: iq.flags,
+            };
+            self.seq += 1;
+            self.audio_start_sample += self.iq_scratch.len() as u64;
+            let samples: Arc<[Sample]> = Arc::from(self.iq_scratch.as_slice());
+            out.push(Frame::new(meta, StreamData::Iq(samples)));
+            return Ok(());
+        }
 
         self.audio_scratch.clear();
         match demod {
             Demod::Am(demod) => demod.process(&iq.samples, &mut self.audio_scratch),
             Demod::Fm(demod) => demod.process(&iq.samples, &mut self.audio_scratch),
             Demod::Cw(demod) => demod.process(&iq.samples, &mut self.audio_scratch),
+            Demod::Bpsk(_) | Demod::IfAudio => unreachable!(),
         }
         if self.audio_scratch.is_empty() {
             return Ok(());
@@ -224,7 +300,6 @@ impl Channel for VfoChannel {
             self.agc.process(&mut self.audio_scratch);
         }
 
-        let tuned_freq_hz = iq.spec.center_freq_hz + self.current_offset_hz();
         let meta = FrameMeta {
             seq: self.seq,
             start_sample: self.audio_start_sample,
@@ -454,6 +529,129 @@ mod tests {
             "AFC ended at {tracked:.1} Hz, expected about {expected:.1} Hz"
         );
         assert!(channel.afc_snr_db().is_some());
+    }
+
+    #[test]
+    fn bpsk_mode_outputs_complex_baseband_at_48k() {
+        let fs = 2_400_000.0;
+        let offset = 3_000.0;
+        let n = 240_000;
+        let samples: Vec<Sample> = (0..n)
+            .map(|index| {
+                let phase = std::f64::consts::TAU * offset * index as f64 / fs;
+                Sample::new(phase.cos() as f32, phase.sin() as f32)
+            })
+            .collect();
+
+        let spec = StreamSpec {
+            sample_rate_hz: fs,
+            center_freq_hz: 436_210_000.0,
+            bandwidth_hz: 2_000_000.0,
+            format: SampleFormat::Cf32Le,
+            full_scale: 1.0,
+        };
+        let iq = IqBlock {
+            samples: Arc::from(samples.into_boxed_slice()),
+            spec,
+            start_sample: 0,
+            timestamp_ns: None,
+            flags: BlockFlags::default(),
+        };
+        let mut channel = VfoChannel::new(VfoConfig {
+            id: 4,
+            offset_hz: offset,
+            bandwidth_hz: 30_000.0,
+            demod: DemodMode::Bpsk,
+            audio_rate_hz: 48_000.0,
+            channel_rate_hz: 48_000.0,
+            audio_bandwidth_hz: 30_000.0,
+            deemphasis_us: 0.0,
+            bfo_hz: 700.0,
+        });
+        channel.configure(&spec).unwrap();
+        let mut frames = Vec::new();
+        channel.process(&iq, &mut frames).unwrap();
+
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].meta.vfo_id, Some(4));
+        assert_eq!(frames[0].meta.sample_rate_hz, 48_000.0);
+        let StreamData::Iq(samples) = &frames[0].data else {
+            panic!("expected IQ frame");
+        };
+        assert!(samples.len() > 4_000, "got {} samples", samples.len());
+
+        // The channel NCO removes the 3 kHz offset, so the residual phase
+        // step should be tiny once the filter has settled.
+        let steady = &samples[200..];
+        let mut sum = 0.0f64;
+        for pair in steady.windows(2) {
+            let product = pair[1] * pair[0].conj();
+            sum += product.im.atan2(product.re) as f64;
+        }
+        let mean_step = sum / (steady.len() - 1) as f64;
+        assert!(
+            mean_step.abs() < 0.02,
+            "residual phase step {mean_step:.4} rad/sample"
+        );
+        let power: f32 =
+            steady.iter().map(|sample| sample.norm_sqr()).sum::<f32>() / steady.len() as f32;
+        assert!(power > 0.05, "channel output power {power}");
+    }
+
+    #[test]
+    fn bpsk_if_mode_passes_real_if_audio_through() {
+        let fs = 48_000.0;
+        let tone = 12_000.0;
+        let n = 48_000;
+        let samples: Vec<Sample> = (0..n)
+            .map(|index| {
+                let phase = std::f64::consts::TAU * tone * index as f64 / fs;
+                Sample::new(phase.cos() as f32, 0.0)
+            })
+            .collect();
+        let spec = StreamSpec {
+            sample_rate_hz: fs,
+            center_freq_hz: 0.0,
+            bandwidth_hz: fs,
+            format: SampleFormat::Cf32Le,
+            full_scale: 1.0,
+        };
+        let iq = IqBlock {
+            samples: Arc::from(samples.into_boxed_slice()),
+            spec,
+            start_sample: 0,
+            timestamp_ns: None,
+            flags: BlockFlags::default(),
+        };
+        let mut channel = VfoChannel::new(VfoConfig {
+            id: 5,
+            offset_hz: 0.0,
+            bandwidth_hz: 30_000.0,
+            demod: DemodMode::BpskIf,
+            audio_rate_hz: 48_000.0,
+            channel_rate_hz: 48_000.0,
+            audio_bandwidth_hz: 30_000.0,
+            deemphasis_us: 0.0,
+            bfo_hz: 700.0,
+        });
+        channel.configure(&spec).unwrap();
+        let mut frames = Vec::new();
+        channel.process(&iq, &mut frames).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].meta.sample_rate_hz, 48_000.0);
+        let StreamData::Audio(audio) = &frames[0].data else {
+            panic!("expected real-IF audio");
+        };
+        assert_eq!(audio.len(), n);
+        let crossings = audio
+            .windows(2)
+            .filter(|window| (window[0] < 0.0) != (window[1] < 0.0))
+            .count();
+        let measured = crossings as f64 / 2.0 / (audio.len() as f64 / fs);
+        assert!(
+            (measured - tone).abs() < 50.0,
+            "measured {measured} Hz, expected {tone} Hz"
+        );
     }
 
     #[test]

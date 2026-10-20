@@ -236,6 +236,14 @@ pub enum DemodMode {
     /// FM demodulation with settings tuned for SSTV (narrow audio passband,
     /// no de-emphasis). The actual image decoding happens in a sidecar.
     Sstv,
+    /// Complex data channel for linear BPSK downlinks such as ASRTU-1 SSDV.
+    /// The channel is mixed, filtered, and resampled to a fixed IQ rate; symbol
+    /// timing, FEC, and framing are handled by the SSDV sidecar.
+    Bpsk,
+    /// Real 12 kHz intermediate-frequency audio, passed through at the file's
+    /// native rate. Useful for receivers that expose mono 48 kHz IF instead of
+    /// zero-IF I/Q.
+    BpskIf,
 }
 
 impl VfoConfig {

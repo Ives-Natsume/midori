@@ -8,7 +8,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use midori_core::{Frame, FrameMeta};
+use midori_core::{Frame, FrameMeta, StreamKind};
 use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -208,6 +208,11 @@ pub trait PluginHost: Send {
     fn start(&mut self) -> Result<()>;
 
     fn configure(&mut self, params: &serde_json::Value) -> Result<()>;
+
+    /// The single stream kind this plugin accepts. The engine uses it to fan
+    /// out only matching frames instead of flooding a decoder with IQ or audio
+    /// it does not understand.
+    fn input_kind(&self) -> StreamKind;
 
     /// Send one typed frame. The host is responsible for serialising it
     /// according to the plugin's input specification and applying a drop
