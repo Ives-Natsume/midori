@@ -60,8 +60,19 @@ pub struct SigMfWriter {
     sample_rate_hz: f64,
     center_freq_hz: f64,
     full_scale: f64,
+    datatype: &'static str,
     description: String,
     samples_written: u64,
+}
+
+/// Normalised float sources (WAV replay, channel baseband) use a full scale of
+/// 1.0; integer ADC sources report the ADC's code full scale instead.
+fn datatype_for_scale(full_scale: f64) -> &'static str {
+    if full_scale <= 1.0 {
+        "cf32_le"
+    } else {
+        "ci16_le"
+    }
 }
 
 impl SigMfWriter {
@@ -87,6 +98,7 @@ impl SigMfWriter {
             sample_rate_hz,
             center_freq_hz,
             full_scale,
+            datatype: datatype_for_scale(full_scale),
             description: description.to_string(),
             samples_written: 0,
         };
@@ -97,7 +109,7 @@ impl SigMfWriter {
     fn meta_json(&self) -> Value {
         json!({
             "global": {
-                "core:datatype": "ci16_le",
+                "core:datatype": self.datatype,
                 "core:sample_rate": self.sample_rate_hz,
                 "core:version": "1.2.0",
                 "core:description": self.description,
@@ -127,20 +139,28 @@ impl SigMfWriter {
         Ok(())
     }
 
-    /// Write normalised complex samples. They are quantised to `ci16_le`
-    /// using the full-scale value supplied at creation.
+    /// Write normalised complex samples. Sources with a full scale above 1.0
+    /// (integer ADC formats) are quantised to `ci16_le`; normalised float
+    /// sources are stored losslessly as `cf32_le`.
     pub fn write_block(&mut self, samples: &[Sample]) -> Result<()> {
-        let mut bytes = Vec::with_capacity(samples.len() * 4);
-        let scale = self.full_scale;
-        for sample in samples {
-            let i = (sample.re as f64 * scale)
-                .round()
-                .clamp(i16::MIN as f64, i16::MAX as f64) as i16;
-            let q = (sample.im as f64 * scale)
-                .round()
-                .clamp(i16::MIN as f64, i16::MAX as f64) as i16;
-            bytes.extend_from_slice(&i.to_le_bytes());
-            bytes.extend_from_slice(&q.to_le_bytes());
+        let mut bytes = Vec::with_capacity(samples.len() * 8);
+        if self.datatype == "cf32_le" {
+            for sample in samples {
+                bytes.extend_from_slice(&sample.re.to_le_bytes());
+                bytes.extend_from_slice(&sample.im.to_le_bytes());
+            }
+        } else {
+            let scale = self.full_scale;
+            for sample in samples {
+                let i = (sample.re as f64 * scale)
+                    .round()
+                    .clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+                let q = (sample.im as f64 * scale)
+                    .round()
+                    .clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+                bytes.extend_from_slice(&i.to_le_bytes());
+                bytes.extend_from_slice(&q.to_le_bytes());
+            }
         }
         self.data.write_all(&bytes)?;
         self.samples_written += samples.len() as u64;
@@ -320,6 +340,9 @@ mod tests {
         let mut reader = SigMfReader::open(&base).unwrap();
         assert_eq!(reader.info().sample_rate_hz, 2_084_000.0);
         assert_eq!(reader.info().center_freq_hz, 120_000_000.0);
+        assert_eq!(reader.info().datatype, "ci16_le");
+        assert_eq!(reader.info().sample_count, Some(1024));
+        assert!((reader.info().duration_seconds().unwrap() - 1024.0 / 2_084_000.0).abs() < 1e-12);
         let output = reader.read_block(2048).unwrap();
         assert_eq!(output.len(), input.len());
         for (a, b) in input.iter().zip(output.iter()) {
@@ -327,6 +350,38 @@ mod tests {
             assert!((a.im - b.im).abs() < 1.5 / 2048.0);
         }
         assert!(reader.read_block(2048).unwrap().is_empty());
+
+        let _ = std::fs::remove_file(data_path(&base));
+        let _ = std::fs::remove_file(meta_path(&base));
+    }
+
+    #[test]
+    fn roundtrip_normalised_float() {
+        let base = temp_base("roundtrip-cf32");
+        let input = vec![
+            Complex32::new(0.25, 0.125),
+            Complex32::new(-0.5, -0.75),
+            Complex32::new(0.001, -0.001),
+        ];
+
+        let mut writer = SigMfWriter::create(&base, 48_000.0, 14_074_000.0, 1.0, "test").unwrap();
+        writer.write_block(&input).unwrap();
+        assert_eq!(writer.samples_written(), 3);
+        writer.finish().unwrap();
+
+        let mut reader = SigMfReader::open(&base).unwrap();
+        assert_eq!(reader.info().datatype, "cf32_le");
+        assert_eq!(reader.info().sample_count, Some(3));
+        assert!((reader.info().duration_seconds().unwrap() - 3.0 / 48_000.0).abs() < 1e-12);
+        assert_eq!(reader.spec().format, SampleFormat::Cf32Le);
+
+        let output = reader.read_block(16).unwrap();
+        assert_eq!(output.len(), input.len());
+        for (a, b) in input.iter().zip(output.iter()) {
+            assert!((a.re - b.re).abs() < 1e-4, "{a} != {b}");
+            assert!((a.im - b.im).abs() < 1e-4, "{a} != {b}");
+        }
+        assert!(reader.read_block(16).unwrap().is_empty());
 
         let _ = std::fs::remove_file(data_path(&base));
         let _ = std::fs::remove_file(meta_path(&base));
