@@ -53,6 +53,13 @@ impl RecorderSink {
 
 impl Sink for RecorderSink {
     fn on_frame(&mut self, frame: Frame) -> Result<()> {
+        // Recordings are of the wideband source. A BPSK channel also emits IQ,
+        // but at the channel rate and with a VFO id, so it must not be mixed
+        // into the recording.
+        if frame.meta.vfo_id.is_some() {
+            return Ok(());
+        }
+
         let StreamData::Iq(samples) = &frame.data else {
             return Ok(());
         };
@@ -199,6 +206,57 @@ mod tests {
         let mut reader = SigMfReader::open(&base).unwrap();
         let samples = reader.read_block(512).unwrap();
         assert_eq!(samples.len(), 256);
+
+        let _ = std::fs::remove_file(format!("{}.sigmf-data", base.display()));
+        let _ = std::fs::remove_file(format!("{}.sigmf-meta", base.display()));
+    }
+
+    #[test]
+    fn recorder_sink_ignores_channel_iq_frames() {
+        let base = temp_base("channel-iq");
+        let spec = StreamSpec {
+            sample_rate_hz: 48_000.0,
+            center_freq_hz: 91_600_000.0,
+            bandwidth_hz: 48_000.0,
+            format: SampleFormat::Cf32Le,
+            full_scale: 1.0,
+        };
+        let (mut sink, handle) = RecorderSink::new();
+        handle.start(base.clone(), spec).unwrap();
+
+        let samples: Arc<[Sample]> = Arc::from(vec![Sample::new(0.5, -0.5); 64].into_boxed_slice());
+        let mut meta = FrameMeta {
+            seq: 0,
+            start_sample: 0,
+            timestamp_ns: None,
+            sample_rate_hz: spec.sample_rate_hz,
+            center_freq_hz: spec.center_freq_hz,
+            nominal_freq_hz: spec.center_freq_hz,
+            bandwidth_hz: spec.bandwidth_hz,
+            vfo_id: Some(1),
+            doppler_hz: 0.0,
+            doppler_rate_hz_s: 0.0,
+            flags: BlockFlags::default(),
+        };
+        sink.on_frame(Frame::new(meta, StreamData::Iq(Arc::clone(&samples))))
+            .unwrap();
+        {
+            let state = sink.state.lock().unwrap();
+            let written = state.active.as_ref().unwrap().writer.samples_written();
+            assert_eq!(written, 0, "channel IQ must not be recorded");
+        }
+
+        meta.vfo_id = None;
+        sink.on_frame(Frame::new(meta, StreamData::Iq(samples)))
+            .unwrap();
+        {
+            let state = sink.state.lock().unwrap();
+            let written = state.active.as_ref().unwrap().writer.samples_written();
+            assert_eq!(written, 64);
+        }
+
+        let info = handle.stop().unwrap().expect("recording info");
+        assert_eq!(info.samples, 64);
 
         let _ = std::fs::remove_file(format!("{}.sigmf-data", base.display()));
         let _ = std::fs::remove_file(format!("{}.sigmf-meta", base.display()));

@@ -39,6 +39,13 @@ impl AutoTuneSink {
 
 impl Sink for AutoTuneSink {
     fn on_frame(&mut self, frame: Frame) -> Result<()> {
+        // A BPSK channel also emits IQ, but at the channel rate and with a VFO
+        // id. Scanning it would look for carriers inside the selected channel
+        // instead of across the wideband capture.
+        if frame.meta.vfo_id.is_some() {
+            return Ok(());
+        }
+
         let mut state = self.state.lock().unwrap();
         let scanning = matches!(*state, AutoTuneState::Scanning);
         if scanning && !matches!(self.previous, AutoTuneState::Scanning) {
@@ -96,6 +103,11 @@ impl SpectrumSink {
 impl Sink for SpectrumSink {
     fn on_frame(&mut self, frame: Frame) -> Result<()> {
         let meta = frame.meta;
+        // Ignore channel IQ (BPSK baseband): the waterfall shows the wideband
+        // source block only.
+        if meta.vfo_id.is_some() {
+            return Ok(());
+        }
         let StreamData::Iq(samples) = frame.data else {
             return Ok(());
         };
@@ -120,5 +132,70 @@ impl Sink for SpectrumSink {
         });
         self.analyzer.reset();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use midori_core::{BlockFlags, FrameMeta, Sample};
+
+    use super::*;
+
+    fn meta(vfo_id: Option<u32>, sample_rate_hz: f64) -> FrameMeta {
+        FrameMeta {
+            seq: 0,
+            start_sample: 0,
+            timestamp_ns: None,
+            sample_rate_hz,
+            center_freq_hz: 100_000_000.0,
+            nominal_freq_hz: 100_000_000.0,
+            bandwidth_hz: sample_rate_hz,
+            vfo_id,
+            doppler_hz: 0.0,
+            doppler_rate_hz_s: 0.0,
+            flags: BlockFlags::default(),
+        }
+    }
+
+    fn iq(len: usize) -> Arc<[Sample]> {
+        Arc::from(vec![Sample::new(0.0, 0.0); len].into_boxed_slice())
+    }
+
+    #[test]
+    fn spectrum_sink_ignores_channel_iq() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut sink = SpectrumSink::new(64, tx);
+
+        sink.on_frame(Frame::new(meta(Some(1), 48_000.0), StreamData::Iq(iq(64))))
+            .unwrap();
+        assert_eq!(sink.analyzer.frames(), 0, "channel IQ must not be analysed");
+        assert!(rx.try_recv().is_err(), "no spectrum frame expected");
+
+        // The wideband source frame still produces a spectrum frame.
+        sink.on_frame(Frame::new(meta(None, 48_000.0), StreamData::Iq(iq(64))))
+            .unwrap();
+        assert!(rx.try_recv().is_ok(), "wideband IQ must be analysed");
+    }
+
+    #[test]
+    fn auto_tune_sink_ignores_channel_iq() {
+        let state = Arc::new(Mutex::new(AutoTuneState::Scanning));
+        let mut sink = AutoTuneSink::new(Arc::clone(&state));
+
+        // More than four seconds of channel IQ; if it were counted the scan
+        // would finish immediately.
+        for _ in 0..3 {
+            sink.on_frame(Frame::new(
+                meta(Some(1), 10_000.0),
+                StreamData::Iq(iq(20_000)),
+            ))
+            .unwrap();
+        }
+        assert_eq!(*state.lock().unwrap(), AutoTuneState::Scanning);
+
+        // Four seconds of wideband IQ completes the scan.
+        sink.on_frame(Frame::new(meta(None, 10_000.0), StreamData::Iq(iq(40_001))))
+            .unwrap();
+        assert!(matches!(*state.lock().unwrap(), AutoTuneState::Done(_)));
     }
 }
