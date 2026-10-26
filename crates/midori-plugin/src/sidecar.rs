@@ -142,7 +142,11 @@ impl SidecarPlugin {
             .spawn(move || {
                 let mut reader = BufReader::new(stdout);
                 while let Ok(message) = read_message(&mut reader) {
-                    if let Err(TrySendError::Disconnected(_)) = tx.try_send(message) {
+                    // Block when the host is behind instead of dropping events.
+                    // The worker drains this queue continuously, and stop()
+                    // drains while joining the reader, so the send cannot
+                    // deadlock against shutdown.
+                    if tx.send(message).is_err() {
                         break;
                     }
                 }
@@ -426,16 +430,11 @@ impl PluginHost for SidecarPlugin {
         };
         loop {
             match inbound.try_recv() {
-                Ok(WireMessage::Json(value)) => {
-                    return match serde_json::from_value::<PluginEvent>(value) {
-                        Ok(event) => Ok(Some(event)),
-                        Err(error) => Ok(Some(PluginEvent::Error {
-                            message: format!("invalid plugin event: {error}"),
-                            fatal: false,
-                        })),
-                    };
+                Ok(message) => {
+                    if let Some(event) = decode_event(message) {
+                        return Ok(Some(event));
+                    }
                 }
-                Ok(_) => continue,
                 Err(TryRecvError::Empty) => return Ok(None),
                 Err(TryRecvError::Disconnected) => {
                     if self.closed_reported {
@@ -451,7 +450,10 @@ impl PluginHost for SidecarPlugin {
         }
     }
 
-    fn stop(&mut self) -> Result<()> {
+    fn stop(&mut self) -> Result<Vec<PluginEvent>> {
+        // Queue the shutdown request while the writer is still alive, then
+        // drop the sender. The writer drains anything already queued, flushes
+        // its buffer, and closes the child's stdin so it sees EOF and exits.
         if let Some(outbound) = self.outbound.as_ref() {
             let _ = outbound.send_timeout(
                 Outbound::Json(json!({"type": "shutdown"})),
@@ -459,7 +461,6 @@ impl PluginHost for SidecarPlugin {
             );
         }
         self.outbound = None;
-        self.inbound = None;
 
         if let Some(mut child) = self.child.take() {
             let deadline = Instant::now() + STOP_TIMEOUT;
@@ -482,14 +483,63 @@ impl PluginHost for SidecarPlugin {
         if let Some(handle) = self.writer_thread.take() {
             let _ = handle.join();
         }
-        if let Some(handle) = self.reader_thread.take() {
+
+        // Keep draining while the reader is alive: it uses a blocking send,
+        // so joining it first would deadlock if the plugin flushed more than
+        // the queue depth. Events emitted after the shutdown request (final CW
+        // text, SSDV partial images, ...) are returned to the caller.
+        let mut events = Vec::new();
+        let mut reader = self.reader_thread.take();
+        let drain_deadline = Instant::now() + STOP_TIMEOUT;
+        let mut drain_timed_out = false;
+        if let Some(inbound) = self.inbound.take() {
+            loop {
+                if reader.as_ref().is_none_or(JoinHandle::is_finished) {
+                    while let Ok(message) = inbound.try_recv() {
+                        if let Some(event) = decode_event(message) {
+                            events.push(event);
+                        }
+                    }
+                    break;
+                }
+                if Instant::now() >= drain_deadline {
+                    drain_timed_out = true;
+                    break;
+                }
+                match inbound.recv_timeout(Duration::from_millis(20)) {
+                    Ok(message) => {
+                        if let Some(event) = decode_event(message) {
+                            events.push(event);
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        }
+        // A reader wedged on a stdout handle inherited by a grandchild is
+        // detached: joining it would hang shutdown forever.
+        if !drain_timed_out && let Some(handle) = reader.take() {
             let _ = handle.join();
         }
 
         self.stream = None;
         self.configured = false;
         self.closed_reported = false;
-        Ok(())
+        Ok(events)
+    }
+}
+
+fn decode_event(message: WireMessage) -> Option<PluginEvent> {
+    match message {
+        WireMessage::Json(value) => Some(match serde_json::from_value::<PluginEvent>(value) {
+            Ok(event) => event,
+            Err(error) => PluginEvent::Error {
+                message: format!("invalid plugin event: {error}"),
+                fatal: false,
+            },
+        }),
+        _ => None,
     }
 }
 

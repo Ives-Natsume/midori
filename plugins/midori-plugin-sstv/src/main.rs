@@ -34,6 +34,9 @@ fn main() -> Result<()> {
     loop {
         let message = match read_message(&mut reader) {
             Ok(message) => message,
+            // stdin EOF means the host closed the pipe: exit as cleanly as an
+            // explicit shutdown. SstvSession has no partial-image flush hook,
+            // so an incomplete image is discarded rather than emitted.
             Err(_) => break,
         };
 

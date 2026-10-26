@@ -3341,8 +3341,21 @@ fn run_worker(
         }
     }
 
-    for (_, handle) in &plugin_handles {
-        let _ = handle.stop();
+    for (source, handle) in &plugin_handles {
+        match handle.stop() {
+            Ok(events) => {
+                for event in events {
+                    let _ = event_tx.try_send(WorkerEvent::Plugin {
+                        source: *source,
+                        event,
+                    });
+                }
+            }
+            Err(error) => {
+                let _ =
+                    event_tx.try_send(WorkerEvent::Error(format!("plugin {source:?}: {error}")));
+            }
+        }
     }
     if let Ok(Some(info)) = recorder_handle.stop() {
         let _ = event_tx.try_send(WorkerEvent::RecordingStopped {

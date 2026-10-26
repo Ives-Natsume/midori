@@ -70,7 +70,8 @@ impl PluginHandle {
         host.try_recv()
     }
 
-    pub fn stop(&self) -> Result<()> {
+    /// Stop the plugin, returning events it flushed while shutting down.
+    pub fn stop(&self) -> Result<Vec<PluginEvent>> {
         let mut host = self
             .host
             .lock()

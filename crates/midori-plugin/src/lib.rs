@@ -222,7 +222,12 @@ pub trait PluginHost: Send {
     /// Non-blocking poll for events produced by the plugin.
     fn try_recv(&mut self) -> Result<Option<PluginEvent>>;
 
-    fn stop(&mut self) -> Result<()>;
+    /// Stop the plugin and return any events it emitted while shutting down.
+    ///
+    /// Plugins may flush buffered results (final decoded text, partial images,
+    /// ...) after the shutdown request, so callers must forward the returned
+    /// events through the same path as `try_recv` events.
+    fn stop(&mut self) -> Result<Vec<PluginEvent>>;
 }
 
 #[cfg(test)]
