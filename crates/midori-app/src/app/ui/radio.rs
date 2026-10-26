@@ -42,13 +42,12 @@ impl MidoriApp {
                 ui.separator();
 
                 let previous_demod = self.demod_mode;
-                ui.selectable_value(&mut self.demod_mode, DemodMode::Fm, "FM");
-                ui.selectable_value(&mut self.demod_mode, DemodMode::Am, "AM");
-                ui.selectable_value(&mut self.demod_mode, DemodMode::Cw, "CW");
-                ui.selectable_value(&mut self.demod_mode, DemodMode::Sstv, "SSTV");
-                ui.selectable_value(&mut self.demod_mode, DemodMode::Bpsk, "BPSK");
-                ui.selectable_value(&mut self.demod_mode, DemodMode::BpskIf, "BPSK IF")
-                    .on_hover_text("mono 48 kHz, 12 kHz real-IF recording");
+                for mode in DemodMode::implemented() {
+                    let response = ui.selectable_value(&mut self.demod_mode, mode, mode.label());
+                    if mode == DemodMode::BpskIf {
+                        response.on_hover_text("mono 48 kHz, 12 kHz real-IF recording");
+                    }
+                }
                 if self.demod_mode != previous_demod {
                     self.config.demod.mode = self.demod_mode;
                     self.mark_demod_dirty();
@@ -395,8 +394,7 @@ impl MidoriApp {
                         ));
 
                         let mut changed = false;
-                        {
-                            let params = self.config.demod.params_mut(self.demod_mode);
+                        if let Some(params) = self.config.demod.params_mut(self.demod_mode) {
                             ui.horizontal(|ui| {
                                 ui.label("RF bandwidth");
                                 let mut bandwidth_khz = params.bandwidth_hz / 1_000.0;

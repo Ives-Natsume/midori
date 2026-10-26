@@ -7,7 +7,6 @@ use chrono::Utc;
 use eframe::egui;
 
 use midori_config::AppConfig;
-use midori_core::DemodMode;
 
 use crate::app::MidoriApp;
 use crate::app::format::{apply_theme, split_list};
@@ -84,7 +83,13 @@ impl MidoriApp {
 
     pub(crate) fn send_demod_update(&mut self) {
         self.config.demod.mode = self.demod_mode;
-        let params = self.config.demod.params(self.demod_mode);
+        let Some(params) = self.config.demod.params(self.demod_mode) else {
+            self.error_msg = Some(format!(
+                "{} demod is not implemented yet",
+                self.demod_mode.label()
+            ));
+            return;
+        };
         let update = DemodUpdate {
             mode: self.demod_mode,
             bandwidth_hz: params.bandwidth_hz,
@@ -270,19 +275,14 @@ impl MidoriApp {
         ));
     }
     pub(crate) fn demod_bandwidth_hz(&self) -> f64 {
-        self.config.demod.params(self.demod_mode).bandwidth_hz
+        self.config
+            .demod
+            .params(self.demod_mode)
+            .map_or(0.0, |params| params.bandwidth_hz)
     }
 
     pub(crate) fn demod_label(&self) -> &'static str {
-        match self.demod_mode {
-            DemodMode::Fm => "FM",
-            DemodMode::Am => "AM",
-            DemodMode::Cw => "CW",
-            DemodMode::Sstv => "SSTV",
-            DemodMode::Bpsk => "BPSK",
-            DemodMode::BpskIf => "BPSK IF",
-            _ => "?",
-        }
+        self.demod_mode.label()
     }
 
     pub(crate) fn auto_tune_color(&self) -> egui::Color32 {

@@ -216,23 +216,28 @@ impl Default for DemodSettings {
 }
 
 impl DemodSettings {
-    pub fn params(&self, mode: DemodMode) -> &DemodParams {
+    /// Parameters for an implemented mode. Returns `None` for reserved modes
+    /// (USB/LSB), which must not silently reuse another mode's settings.
+    pub fn params(&self, mode: DemodMode) -> Option<&DemodParams> {
         match mode {
-            DemodMode::Am => &self.am,
-            DemodMode::Cw => &self.cw,
-            DemodMode::Sstv => &self.sstv,
-            DemodMode::Bpsk | DemodMode::BpskIf => &self.bpsk,
-            _ => &self.fm,
+            DemodMode::Am => Some(&self.am),
+            DemodMode::Fm => Some(&self.fm),
+            DemodMode::Cw => Some(&self.cw),
+            DemodMode::Sstv => Some(&self.sstv),
+            DemodMode::Bpsk | DemodMode::BpskIf => Some(&self.bpsk),
+            DemodMode::Usb | DemodMode::Lsb => None,
         }
     }
 
-    pub fn params_mut(&mut self, mode: DemodMode) -> &mut DemodParams {
+    /// Mutable counterpart of [`Self::params`].
+    pub fn params_mut(&mut self, mode: DemodMode) -> Option<&mut DemodParams> {
         match mode {
-            DemodMode::Am => &mut self.am,
-            DemodMode::Cw => &mut self.cw,
-            DemodMode::Sstv => &mut self.sstv,
-            DemodMode::Bpsk | DemodMode::BpskIf => &mut self.bpsk,
-            _ => &mut self.fm,
+            DemodMode::Am => Some(&mut self.am),
+            DemodMode::Fm => Some(&mut self.fm),
+            DemodMode::Cw => Some(&mut self.cw),
+            DemodMode::Sstv => Some(&mut self.sstv),
+            DemodMode::Bpsk | DemodMode::BpskIf => Some(&mut self.bpsk),
+            DemodMode::Usb | DemodMode::Lsb => None,
         }
     }
 }
@@ -443,12 +448,29 @@ impl AppConfig {
         Ok(())
     }
 
-    /// Clamp hand-edited or stale values into ranges the UI can handle.
+    /// Clamp hand-edited, stale, or non-finite values into ranges the UI and
+    /// engine can handle.
     pub fn sanitize(&mut self) {
-        self.source.sample_rate_hz = self.source.sample_rate_hz.clamp(100_000.0, 61_440_000.0);
-        self.source.bandwidth_hz = self.source.bandwidth_hz.clamp(100_000.0, 61_440_000.0);
-        self.source.center_freq_hz = self.source.center_freq_hz.clamp(0.0, 6_000_000_000.0);
-        self.source.gain_db = self.source.gain_db.clamp(-3.0, 71.0);
+        let source_defaults = SourceSettings::default();
+        self.source.sample_rate_hz = clamp_or(
+            self.source.sample_rate_hz,
+            100_000.0,
+            61_440_000.0,
+            source_defaults.sample_rate_hz,
+        );
+        self.source.bandwidth_hz = clamp_or(
+            self.source.bandwidth_hz,
+            100_000.0,
+            61_440_000.0,
+            source_defaults.bandwidth_hz,
+        );
+        self.source.center_freq_hz = clamp_or(
+            self.source.center_freq_hz,
+            0.0,
+            6_000_000_000.0,
+            source_defaults.center_freq_hz,
+        );
+        self.source.gain_db = clamp_or(self.source.gain_db, -3.0, 71.0, source_defaults.gain_db);
         self.source.buffer_samples = self.source.buffer_samples.clamp(1_024, 1_048_576);
         if self.source.uri.trim().is_empty() {
             self.source.uri = "usb:".to_string();
@@ -457,38 +479,149 @@ impl AppConfig {
             self.source.rf_port = "A_BALANCED".to_string();
         }
 
-        for params in [
-            &mut self.demod.fm,
-            &mut self.demod.am,
-            &mut self.demod.cw,
-            &mut self.demod.sstv,
-        ] {
-            params.bandwidth_hz = params.bandwidth_hz.clamp(100.0, 2_000_000.0);
-            params.channel_rate_hz = params.channel_rate_hz.clamp(8_000.0, 61_440_000.0);
-            params.audio_rate_hz = params.audio_rate_hz.clamp(8_000.0, 192_000.0);
-            params.audio_bandwidth_hz = params
-                .audio_bandwidth_hz
-                .clamp(100.0, params.audio_rate_hz * 0.45);
-            params.deemphasis_us = params.deemphasis_us.clamp(0.0, 500.0);
-            params.bfo_hz = params.bfo_hz.clamp(100.0, 5_000.0);
+        // USB/LSB are reserved but not implemented. Keep them in the config
+        // schema and serde surface, but never start a session with one.
+        if !self.demod.mode.is_implemented() {
+            self.demod.mode = DemodMode::Fm;
         }
 
-        self.ui.spectrum_ratio = self.ui.spectrum_ratio.clamp(0.2, 0.85);
-        self.ui.left_panel_width = self.ui.left_panel_width.clamp(200.0, 500.0);
-        self.ui.right_panel_width = self.ui.right_panel_width.clamp(220.0, 560.0);
-        self.ui.decoder_dock_height = self.ui.decoder_dock_height.clamp(80.0, 500.0);
-        self.ui.fft_size = self.ui.fft_size.clamp(256, 65_536);
+        let source_rate_hz = self.source.sample_rate_hz;
+        sanitize_params(
+            &mut self.demod.fm,
+            &DemodParams::fm(),
+            source_rate_hz,
+            false,
+        );
+        sanitize_params(
+            &mut self.demod.am,
+            &DemodParams::am(),
+            source_rate_hz,
+            false,
+        );
+        sanitize_params(
+            &mut self.demod.cw,
+            &DemodParams::cw(),
+            source_rate_hz,
+            false,
+        );
+        sanitize_params(
+            &mut self.demod.sstv,
+            &DemodParams::sstv(),
+            source_rate_hz,
+            false,
+        );
+        sanitize_params(
+            &mut self.demod.bpsk,
+            &DemodParams::bpsk(),
+            source_rate_hz,
+            true,
+        );
+
+        let ui_defaults = UiSettings::default();
+        self.ui.spectrum_ratio = clamp_or_f32(
+            self.ui.spectrum_ratio,
+            0.2,
+            0.85,
+            ui_defaults.spectrum_ratio,
+        );
+        self.ui.left_panel_width = clamp_or_f32(
+            self.ui.left_panel_width,
+            200.0,
+            500.0,
+            ui_defaults.left_panel_width,
+        );
+        self.ui.right_panel_width = clamp_or_f32(
+            self.ui.right_panel_width,
+            220.0,
+            560.0,
+            ui_defaults.right_panel_width,
+        );
+        self.ui.decoder_dock_height = clamp_or_f32(
+            self.ui.decoder_dock_height,
+            80.0,
+            500.0,
+            ui_defaults.decoder_dock_height,
+        );
+        self.ui.fft_size = self
+            .ui
+            .fft_size
+            .clamp(256, 65_536)
+            .next_power_of_two()
+            .min(65_536);
         self.ui.waterfall_rows = self.ui.waterfall_rows.clamp(50, 1_000);
         self.ui.waterfall_width = self.ui.waterfall_width.clamp(256, 4_096);
-        self.ui.db_min = self.ui.db_min.clamp(-200.0, -10.0);
-        self.ui.db_max = self.ui.db_max.clamp(-100.0, 0.0);
+        self.ui.db_min = clamp_or_f32(self.ui.db_min, -200.0, -10.0, ui_defaults.db_min);
+        self.ui.db_max = clamp_or_f32(self.ui.db_max, -100.0, 0.0, ui_defaults.db_max);
         if self.ui.db_max <= self.ui.db_min + 10.0 {
-            self.ui.db_min = -110.0;
-            self.ui.db_max = -20.0;
+            self.ui.db_min = ui_defaults.db_min;
+            self.ui.db_max = ui_defaults.db_max;
         }
 
-        self.satellite.min_elevation_deg = self.satellite.min_elevation_deg.clamp(0.0, 90.0);
+        self.satellite.min_elevation_deg = clamp_or(
+            self.satellite.min_elevation_deg,
+            0.0,
+            90.0,
+            SatelliteSettings::default().min_elevation_deg,
+        );
     }
+}
+
+/// Clamp a value, substituting `default` when it is NaN or infinite.
+fn clamp_or(value: f64, min: f64, max: f64, default: f64) -> f64 {
+    let value = if value.is_finite() { value } else { default };
+    value.clamp(min, max)
+}
+
+/// `clamp_or` for UI values.
+fn clamp_or_f32(value: f32, min: f32, max: f32, default: f32) -> f32 {
+    let value = if value.is_finite() { value } else { default };
+    value.clamp(min, max)
+}
+
+fn sanitize_params(
+    params: &mut DemodParams,
+    defaults: &DemodParams,
+    source_rate_hz: f64,
+    data_channel: bool,
+) {
+    params.bandwidth_hz = clamp_or(
+        params.bandwidth_hz,
+        100.0,
+        2_000_000.0,
+        defaults.bandwidth_hz,
+    );
+    params.channel_rate_hz = clamp_or(
+        params.channel_rate_hz,
+        8_000.0,
+        61_440_000.0,
+        defaults.channel_rate_hz,
+    );
+    params.audio_rate_hz = clamp_or(
+        params.audio_rate_hz,
+        8_000.0,
+        192_000.0,
+        defaults.audio_rate_hz,
+    );
+
+    // A channel or filter cannot be wider than the captured stream.
+    params.bandwidth_hz = params.bandwidth_hz.min(source_rate_hz);
+    params.channel_rate_hz = params.channel_rate_hz.min(source_rate_hz);
+
+    // Audio modes must leave room for the resampler. Data modes use this field
+    // for the complex output bandwidth, which is bounded by the channel rate.
+    let max_bandwidth_hz = if data_channel {
+        params.channel_rate_hz
+    } else {
+        params.audio_rate_hz * 0.45
+    };
+    params.audio_bandwidth_hz = clamp_or(
+        params.audio_bandwidth_hz,
+        100.0,
+        max_bandwidth_hz,
+        defaults.audio_bandwidth_hz,
+    );
+    params.deemphasis_us = clamp_or(params.deemphasis_us, 0.0, 500.0, defaults.deemphasis_us);
+    params.bfo_hz = clamp_or(params.bfo_hz, 100.0, 5_000.0, defaults.bfo_hz);
 }
 
 #[cfg(test)]
@@ -556,5 +689,124 @@ mod tests {
         assert_eq!(config.ui.spectrum_ratio, 0.85);
         assert_eq!(config.ui.db_min, -110.0);
         assert_eq!(config.ui.db_max, -20.0);
+    }
+
+    #[test]
+    fn example_config_loads_and_sanitizes_cleanly() {
+        let text = include_str!("../../../config.example.toml");
+        let parsed: AppConfig = toml::from_str(text).unwrap();
+        assert_eq!(parsed.demod.mode, DemodMode::Fm);
+        assert_eq!(
+            parsed.demod.params(DemodMode::Bpsk).unwrap().bandwidth_hz,
+            30_000.0
+        );
+
+        let path = temp_path("example");
+        fs::write(&path, text).unwrap();
+        let loaded = AppConfig::load(&path);
+        assert!(loaded.warning.is_none(), "{:?}", loaded.warning);
+        assert_eq!(loaded.config.demod.mode, DemodMode::Fm);
+        // BPSK's data-channel bandwidth survives sanitize unchanged.
+        assert_eq!(
+            loaded.config.demod.bpsk.audio_bandwidth_hz,
+            DemodParams::bpsk().audio_bandwidth_hz
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reserved_modes_have_no_params() {
+        let settings = DemodSettings::default();
+        assert!(settings.params(DemodMode::Usb).is_none());
+        assert!(settings.params(DemodMode::Lsb).is_none());
+        for mode in DemodMode::implemented() {
+            assert!(settings.params(mode).is_some(), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn reserved_mode_falls_back_to_fm() {
+        let mut config = AppConfig::default();
+        config.demod.mode = DemodMode::Usb;
+        config.sanitize();
+        assert_eq!(config.demod.mode, DemodMode::Fm);
+    }
+
+    #[test]
+    fn sanitize_covers_bpsk() {
+        let mut config = AppConfig::default();
+        config.demod.bpsk.bandwidth_hz = 9_000_000.0;
+        config.demod.bpsk.channel_rate_hz = 9_000_000.0;
+        config.demod.bpsk.audio_bandwidth_hz = 100_000_000.0;
+        config.demod.bpsk.deemphasis_us = 9_000.0;
+        config.demod.bpsk.bfo_hz = 0.0;
+        config.sanitize();
+        assert_eq!(config.demod.bpsk.bandwidth_hz, 2_000_000.0);
+        assert_eq!(
+            config.demod.bpsk.channel_rate_hz,
+            config.source.sample_rate_hz
+        );
+        assert_eq!(
+            config.demod.bpsk.audio_bandwidth_hz,
+            config.demod.bpsk.channel_rate_hz
+        );
+        assert_eq!(config.demod.bpsk.deemphasis_us, 500.0);
+        assert_eq!(config.demod.bpsk.bfo_hz, 100.0);
+    }
+
+    #[test]
+    fn demod_widths_do_not_exceed_the_source_rate() {
+        let mut config = AppConfig::default();
+        config.source.sample_rate_hz = 100_000.0;
+        config.demod.fm.bandwidth_hz = 200_000.0;
+        config.demod.fm.channel_rate_hz = 240_000.0;
+        config.sanitize();
+        assert_eq!(config.demod.fm.bandwidth_hz, 100_000.0);
+        assert_eq!(config.demod.fm.channel_rate_hz, 100_000.0);
+    }
+
+    #[test]
+    fn fft_size_is_a_power_of_two_in_range() {
+        for (input, expected) in [
+            (0, 256),
+            (1_000, 1_024),
+            (4_096, 4_096),
+            (5_000, 8_192),
+            (70_000, 65_536),
+        ] {
+            let mut config = AppConfig::default();
+            config.ui.fft_size = input;
+            config.sanitize();
+            assert_eq!(config.ui.fft_size, expected);
+            assert!(config.ui.fft_size.is_power_of_two());
+        }
+    }
+
+    #[test]
+    fn non_finite_values_fall_back_to_defaults() {
+        let defaults = AppConfig::default();
+        let mut config = AppConfig::default();
+        config.source.sample_rate_hz = f64::NAN;
+        config.source.gain_db = f64::INFINITY;
+        config.demod.fm.bandwidth_hz = f64::NAN;
+        config.demod.bpsk.audio_bandwidth_hz = f64::NEG_INFINITY;
+        config.ui.spectrum_ratio = f32::NAN;
+        config.ui.db_min = f32::NEG_INFINITY;
+        config.satellite.min_elevation_deg = f64::NAN;
+        config.sanitize();
+
+        assert_eq!(config.source.sample_rate_hz, defaults.source.sample_rate_hz);
+        assert_eq!(config.source.gain_db, defaults.source.gain_db);
+        assert_eq!(config.demod.fm.bandwidth_hz, DemodParams::fm().bandwidth_hz);
+        assert_eq!(
+            config.demod.bpsk.audio_bandwidth_hz,
+            DemodParams::bpsk().audio_bandwidth_hz
+        );
+        assert_eq!(config.ui.spectrum_ratio, defaults.ui.spectrum_ratio);
+        assert_eq!(config.ui.db_min, defaults.ui.db_min);
+        assert_eq!(
+            config.satellite.min_elevation_deg,
+            defaults.satellite.min_elevation_deg
+        );
     }
 }

@@ -5,7 +5,7 @@ A portable, decoder-centric SDR workbench for macOS and other platforms.
 Midori is built around a small Rust core that accepts IQ from different
 sources, runs a fixed DSP pipeline, records to SigMF, and hands audio or
 packets to external decoder processes. The first target is amateur-satellite
-and aviation-band work on a Mac: waterfall, VFO, AM/SSB/FM demodulation,
+and aviation-band work on a Mac: waterfall, VFO, AM/FM/CW demodulation,
 Doppler correction, recording, and plugins for SSTV/SSDV/FT4/CW.
 
 > Status: early prototype. The core, CLI, and egui application live in
@@ -49,6 +49,10 @@ Doppler correction, recording, and plugins for SSTV/SSDV/FT4/CW.
   and BY-04 passes.
 - Live FM/AM/CW audio through `cpal`, driven by the same `VfoChannel` used for
   offline captures, with a simple AGC.
+- Demod mode metadata (labels, config keys, implementation status, output
+  kind) lives in `midori-core`; the engine, config, and UI derive from it.
+  USB/LSB remain reserved in the config schema but are not implemented or
+  selectable.
 - egui desktop UI with a fixed three-column layout, stacked spectrum/waterfall,
   click-to-tune, per-mode RF bandwidth controls, a waterfall that can follow or
   independently show the spectrum zoom, a stable dB scale, a bottom
@@ -180,11 +184,12 @@ The desktop UI uses a fixed three-column layout:
   warning when no narrowband CW signal is found), SSTV and SSDV controls
   (including the SSDV CRC initial value and CCSDS frame header length),
   plugin list, decoder dock visibility.
-- **Left — Demod**: editable RF bandwidth, audio bandwidth, and FM
-  de-emphasis; **BPSK** selects the complex 48 kHz data channel, and
-  **BPSK IF** passes a mono 48 kHz / 12 kHz real-IF recording straight to the
-  data decoder. Changes are applied to the running session after a short
-  debounce (no reconnect needed).
+- **Left — Demod**: mode buttons come from the modes implemented by the
+  engine (FM, AM, CW, SSTV, BPSK, BPSK IF); editable RF bandwidth, audio
+  bandwidth, and FM de-emphasis; **BPSK** selects the complex 48 kHz data
+  channel, and **BPSK IF** passes a mono 48 kHz / 12 kHz real-IF recording
+  straight to the data decoder. Changes are applied to the running session
+  after a short debounce (no reconnect needed).
 - **Bottom dock**: `CW`, `SSTV`, `SSDV`, `Passes` planner, and `Log`. The
   SSTV and SSDV tabs split vertically: status/controls on the left, decoded
   image on the right.

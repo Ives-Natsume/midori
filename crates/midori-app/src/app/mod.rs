@@ -326,7 +326,13 @@ impl MidoriApp {
             }
         };
 
-        let demod = self.config.demod.params(self.demod_mode);
+        let Some(demod) = self.config.demod.params(self.demod_mode) else {
+            self.error_msg = Some(format!(
+                "{} demod is not implemented yet",
+                self.demod_mode.label()
+            ));
+            return;
+        };
         let vfo = VfoConfig {
             id: 0,
             offset_hz: 0.0,

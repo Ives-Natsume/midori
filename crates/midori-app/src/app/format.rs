@@ -40,16 +40,7 @@ pub(crate) fn format_bandwidth(hz: f64) -> String {
 }
 
 pub(crate) fn format_demod(mode: DemodMode) -> &'static str {
-    match mode {
-        DemodMode::Fm => "FM",
-        DemodMode::Am => "AM",
-        DemodMode::Cw => "CW",
-        DemodMode::Sstv => "SSTV",
-        DemodMode::Bpsk => "BPSK",
-        DemodMode::BpskIf => "BPSK IF",
-        DemodMode::Usb => "USB",
-        DemodMode::Lsb => "LSB",
-    }
+    mode.label()
 }
 
 /// Extract a centre frequency from names like `recording_437393500Hz.wav`.
@@ -170,5 +161,12 @@ mod tests {
             Some(437.3935)
         );
         assert_eq!(frequency_from_path("no-frequency.wav"), None);
+    }
+
+    #[test]
+    fn demod_labels_come_from_core_metadata() {
+        for &mode in DemodMode::ALL {
+            assert_eq!(format_demod(mode), mode.label());
+        }
     }
 }

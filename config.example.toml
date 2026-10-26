@@ -20,6 +20,9 @@ rf_port = "A_BALANCED"
 buffer_samples = 32768
 
 [demod]
+# Implemented modes: "fm", "am", "cw", "sstv", "bpsk", "bpsk_if".
+# "usb" and "lsb" are reserved in the schema but not implemented yet; loading
+# a config with either falls back to "fm".
 mode = "fm"
 
 [demod.fm]

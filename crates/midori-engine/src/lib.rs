@@ -3,6 +3,7 @@
 //! The engine stays platform-agnostic: it owns a source, digital VFO channels,
 //! and sinks. Audio devices and egui live in the application crate.
 
+mod demod;
 pub mod gate;
 pub mod plugin;
 pub mod recorder;

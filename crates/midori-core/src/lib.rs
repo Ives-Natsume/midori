@@ -246,6 +246,77 @@ pub enum DemodMode {
     BpskIf,
 }
 
+impl DemodMode {
+    /// Every demod mode, ordered for UI presentation. Unimplemented modes are
+    /// included here so config keys and serde round-trips stay stable; call
+    /// [`Self::implemented`] for the selectable subset.
+    pub const ALL: &'static [DemodMode] = &[
+        Self::Fm,
+        Self::Am,
+        Self::Usb,
+        Self::Lsb,
+        Self::Cw,
+        Self::Sstv,
+        Self::Bpsk,
+        Self::BpskIf,
+    ];
+
+    /// Human-readable name for the UI.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Am => "AM",
+            Self::Fm => "FM",
+            Self::Usb => "USB",
+            Self::Lsb => "LSB",
+            Self::Cw => "CW",
+            Self::Sstv => "SSTV",
+            Self::Bpsk => "BPSK",
+            Self::BpskIf => "BPSK IF",
+        }
+    }
+
+    /// Whether the engine can build a demodulator for this mode.
+    pub fn is_implemented(self) -> bool {
+        match self {
+            Self::Am | Self::Fm | Self::Cw | Self::Sstv | Self::Bpsk | Self::BpskIf => true,
+            Self::Usb | Self::Lsb => false,
+        }
+    }
+
+    /// Kind of frame the channel produces. Unimplemented modes report the kind
+    /// they are expected to produce once implemented.
+    pub fn output_kind(self) -> StreamKind {
+        match self {
+            Self::Am | Self::Fm | Self::Cw | Self::Sstv | Self::BpskIf => StreamKind::Audio,
+            Self::Bpsk => StreamKind::Iq,
+            Self::Usb | Self::Lsb => StreamKind::Audio,
+        }
+    }
+
+    /// Stable snake_case identifier used in config files and wire messages.
+    /// This is the same string serde produces with `rename_all = "snake_case"`.
+    pub fn config_key(self) -> &'static str {
+        match self {
+            Self::Am => "am",
+            Self::Fm => "fm",
+            Self::Usb => "usb",
+            Self::Lsb => "lsb",
+            Self::Cw => "cw",
+            Self::Sstv => "sstv",
+            Self::Bpsk => "bpsk",
+            Self::BpskIf => "bpsk_if",
+        }
+    }
+
+    /// Modes the engine and UI can actually use.
+    pub fn implemented() -> impl Iterator<Item = DemodMode> {
+        Self::ALL
+            .iter()
+            .copied()
+            .filter(|mode| mode.is_implemented())
+    }
+}
+
 impl VfoConfig {
     pub fn new(id: VfoId, offset_hz: f64, bandwidth_hz: f64, demod: DemodMode) -> Self {
         Self {
@@ -470,5 +541,245 @@ pub trait IqSource: Send {
     /// Live sources keep returning false.
     fn is_finished(&self) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fmt;
+
+    use serde::Serialize;
+    use serde::ser::Impossible;
+
+    use super::*;
+
+    /// Number of `DemodMode` variants. Update together with `variant_metadata`;
+    /// the exhaustive match there makes a forgotten update a compile error.
+    const VARIANT_COUNT: usize = 8;
+
+    /// Exhaustive per-variant metadata used to prove `ALL` and the accessors
+    /// stay in sync. Adding a variant fails to compile until this match and
+    /// `VARIANT_COUNT` are updated.
+    fn variant_metadata(mode: DemodMode) -> (usize, &'static str, &'static str, bool, StreamKind) {
+        match mode {
+            DemodMode::Am => (0, "AM", "am", true, StreamKind::Audio),
+            DemodMode::Fm => (1, "FM", "fm", true, StreamKind::Audio),
+            DemodMode::Usb => (2, "USB", "usb", false, StreamKind::Audio),
+            DemodMode::Lsb => (3, "LSB", "lsb", false, StreamKind::Audio),
+            DemodMode::Cw => (4, "CW", "cw", true, StreamKind::Audio),
+            DemodMode::Sstv => (5, "SSTV", "sstv", true, StreamKind::Audio),
+            DemodMode::Bpsk => (6, "BPSK", "bpsk", true, StreamKind::Iq),
+            DemodMode::BpskIf => (7, "BPSK IF", "bpsk_if", true, StreamKind::Audio),
+        }
+    }
+
+    #[test]
+    fn all_contains_every_variant_and_metadata_matches() {
+        let mut seen: [Option<DemodMode>; VARIANT_COUNT] = [None; VARIANT_COUNT];
+
+        for &mode in DemodMode::ALL {
+            let (index, label, key, implemented, kind) = variant_metadata(mode);
+            assert!(index < VARIANT_COUNT);
+            assert!(
+                seen[index].is_none(),
+                "duplicate {mode:?} in DemodMode::ALL"
+            );
+            seen[index] = Some(mode);
+
+            assert_eq!(mode.label(), label);
+            assert_eq!(mode.config_key(), key);
+            assert_eq!(mode.is_implemented(), implemented);
+            assert_eq!(mode.output_kind(), kind);
+            assert_eq!(serialized_variant(mode), key);
+        }
+
+        assert!(
+            seen.iter().all(Option::is_some),
+            "DemodMode::ALL is missing a variant"
+        );
+    }
+
+    #[test]
+    fn implemented_filters_reserved_modes() {
+        let modes: Vec<_> = DemodMode::implemented().collect();
+        assert_eq!(
+            modes,
+            [
+                DemodMode::Fm,
+                DemodMode::Am,
+                DemodMode::Cw,
+                DemodMode::Sstv,
+                DemodMode::Bpsk,
+                DemodMode::BpskIf,
+            ]
+        );
+        assert!(modes.iter().all(|mode| mode.is_implemented()));
+        assert!(!modes.contains(&DemodMode::Usb));
+        assert!(!modes.contains(&DemodMode::Lsb));
+    }
+
+    /// Capture the variant name serde writes for a unit enum.
+    fn serialized_variant(mode: DemodMode) -> &'static str {
+        mode.serialize(VariantSerializer).expect("enum serialises")
+    }
+
+    #[derive(Debug)]
+    struct Unsupported;
+
+    impl fmt::Display for Unsupported {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("only unit variants are supported")
+        }
+    }
+
+    impl std::error::Error for Unsupported {}
+
+    impl serde::ser::Error for Unsupported {
+        fn custom<T: fmt::Display>(_message: T) -> Self {
+            Self
+        }
+    }
+
+    struct VariantSerializer;
+
+    macro_rules! unsupported_scalar {
+        ($($method:ident($ty:ty)),* $(,)?) => {
+            $(
+                fn $method(self, _value: $ty) -> Result<Self::Ok, Self::Error> {
+                    Err(Unsupported)
+                }
+            )*
+        };
+    }
+
+    impl serde::Serializer for VariantSerializer {
+        type Ok = &'static str;
+        type Error = Unsupported;
+        type SerializeSeq = Impossible<Self::Ok, Self::Error>;
+        type SerializeTuple = Impossible<Self::Ok, Self::Error>;
+        type SerializeTupleStruct = Impossible<Self::Ok, Self::Error>;
+        type SerializeTupleVariant = Impossible<Self::Ok, Self::Error>;
+        type SerializeMap = Impossible<Self::Ok, Self::Error>;
+        type SerializeStruct = Impossible<Self::Ok, Self::Error>;
+        type SerializeStructVariant = Impossible<Self::Ok, Self::Error>;
+
+        unsupported_scalar!(
+            serialize_bool(bool),
+            serialize_i8(i8),
+            serialize_i16(i16),
+            serialize_i32(i32),
+            serialize_i64(i64),
+            serialize_i128(i128),
+            serialize_u8(u8),
+            serialize_u16(u16),
+            serialize_u32(u32),
+            serialize_u64(u64),
+            serialize_u128(u128),
+            serialize_f32(f32),
+            serialize_f64(f64),
+            serialize_char(char),
+            serialize_str(&str),
+            serialize_bytes(&[u8]),
+        );
+
+        fn serialize_unit_variant(
+            self,
+            _name: &'static str,
+            _index: u32,
+            variant: &'static str,
+        ) -> Result<Self::Ok, Self::Error> {
+            Ok(variant)
+        }
+
+        fn serialize_none(self) -> Result<Self::Ok, Self::Error> {
+            Err(Unsupported)
+        }
+
+        fn serialize_some<T>(self, _value: &T) -> Result<Self::Ok, Self::Error>
+        where
+            T: ?Sized + serde::Serialize,
+        {
+            Err(Unsupported)
+        }
+
+        fn serialize_unit(self) -> Result<Self::Ok, Self::Error> {
+            Err(Unsupported)
+        }
+
+        fn serialize_unit_struct(self, _name: &'static str) -> Result<Self::Ok, Self::Error> {
+            Err(Unsupported)
+        }
+
+        fn serialize_newtype_struct<T>(
+            self,
+            _name: &'static str,
+            _value: &T,
+        ) -> Result<Self::Ok, Self::Error>
+        where
+            T: ?Sized + serde::Serialize,
+        {
+            Err(Unsupported)
+        }
+
+        fn serialize_newtype_variant<T>(
+            self,
+            _name: &'static str,
+            _index: u32,
+            _variant: &'static str,
+            _value: &T,
+        ) -> Result<Self::Ok, Self::Error>
+        where
+            T: ?Sized + serde::Serialize,
+        {
+            Err(Unsupported)
+        }
+
+        fn serialize_seq(self, _len: Option<usize>) -> Result<Self::SerializeSeq, Self::Error> {
+            Err(Unsupported)
+        }
+
+        fn serialize_tuple(self, _len: usize) -> Result<Self::SerializeTuple, Self::Error> {
+            Err(Unsupported)
+        }
+
+        fn serialize_tuple_struct(
+            self,
+            _name: &'static str,
+            _len: usize,
+        ) -> Result<Self::SerializeTupleStruct, Self::Error> {
+            Err(Unsupported)
+        }
+
+        fn serialize_tuple_variant(
+            self,
+            _name: &'static str,
+            _index: u32,
+            _variant: &'static str,
+            _len: usize,
+        ) -> Result<Self::SerializeTupleVariant, Self::Error> {
+            Err(Unsupported)
+        }
+
+        fn serialize_map(self, _len: Option<usize>) -> Result<Self::SerializeMap, Self::Error> {
+            Err(Unsupported)
+        }
+
+        fn serialize_struct(
+            self,
+            _name: &'static str,
+            _len: usize,
+        ) -> Result<Self::SerializeStruct, Self::Error> {
+            Err(Unsupported)
+        }
+
+        fn serialize_struct_variant(
+            self,
+            _name: &'static str,
+            _index: u32,
+            _variant: &'static str,
+            _len: usize,
+        ) -> Result<Self::SerializeStructVariant, Self::Error> {
+            Err(Unsupported)
+        }
     }
 }

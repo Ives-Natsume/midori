@@ -2,24 +2,14 @@
 
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use midori_core::{
-    Channel, DemodMode, Frame, FrameMeta, IqBlock, Sample, StreamData, StreamSpec, VfoConfig,
+    Channel, DemodMode, Frame, FrameMeta, IqBlock, Sample, StreamData, StreamKind, StreamSpec,
+    VfoConfig,
 };
-use midori_dsp::{
-    AmDemod, AmDemodConfig, AudioAgc, BpskDemod, BpskDemodConfig, CarrierTracker, CwDemod,
-    CwDemodConfig, FmDemod, FmDemodConfig,
-};
+use midori_dsp::{AudioAgc, CarrierTracker};
 
-enum Demod {
-    Am(AmDemod),
-    Fm(FmDemod),
-    Cw(CwDemod),
-    Bpsk(BpskDemod),
-    /// 12 kHz real-IF pass-through. No mixing or filtering: the source file is
-    /// already the audio-IF stream expected by the 9k6 decoder.
-    IfAudio,
-}
+use crate::demod::Demod;
 
 /// One digital channel inside a session.
 pub struct VfoChannel {
@@ -118,12 +108,8 @@ impl VfoChannel {
 
     fn retune_demod(&mut self) {
         let absolute = self.current_offset_hz();
-        match &mut self.demod {
-            Some(Demod::Am(demod)) => demod.set_offset(absolute),
-            Some(Demod::Fm(demod)) => demod.set_offset(absolute),
-            Some(Demod::Cw(demod)) => demod.set_offset(absolute),
-            Some(Demod::Bpsk(demod)) => demod.set_offset(absolute),
-            Some(Demod::IfAudio) | None => {}
+        if let Some(demod) = &mut self.demod {
+            demod.set_offset(absolute);
         }
     }
 }
@@ -135,41 +121,7 @@ impl Channel for VfoChannel {
 
     fn configure(&mut self, spec: &StreamSpec) -> Result<()> {
         let offset_hz = self.current_offset_hz();
-        let demod = match self.config.demod {
-            DemodMode::Fm | DemodMode::Sstv => Demod::Fm(FmDemod::new(FmDemodConfig {
-                input_rate_hz: spec.sample_rate_hz,
-                channel_rate_hz: self.config.channel_rate_hz,
-                output_rate_hz: self.config.audio_rate_hz,
-                offset_hz,
-                channel_bandwidth_hz: self.config.bandwidth_hz,
-                deemphasis_us: self.config.deemphasis_us,
-                audio_bandwidth_hz: self.config.audio_bandwidth_hz,
-            })),
-            DemodMode::Am => Demod::Am(AmDemod::new(AmDemodConfig {
-                input_rate_hz: spec.sample_rate_hz,
-                output_rate_hz: self.config.audio_rate_hz,
-                offset_hz,
-                bandwidth_hz: self.config.bandwidth_hz,
-            })),
-            DemodMode::Cw => Demod::Cw(CwDemod::new(CwDemodConfig {
-                input_rate_hz: spec.sample_rate_hz,
-                channel_rate_hz: self.config.channel_rate_hz,
-                output_rate_hz: self.config.audio_rate_hz,
-                offset_hz,
-                bandwidth_hz: self.config.bandwidth_hz,
-                bfo_hz: self.config.bfo_hz,
-                audio_bandwidth_hz: self.config.audio_bandwidth_hz,
-            })),
-            DemodMode::Bpsk => Demod::Bpsk(BpskDemod::new(BpskDemodConfig {
-                input_rate_hz: spec.sample_rate_hz,
-                channel_rate_hz: self.config.channel_rate_hz,
-                output_rate_hz: self.config.audio_rate_hz,
-                offset_hz,
-                channel_bandwidth_hz: self.config.bandwidth_hz,
-            })),
-            DemodMode::BpskIf => Demod::IfAudio,
-            other => bail!("demod mode {other:?} is not implemented yet"),
-        };
+        let demod = Demod::build(&self.config, spec, offset_hz)?;
 
         self.demod = Some(demod);
         self.spec = Some(*spec);
@@ -226,7 +178,7 @@ impl Channel for VfoChannel {
 
         // A real-IF source is already the mono audio stream the 9k6 decoder
         // expects. Pass the real part through and skip audio AGC.
-        if matches!(demod, Demod::IfAudio) {
+        if demod.is_if_audio() {
             self.audio_scratch.clear();
             self.audio_scratch
                 .extend(iq.samples.iter().map(|sample| sample.re));
@@ -256,17 +208,20 @@ impl Channel for VfoChannel {
         // A BPSK channel is not demodulated here: the decoder wants complex
         // baseband so it can run its own carrier/timing loops and FEC. Keep
         // the same VFO/Doppler metadata as the audio paths.
-        if let Demod::Bpsk(demod) = demod {
+        if demod.output_kind() == StreamKind::Iq {
             self.iq_scratch.clear();
-            demod.process(&iq.samples, &mut self.iq_scratch);
+            demod.process_iq(&iq.samples, &mut self.iq_scratch);
             if self.iq_scratch.is_empty() {
                 return Ok(());
             }
+            let output_rate_hz = demod
+                .iq_output_rate_hz()
+                .expect("IQ demodulator reports an output rate");
             let meta = FrameMeta {
                 seq: self.seq,
                 start_sample: self.audio_start_sample,
                 timestamp_ns: iq.timestamp_ns,
-                sample_rate_hz: demod.output_rate_hz(),
+                sample_rate_hz: output_rate_hz,
                 center_freq_hz: tuned_freq_hz,
                 nominal_freq_hz: iq.spec.center_freq_hz + self.config.offset_hz,
                 bandwidth_hz: self.config.bandwidth_hz,
@@ -283,12 +238,7 @@ impl Channel for VfoChannel {
         }
 
         self.audio_scratch.clear();
-        match demod {
-            Demod::Am(demod) => demod.process(&iq.samples, &mut self.audio_scratch),
-            Demod::Fm(demod) => demod.process(&iq.samples, &mut self.audio_scratch),
-            Demod::Cw(demod) => demod.process(&iq.samples, &mut self.audio_scratch),
-            Demod::Bpsk(_) | Demod::IfAudio => unreachable!(),
-        }
+        demod.process_audio(&iq.samples, &mut self.audio_scratch);
         if self.audio_scratch.is_empty() {
             return Ok(());
         }
