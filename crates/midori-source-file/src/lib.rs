@@ -235,7 +235,13 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("midori-source-file-{nanos}.wav"));
+        // Tests run in parallel, so the timestamp alone can collide.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "midori-source-file-{}-{nanos}-{unique}.wav",
+            std::process::id()
+        ));
         let spec = hound::WavSpec {
             channels: 2,
             sample_rate: rate,
