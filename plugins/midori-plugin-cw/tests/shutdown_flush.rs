@@ -52,6 +52,7 @@ fn shutdown_flush_delivers_final_text() {
         },
         outputs: vec![OutputKind::Display, OutputKind::Packets],
         params: vec![],
+        demod_modes: Vec::new(),
     };
 
     let mut plugin = SidecarPlugin::new(manifest).expect("manifest");

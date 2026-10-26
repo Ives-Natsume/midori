@@ -591,6 +591,7 @@ mod tests {
             },
             outputs: vec![OutputKind::Display],
             params: vec![],
+            demod_modes: Vec::new(),
         }
     }
 
@@ -735,6 +736,7 @@ mod tests {
             },
             outputs: vec![OutputKind::Display],
             params: vec![],
+            demod_modes: Vec::new(),
         };
 
         let mut plugin = SidecarPlugin::new(manifest).unwrap();

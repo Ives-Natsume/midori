@@ -1,0 +1,29 @@
+{
+  "name": "sstv",
+  "version": "0.1.0",
+  "protocol": 2,
+  "command": ["midori-plugin-sstv"],
+  "input": {
+    "type": "audio",
+    "sample_rate_hz": 48000,
+    "channels": 1
+  },
+  "outputs": ["display"],
+  "demod_modes": ["sstv", "fm"],
+  "params": [
+    {
+      "name": "output_dir",
+      "kind": "string",
+      "default": "",
+      "description": "Directory for completed PNG images; empty uses the plugin default."
+    },
+    {
+      "name": "sample_rate_hz",
+      "kind": "int",
+      "default": 48000,
+      "min": 8000,
+      "max": 192000,
+      "description": "Initial audio sample rate, Hz."
+    }
+  ]
+}

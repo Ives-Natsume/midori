@@ -100,6 +100,7 @@ fn sstv_sidecar_decodes_pd120() {
         },
         outputs: vec![OutputKind::Display],
         params: vec![],
+        demod_modes: Vec::new(),
     };
 
     let mut plugin = SidecarPlugin::new(manifest).expect("manifest");

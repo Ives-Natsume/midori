@@ -19,9 +19,10 @@ engine                          plugin
   |---------- shutdown ---------->|
 ```
 
-The plugin executable is described by a manifest. The engine builds the
-manifest for built-in reference plugins and will eventually load them from
-files for third-party plugins.
+The plugin executable is described by a manifest. The reference plugins ship
+`plugins/midori-plugin-*/manifest.json`; the engine discovers them at runtime
+and still has a compiled-in fallback so a build tree without `plugins/` keeps
+working.
 
 Example manifest:
 
@@ -33,9 +34,47 @@ Example manifest:
   "command": ["midori-plugin-cw"],
   "input": { "type": "audio", "sample_rate_hz": 48000, "channels": 1 },
   "outputs": ["display", "packets"],
-  "params": []
+  "demod_modes": ["cw"],
+  "params": [
+    { "name": "tone_hz", "kind": "float", "default": 700.0, "min": 100.0, "max": 3000.0 },
+    { "name": "envelope_hz", "kind": "float", "default": 50.0, "min": 10.0, "max": 500.0 },
+    { "name": "start_at_signal", "kind": "bool", "default": false }
+  ]
 }
 ```
+
+### Discovery
+
+Manifests are looked for in this order:
+
+1. entries in `MIDORI_PLUGIN_PATH` (operating-system path-list separator);
+2. `<directory of the midori executable>/plugins`;
+3. a development `<workspace>/plugins`, found relative to the executable
+   (`target/debug/midori-gui` → `../../plugins`).
+
+Each directory is scanned for `*.json` manifests and `*/manifest.json` bundle
+layouts. The first manifest with a given `name` wins. A malformed manifest is
+reported and skipped; it does not hide the other plugins.
+
+A relative `command[0]` is resolved against the manifest's directory first,
+then the directory of the host executable, and finally left as a bare name for
+the operating system's `PATH` lookup. `MIDORI_CW_PLUGIN`, `MIDORI_SSTV_PLUGIN`
+and `MIDORI_SSDV_PLUGIN` still override the program for the reference decoders.
+
+### Parameters and demod modes
+
+`params` is the UI/configuration schema. Supported `kind` values are `bool`,
+`int`, `float`, `string`, `enum` (with `values`), and `string_list` (an array
+of strings). `default`, optional `min`/`max`, and `description` are used by the
+host to build a complete parameter object; host overrides are rejected if they
+name an unknown key, have the wrong type, fall outside the range, or select an
+unknown enum value.
+
+`demod_modes` lists the snake_case demodulator names whose frames make sense
+for this plugin (`cw`; `sstv`/`fm`; `bpsk`/`bpsk_if`). A missing or empty list
+means "any mode". When the VFO changes mode the worker pauses or resumes the
+plugin and logs an `Info` event; paused plugins are not sent frames and those
+frames are not counted as dropped.
 
 ## Wire format
 

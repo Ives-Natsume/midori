@@ -10,12 +10,13 @@
 //! that only update frequency metadata. See [`wire`] and [`sidecar`] for the
 //! framing and handshake details.
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use midori_core::{Frame, FrameMeta, StreamKind};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+pub use serde_json::Value;
 
 pub const PROTOCOL_VERSION: u32 = 2;
 
@@ -143,6 +144,9 @@ pub enum ParamKind {
     Float,
     String,
     Enum,
+    /// An ordered list of strings, used for parameters that take a set of
+    /// values (for example SSDV CRC initial values).
+    StringList,
 }
 
 /// Parameter schema used by the UI to generate controls automatically.
@@ -175,6 +179,22 @@ pub struct Manifest {
     pub outputs: Vec<OutputKind>,
     #[serde(default)]
     pub params: Vec<ParamSpec>,
+    /// Demodulator modes this plugin's input makes sense for, using the
+    /// snake_case names of the engine's `DemodMode` (for example `"cw"`,
+    /// `"sstv"`, `"bpsk_if"`). The host keeps the field as strings so a
+    /// manifest never has to be rebuilt when the engine gains a mode.
+    ///
+    /// An empty (or missing) list means the plugin accepts any mode.
+    #[serde(default)]
+    pub demod_modes: Vec<String>,
+}
+
+/// Whether `mode` is listed in a manifest's `demod_modes`.
+///
+/// An empty list means "any mode", so plugins written before mode routing
+/// existed keep receiving frames.
+pub fn demod_modes_match(modes: &[String], mode: &str) -> bool {
+    modes.is_empty() || modes.iter().any(|candidate| candidate == mode)
 }
 
 impl Manifest {
@@ -205,6 +225,11 @@ impl Manifest {
                 PROTOCOL_VERSION
             );
         }
+        for mode in &self.demod_modes {
+            if mode.trim().is_empty() {
+                bail!("plugin '{}' has an empty demod mode", self.name);
+            }
+        }
         match &self.input {
             InputSpec::Iq { sample_rate_hz, .. } if *sample_rate_hz <= 0.0 => {
                 bail!("plugin '{}' has an invalid IQ sample rate", self.name)
@@ -221,6 +246,361 @@ impl Manifest {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Whether this plugin should receive frames while the VFO is in `mode`.
+    pub fn accepts_demod(&self, mode: &str) -> bool {
+        demod_modes_match(&self.demod_modes, mode)
+    }
+
+    /// Resolve the plugin's full parameter object from the declared defaults
+    /// plus host overrides.
+    ///
+    /// Every parameter appears in the result (defaults are included). Overrides
+    /// must refer to a declared parameter and match its type, range, and enum
+    /// values. Unknown keys are rejected so a typo cannot silently leave a
+    /// decoder on its default.
+    pub fn resolve_params(&self, overrides: &Value) -> Result<Value> {
+        let Some(overrides) = overrides.as_object() else {
+            bail!(
+                "plugin '{}' parameter overrides must be a JSON object",
+                self.name
+            );
+        };
+
+        let mut resolved = serde_json::Map::new();
+        for spec in &self.params {
+            if spec.name.trim().is_empty() {
+                bail!("plugin '{}' has a parameter with an empty name", self.name);
+            }
+            if resolved.contains_key(&spec.name) {
+                bail!(
+                    "plugin '{}' declares parameter '{}' more than once",
+                    self.name,
+                    spec.name
+                );
+            }
+            if !spec.default.is_null() {
+                validate_param_value(spec, &spec.default).with_context(|| {
+                    format!(
+                        "plugin '{}' default for parameter '{}'",
+                        self.name, spec.name
+                    )
+                })?;
+            }
+            resolved.insert(spec.name.clone(), spec.default.clone());
+        }
+
+        for (name, value) in overrides {
+            let Some(spec) = self.params.iter().find(|spec| spec.name == *name) else {
+                bail!("plugin '{}' has no parameter '{}'", self.name, name);
+            };
+            validate_param_value(spec, value)
+                .with_context(|| format!("plugin '{}' parameter '{}'", self.name, name))?;
+            resolved.insert(name.clone(), value.clone());
+        }
+
+        Ok(Value::Object(resolved))
+    }
+}
+
+fn validate_param_value(spec: &ParamSpec, value: &Value) -> Result<()> {
+    match spec.kind {
+        ParamKind::Bool => {
+            if !value.is_boolean() {
+                bail!("expected a boolean");
+            }
+        }
+        ParamKind::Int => {
+            let Some(integer) = value.as_i64() else {
+                bail!("expected an integer");
+            };
+            check_range(spec, integer as f64)?;
+        }
+        ParamKind::Float => {
+            let Some(number) = value.as_f64() else {
+                bail!("expected a number");
+            };
+            // JSON has no NaN/Infinity literals, but serde_json values can be
+            // produced by callers in other ways in the future; never let a
+            // non-finite value reach a DSP decoder.
+            if !number.is_finite() {
+                bail!("expected a finite number");
+            }
+            check_range(spec, number)?;
+        }
+        ParamKind::String => {
+            if !value.is_string() {
+                bail!("expected a string");
+            }
+        }
+        ParamKind::Enum => {
+            let Some(text) = value.as_str() else {
+                bail!("expected a string");
+            };
+            if !spec.values.iter().any(|allowed| allowed == text) {
+                bail!("value '{text}' is not one of [{}]", spec.values.join(", "));
+            }
+        }
+        ParamKind::StringList => {
+            let Some(items) = value.as_array() else {
+                bail!("expected an array of strings");
+            };
+            if let Some(item) = items.iter().find(|item| !item.is_string()) {
+                bail!("expected an array of strings, found {item}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_range(spec: &ParamSpec, value: f64) -> Result<()> {
+    if let Some(min) = spec.min
+        && value < min
+    {
+        bail!("value {value} is below the minimum {min}");
+    }
+    if let Some(max) = spec.max
+        && value > max
+    {
+        bail!("value {value} is above the maximum {max}");
+    }
+    Ok(())
+}
+
+/// One manifest loaded from disk by [`discover`].
+#[derive(Debug, Clone)]
+pub struct DiscoveredPlugin {
+    pub manifest: Manifest,
+    pub manifest_path: PathBuf,
+    /// Directory containing the manifest. Relative commands resolve here first.
+    pub directory: PathBuf,
+    /// `manifest.command` with `command[0]` resolved for this installation.
+    ///
+    /// See [`discover`] for the lookup order.
+    pub command: Vec<String>,
+}
+
+impl DiscoveredPlugin {
+    /// Return a copy of the manifest whose command starts with `program`.
+    ///
+    /// The remaining arguments are preserved. The app uses this to honour its
+    /// per-plugin environment overrides without losing the rest of the command
+    /// line from the manifest.
+    pub fn sidecar_manifest(&self, program: impl Into<String>) -> Manifest {
+        let mut manifest = self.manifest.clone();
+        manifest.command = std::iter::once(program.into())
+            .chain(self.command.iter().skip(1).cloned())
+            .collect();
+        manifest
+    }
+
+    /// Consume this entry, returning a manifest with the resolved command.
+    pub fn into_manifest(mut self) -> Manifest {
+        self.manifest.command = self.command;
+        self.manifest
+    }
+}
+
+/// A manifest that could not be loaded.
+#[derive(Debug, Clone)]
+pub struct DiscoveryError {
+    pub path: PathBuf,
+    pub message: String,
+}
+
+impl std::fmt::Display for DiscoveryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.path.display(), self.message)
+    }
+}
+
+impl std::error::Error for DiscoveryError {}
+
+/// Discover plugin manifests in `dirs`, in search-path order.
+///
+/// Each directory is scanned for `*.json` manifest files and for
+/// `*/manifest.json` bundle layouts. Entries are de-duplicated by canonical
+/// path, and the first definition of a name wins because callers search the
+/// returned list in order.
+///
+/// For every manifest, a relative `command[0]` is resolved in this order:
+///
+/// 1. relative to the directory containing the manifest;
+/// 2. relative to the directory containing the current executable;
+/// 3. left unchanged, so the operating system performs a `PATH` lookup.
+///
+/// Invalid manifests are returned in the second half of the tuple instead of
+/// aborting the scan, so one broken third-party plugin cannot hide the others.
+pub fn discover(dirs: &[PathBuf]) -> (Vec<DiscoveredPlugin>, Vec<DiscoveryError>) {
+    let mut plugins = Vec::new();
+    let mut errors = Vec::new();
+    let mut seen = HashSet::new();
+
+    for dir in dirs {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                errors.push(DiscoveryError {
+                    path: dir.clone(),
+                    message: format!("reading plugin directory: {error}"),
+                });
+                continue;
+            }
+        };
+
+        let mut candidates = Vec::new();
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    errors.push(DiscoveryError {
+                        path: dir.clone(),
+                        message: format!("reading plugin directory entry: {error}"),
+                    });
+                    continue;
+                }
+            };
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(error) => {
+                    errors.push(DiscoveryError {
+                        path: path.clone(),
+                        message: format!("reading entry type: {error}"),
+                    });
+                    continue;
+                }
+            };
+            if file_type.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+            {
+                candidates.push(path);
+            } else if file_type.is_dir() {
+                let manifest = path.join("manifest.json");
+                if manifest.is_file() {
+                    candidates.push(manifest);
+                }
+            }
+        }
+        candidates.sort();
+
+        for manifest_path in candidates {
+            let dedupe_key = manifest_path
+                .canonicalize()
+                .unwrap_or_else(|_| manifest_path.clone());
+            if !seen.insert(dedupe_key) {
+                continue;
+            }
+            match load_discovered(&manifest_path) {
+                Ok(plugin) => plugins.push(plugin),
+                Err(error) => errors.push(DiscoveryError {
+                    path: manifest_path,
+                    message: format!("{error:#}"),
+                }),
+            }
+        }
+    }
+
+    (plugins, errors)
+}
+
+fn load_discovered(manifest_path: &Path) -> Result<DiscoveredPlugin> {
+    let manifest = Manifest::from_path(manifest_path)?;
+    let directory = manifest_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let command = resolve_command(&directory, &manifest.command);
+    Ok(DiscoveredPlugin {
+        manifest,
+        manifest_path: manifest_path.to_path_buf(),
+        directory,
+        command,
+    })
+}
+
+fn resolve_command(manifest_dir: &Path, command: &[String]) -> Vec<String> {
+    let mut resolved = command.to_vec();
+    let Some(program) = resolved.first_mut() else {
+        return resolved;
+    };
+
+    let program_path = Path::new(program);
+    if program_path.is_absolute() {
+        return resolved;
+    }
+
+    if let Some(found) = find_executable(&manifest_dir.join(program_path)) {
+        *program = found.display().to_string();
+        return resolved;
+    }
+
+    if let Ok(executable) = std::env::current_exe()
+        && let Some(executable_dir) = executable.parent()
+        && let Some(found) = find_executable(&executable_dir.join(program_path))
+    {
+        *program = found.display().to_string();
+    }
+
+    // Not found next to the manifest or the host: leave the bare name so the
+    // OS can perform a PATH lookup when the sidecar is spawned.
+    resolved
+}
+
+fn find_executable(path: &Path) -> Option<PathBuf> {
+    if path.is_file() {
+        return Some(path.to_path_buf());
+    }
+    #[cfg(windows)]
+    if path.extension().is_none() {
+        let with_extension = path.with_extension("exe");
+        if with_extension.is_file() {
+            return Some(with_extension);
+        }
+    }
+    None
+}
+
+/// Default plugin search path, in order:
+///
+/// 1. entries from `MIDORI_PLUGIN_PATH` (OS path-list separated);
+/// 2. `<directory of the current executable>/plugins`;
+/// 3. a development-tree `<workspace>/plugins`, discovered relative to the
+///    executable (`target/debug/midori-gui` → `../../plugins`, and one level
+///    deeper for test binaries in `target/debug/deps`).
+pub fn default_plugin_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(paths) = std::env::var_os("MIDORI_PLUGIN_PATH") {
+        for path in std::env::split_paths(&paths) {
+            if !path.as_os_str().is_empty() {
+                push_unique(&mut dirs, path);
+            }
+        }
+    }
+
+    if let Ok(executable) = std::env::current_exe()
+        && let Some(executable_dir) = executable.parent()
+    {
+        push_unique(&mut dirs, executable_dir.join("plugins"));
+        for relative in ["../../plugins", "../../../plugins"] {
+            if let Ok(path) = executable_dir.join(relative).canonicalize()
+                && path.is_dir()
+            {
+                push_unique(&mut dirs, path);
+            }
+        }
+    }
+
+    dirs
+}
+
+fn push_unique(dirs: &mut Vec<PathBuf>, path: PathBuf) {
+    if !dirs.iter().any(|existing| existing == &path) {
+        dirs.push(path);
     }
 }
 
@@ -317,6 +697,7 @@ pub trait PluginHost: Send {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     const MANIFEST: &str = r#"
     {
@@ -328,9 +709,42 @@ mod tests {
       "outputs": ["packets", "display"],
       "params": [
         { "name": "mode", "kind": "enum", "values": ["a", "b"], "default": "a" }
-      ]
+      ],
+      "demod_modes": ["cw", "fm"]
     }
     "#;
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "midori-plugin-test-{}-{}-{label}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&path).expect("creating temp dir");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn write(path: &Path, text: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("creating parent dir");
+        }
+        std::fs::write(path, text).expect("writing test file");
+    }
 
     #[test]
     fn parses_manifest() {
@@ -344,12 +758,359 @@ mod tests {
             }
         ));
         assert_eq!(manifest.params.len(), 1);
+        assert_eq!(manifest.demod_modes, vec!["cw", "fm"]);
     }
 
     #[test]
     fn rejects_wrong_protocol() {
         let bad = MANIFEST.replace("\"protocol\": 2", "\"protocol\": 1");
         assert!(Manifest::from_json(&bad).is_err());
+    }
+
+    #[test]
+    fn missing_demod_modes_means_any_mode() {
+        let json = MANIFEST.replace(",\n      \"demod_modes\": [\"cw\", \"fm\"]", "");
+        let manifest = Manifest::from_json(&json).unwrap();
+        assert!(manifest.demod_modes.is_empty());
+        assert!(manifest.accepts_demod("anything"));
+    }
+
+    #[test]
+    fn rejects_empty_demod_mode() {
+        let bad = MANIFEST.replace("[\"cw\", \"fm\"]", "[\"cw\", \"  \"]");
+        assert!(Manifest::from_json(&bad).is_err());
+    }
+
+    #[test]
+    fn demod_mode_matching() {
+        assert!(demod_modes_match(&[], "fm"));
+        let modes = vec!["cw".to_string(), "sstv".to_string()];
+        assert!(demod_modes_match(&modes, "cw"));
+        assert!(demod_modes_match(&modes, "sstv"));
+        assert!(!demod_modes_match(&modes, "fm"));
+        assert!(!demod_modes_match(&modes, "CW"));
+    }
+
+    #[test]
+    fn discovery_finds_files_and_bundles() {
+        let root = TempDir::new("discovery-valid");
+        write(
+            &root.path().join("one.json"),
+            &MANIFEST.replace("example", "one"),
+        );
+        write(
+            &root.path().join("two/manifest.json"),
+            &MANIFEST.replace("example", "two"),
+        );
+
+        let (plugins, errors) = discover(&[root.path().to_path_buf()]);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        let names: Vec<&str> = plugins
+            .iter()
+            .map(|plugin| plugin.manifest.name.as_str())
+            .collect();
+        assert_eq!(names, ["one", "two"]);
+    }
+
+    #[test]
+    fn discovery_collects_invalid_manifests() {
+        let root = TempDir::new("discovery-invalid");
+        write(&root.path().join("good.json"), MANIFEST);
+        write(&root.path().join("bad.json"), "{ this is not json");
+
+        let (plugins, errors) = discover(&[root.path().to_path_buf()]);
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].path.ends_with("bad.json"),
+            "unexpected error path: {}",
+            errors[0].path.display()
+        );
+        assert!(!errors[0].message.is_empty());
+    }
+
+    #[test]
+    fn discovery_resolves_command_next_to_manifest() {
+        let root = TempDir::new("discovery-relative");
+        write(
+            &root.path().join("bundle/manifest.json"),
+            r#"{
+              "name": "relative",
+              "version": "0.1.0",
+              "protocol": 2,
+              "command": ["fake-sidecar", "--flag"],
+              "input": { "type": "audio", "sample_rate_hz": 48000, "channels": 1 }
+            }"#,
+        );
+        write(&root.path().join("bundle/fake-sidecar"), "");
+
+        let (plugins, errors) = discover(&[root.path().to_path_buf()]);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert_eq!(plugins.len(), 1);
+        let plugin = &plugins[0];
+        assert_eq!(
+            PathBuf::from(&plugin.command[0]),
+            root.path().join("bundle/fake-sidecar")
+        );
+        assert_eq!(plugin.command[1], "--flag");
+    }
+
+    #[test]
+    fn discovery_resolves_command_next_to_executable() {
+        let executable = std::env::current_exe().expect("current exe");
+        let file_name = executable
+            .file_name()
+            .expect("exe file name")
+            .to_string_lossy()
+            .into_owned();
+        let root = TempDir::new("discovery-exe-dir");
+        write(
+            &root.path().join("manifest.json"),
+            &format!(
+                r#"{{
+                  "name": "exe-relative",
+                  "version": "0.1.0",
+                  "protocol": 2,
+                  "command": ["{file_name}"],
+                  "input": {{ "type": "audio", "sample_rate_hz": 48000, "channels": 1 }}
+                }}"#
+            ),
+        );
+
+        let (plugins, errors) = discover(&[root.path().to_path_buf()]);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert_eq!(
+            PathBuf::from(&plugins[0].command[0]),
+            executable.parent().unwrap().join(file_name)
+        );
+    }
+
+    #[test]
+    fn discovery_leaves_unresolved_command_for_path_lookup() {
+        let root = TempDir::new("discovery-path");
+        write(
+            &root.path().join("manifest.json"),
+            r#"{
+              "name": "path-lookup",
+              "version": "0.1.0",
+              "protocol": 2,
+              "command": ["midori-plugin-does-not-exist-anywhere"],
+              "input": { "type": "audio", "sample_rate_hz": 48000, "channels": 1 }
+            }"#,
+        );
+
+        let (plugins, errors) = discover(&[root.path().to_path_buf()]);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert_eq!(
+            plugins[0].command[0],
+            "midori-plugin-does-not-exist-anywhere"
+        );
+    }
+
+    #[test]
+    fn discovery_deduplicates_directories() {
+        let root = TempDir::new("discovery-dedupe");
+        write(&root.path().join("manifest.json"), MANIFEST);
+        let (plugins, errors) = discover(&[root.path().to_path_buf(), root.path().to_path_buf()]);
+        assert!(errors.is_empty());
+        assert_eq!(plugins.len(), 1);
+    }
+
+    #[test]
+    fn default_plugin_dirs_start_with_the_environment() {
+        let root = TempDir::new("default-dirs");
+        // Environment variables are process-wide; serialise this test against
+        // the other tests in this module that do not touch them.
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+
+        let previous = std::env::var_os("MIDORI_PLUGIN_PATH");
+        // SAFETY: the lock above serialises access within this test binary.
+        unsafe { std::env::set_var("MIDORI_PLUGIN_PATH", root.path()) };
+        let dirs = default_plugin_dirs();
+        match previous {
+            Some(value) => unsafe { std::env::set_var("MIDORI_PLUGIN_PATH", value) },
+            None => unsafe { std::env::remove_var("MIDORI_PLUGIN_PATH") },
+        };
+
+        assert_eq!(dirs.first().map(PathBuf::as_path), Some(root.path()));
+    }
+
+    const PARAM_MANIFEST: &str = r#"
+    {
+      "name": "params",
+      "version": "0.1.0",
+      "protocol": 2,
+      "command": ["params-plugin"],
+      "input": { "type": "audio", "sample_rate_hz": 48000, "channels": 1 },
+      "params": [
+        { "name": "gain", "kind": "float", "default": 1.0, "min": 0.0, "max": 10.0 },
+        { "name": "count", "kind": "int", "default": 2, "min": 1, "max": 5 },
+        { "name": "enabled", "kind": "bool", "default": true },
+        { "name": "label", "kind": "string", "default": "hi" },
+        { "name": "mode", "kind": "enum", "values": ["a", "b"], "default": "a" },
+        { "name": "list", "kind": "string_list", "default": ["x"] }
+      ]
+    }
+    "#;
+
+    fn param_manifest() -> Manifest {
+        Manifest::from_json(PARAM_MANIFEST).unwrap()
+    }
+
+    #[test]
+    fn resolve_params_returns_defaults() {
+        let manifest = param_manifest();
+        assert_eq!(
+            manifest.resolve_params(&serde_json::json!({})).unwrap(),
+            serde_json::json!({
+                "gain": 1.0,
+                "count": 2,
+                "enabled": true,
+                "label": "hi",
+                "mode": "a",
+                "list": ["x"]
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_params_applies_overrides() {
+        let manifest = param_manifest();
+        let resolved = manifest
+            .resolve_params(&serde_json::json!({
+                "gain": 2.5,
+                "count": 3,
+                "enabled": false,
+                "label": "bye",
+                "mode": "b",
+                "list": ["y", "z"]
+            }))
+            .unwrap();
+        assert_eq!(
+            resolved,
+            serde_json::json!({
+                "gain": 2.5,
+                "count": 3,
+                "enabled": false,
+                "label": "bye",
+                "mode": "b",
+                "list": ["y", "z"]
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_params_rejects_unknown_keys() {
+        let error = param_manifest()
+            .resolve_params(&serde_json::json!({"missing": 1}))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("has no parameter 'missing'"));
+    }
+
+    #[test]
+    fn resolve_params_rejects_non_object_overrides() {
+        assert!(
+            param_manifest()
+                .resolve_params(&serde_json::json!([1, 2]))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn resolve_params_rejects_bool_mismatch() {
+        assert!(
+            param_manifest()
+                .resolve_params(&serde_json::json!({"enabled": 1}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn resolve_params_rejects_int_mismatch() {
+        for value in [serde_json::json!(1.5), serde_json::json!("3")] {
+            assert!(
+                param_manifest()
+                    .resolve_params(&serde_json::json!({"count": value}))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_params_rejects_float_mismatch() {
+        assert!(
+            param_manifest()
+                .resolve_params(&serde_json::json!({"gain": "fast"}))
+                .is_err()
+        );
+        // serde_json has no NaN literal; a non-finite value becomes JSON null,
+        // which must be rejected rather than reaching the decoder.
+        assert!(serde_json::to_value(f64::NAN).unwrap().is_null());
+        assert!(
+            param_manifest()
+                .resolve_params(&serde_json::json!({"gain": f64::NAN}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn resolve_params_rejects_string_mismatch() {
+        assert!(
+            param_manifest()
+                .resolve_params(&serde_json::json!({"label": 1}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn resolve_params_rejects_enum_values_not_listed() {
+        let error = param_manifest()
+            .resolve_params(&serde_json::json!({"mode": "c"}))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("is not one of [a, b]"));
+    }
+
+    #[test]
+    fn resolve_params_rejects_out_of_range_values() {
+        assert!(
+            param_manifest()
+                .resolve_params(&serde_json::json!({"gain": -1.0}))
+                .is_err()
+        );
+        assert!(
+            param_manifest()
+                .resolve_params(&serde_json::json!({"gain": 11.0}))
+                .is_err()
+        );
+        assert!(
+            param_manifest()
+                .resolve_params(&serde_json::json!({"count": 0}))
+                .is_err()
+        );
+        assert!(
+            param_manifest()
+                .resolve_params(&serde_json::json!({"count": 6}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn resolve_params_rejects_invalid_string_lists() {
+        for value in [serde_json::json!("x"), serde_json::json!(["x", 1])] {
+            assert!(
+                param_manifest()
+                    .resolve_params(&serde_json::json!({"list": value}))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_params_rejects_invalid_defaults() {
+        let bad = PARAM_MANIFEST.replace("\"default\": 1.0", "\"default\": 99.0");
+        let manifest = Manifest::from_json(&bad).unwrap();
+        assert!(manifest.resolve_params(&serde_json::json!({})).is_err());
     }
 
     #[test]

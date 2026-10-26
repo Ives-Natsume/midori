@@ -50,6 +50,7 @@ fn cw_sidecar_decodes_cq() {
         },
         outputs: vec![OutputKind::Display, OutputKind::Packets],
         params: vec![],
+        demod_modes: Vec::new(),
     };
 
     let mut plugin = SidecarPlugin::new(manifest).expect("manifest");

@@ -1,0 +1,49 @@
+{
+  "name": "ssdv",
+  "version": "0.1.0",
+  "protocol": 2,
+  "command": ["midori-plugin-ssdv"],
+  "input": {
+    "type": "iq",
+    "sample_rate_hz": 48000
+  },
+  "outputs": ["display"],
+  "demod_modes": ["bpsk", "bpsk_if"],
+  "params": [
+    {
+      "name": "output_dir",
+      "kind": "string",
+      "default": "",
+      "description": "Directory for decoded images; empty uses the plugin default."
+    },
+    {
+      "name": "input",
+      "kind": "enum",
+      "default": "iq",
+      "values": ["iq", "audio-if", "bytes", "frames", "audio"],
+      "description": "Input pipeline: channelized IQ, real-IF audio, or raw packets."
+    },
+    {
+      "name": "crc_inits",
+      "kind": "string_list",
+      "default": ["0xFFFFFFFF"],
+      "description": "CRC32 initial values to try, in order (for example 0x4EE4FDE1)."
+    },
+    {
+      "name": "frame_header_len",
+      "kind": "int",
+      "default": 5,
+      "min": 0,
+      "max": 64,
+      "description": "CCSDS frame header length in bytes."
+    },
+    {
+      "name": "preview_interval_ms",
+      "kind": "int",
+      "default": 650,
+      "min": 50,
+      "max": 60000,
+      "description": "Minimum interval between partial-image previews in raw-packet mode, ms."
+    }
+  ]
+}

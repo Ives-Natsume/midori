@@ -78,6 +78,7 @@ fn cw_sidecar_decodes_botan_fixture() {
         },
         outputs: vec![OutputKind::Display, OutputKind::Packets],
         params: vec![],
+        demod_modes: Vec::new(),
     };
 
     let mut plugin = SidecarPlugin::new(manifest).expect("manifest");
@@ -201,6 +202,7 @@ fn gui_style_afc_decodes_botan_raw_iq() {
         },
         outputs: vec![OutputKind::Display, OutputKind::Packets],
         params: vec![],
+        demod_modes: Vec::new(),
     };
     let mut plugin = SidecarPlugin::new(manifest).expect("manifest");
     plugin.start().expect("start");

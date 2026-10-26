@@ -179,6 +179,7 @@ fn decode_with_sidecar(
         },
         outputs: vec![OutputKind::Display, OutputKind::Packets],
         params: vec![],
+        demod_modes: Vec::new(),
     };
     let mut plugin = SidecarPlugin::new(manifest).context("creating CW sidecar")?;
     plugin.start().context("starting CW sidecar")?;

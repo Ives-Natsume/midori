@@ -25,7 +25,7 @@ pub(crate) mod commands;
 pub(crate) mod events;
 mod plugins;
 
-use plugins::{start_cw_plugin, start_ssdv_plugin, start_sstv_plugin};
+use plugins::{PluginCatalog, start_cw_plugin, start_ssdv_plugin, start_sstv_plugin};
 
 // ---------------------------------------------------------------------------
 // Worker messages
@@ -109,6 +109,36 @@ fn build_doppler(
 }
 
 const MAX_PLUGIN_EVENTS_PER_STEP: usize = 64;
+
+fn plugin_label(source: PluginSource) -> &'static str {
+    match source {
+        PluginSource::Cw => "CW decoder",
+        PluginSource::Sstv => "SSTV decoder",
+        PluginSource::Ssdv => "SSDV decoder",
+    }
+}
+
+/// Pause or resume a decoder so it only sees frames for demod modes its
+/// manifest declares. An empty `demod_modes` list (older plugins) stays active
+/// in every mode.
+fn apply_plugin_mode(
+    event_tx: &EventSender,
+    source: PluginSource,
+    handle: &PluginHandle,
+    mode: DemodMode,
+) {
+    let should_be_active = handle.accepts_demod(mode.config_key());
+    if handle.set_active(should_be_active) == should_be_active {
+        return;
+    }
+    let label = plugin_label(source);
+    let message = if should_be_active {
+        format!("{label} resumed: demod is {}", format_demod(mode))
+    } else {
+        format!("{label} paused: demod is {}", format_demod(mode))
+    };
+    event_tx.best_effort(WorkerEvent::Info(message));
+}
 
 /// Worker thread entry point.
 ///
@@ -214,23 +244,29 @@ fn run_worker_inner(
         );
     }
 
+    let plugin_catalog = PluginCatalog::load(&event_tx);
     let mut plugin_handles: Vec<(PluginSource, PluginHandle)> = Vec::new();
     let mut plugin_sinks: Vec<Box<dyn Sink>> = Vec::new();
     if options.cw_enabled
-        && let Some((sink, handle)) = start_cw_plugin(&event_tx, options.cw_tone_hz)
+        && let Some((sink, handle)) =
+            start_cw_plugin(&plugin_catalog, &event_tx, options.cw_tone_hz)
     {
         plugin_sinks.push(Box::new(CwStartGateSink::new(sink)));
         plugin_handles.push((PluginSource::Cw, handle));
     }
     if options.sstv_enabled
-        && let Some((sink, handle)) =
-            start_sstv_plugin(&event_tx, options.sstv_output_dir.as_path())
+        && let Some((sink, handle)) = start_sstv_plugin(
+            &plugin_catalog,
+            &event_tx,
+            options.sstv_output_dir.as_path(),
+        )
     {
         plugin_sinks.push(Box::new(sink));
         plugin_handles.push((PluginSource::Sstv, handle));
     }
     if options.ssdv_enabled
         && let Some((sink, handle)) = start_ssdv_plugin(
+            &plugin_catalog,
             &event_tx,
             options.sstv_output_dir.as_path(),
             &options.ssdv_crc_inits,
@@ -240,6 +276,9 @@ fn run_worker_inner(
     {
         plugin_sinks.push(Box::new(sink));
         plugin_handles.push((PluginSource::Ssdv, handle));
+    }
+    for (source, handle) in &plugin_handles {
+        apply_plugin_mode(&event_tx, *source, handle, vfo.demod);
     }
 
     let (recorder_sink, recorder_handle) = RecorderSink::new();
@@ -342,6 +381,9 @@ fn run_worker_inner(
                                 "demod update failed: {error}"
                             )));
                         }
+                    }
+                    for (source, handle) in &plugin_handles {
+                        apply_plugin_mode(&event_tx, *source, handle, update.mode);
                     }
                 }
                 WorkerCommand::SetCwAfc(enabled) => {
