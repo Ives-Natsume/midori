@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::{any::Any, panic};
 
 use chrono::{Local, Utc};
 use crossbeam_channel::{Receiver, Sender, bounded};
@@ -17,9 +18,7 @@ use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
 
 use midori_config::{AppConfig, Colormap, DecoderTab, SourceKind, Theme};
-use midori_core::{
-    Channel, DemodMode, IqSource, Session, Sink, SourceConfig, StreamSpec, VfoConfig,
-};
+use midori_core::{Channel, DemodMode, IqSource, Session, Sink, SourceConfig, VfoConfig};
 use midori_dsp::median;
 use midori_engine::{
     CwStartGateSink, LiveSession, PluginHandle, PluginSink, RecorderSink, VfoChannel, plugin_sink,
@@ -34,6 +33,10 @@ use midori_source_libiio::LibiioSource;
 
 use crate::audio::{AudioOutput, AudioSink};
 use crate::sinks::{AutoTuneSink, AutoTuneState, SpectrumSink};
+use crate::worker_commands::{CommandSender, DemodUpdate, WorkerCommand};
+use crate::worker_events::{
+    EventReceiver, EventSender, PluginSource, WorkerEvent, accept_worker_event,
+};
 
 // ---------------------------------------------------------------------------
 // Worker messages
@@ -44,28 +47,6 @@ pub(crate) struct SpectrumFrame {
     pub(crate) frequencies_mhz: Vec<f32>,
     pub(crate) center_freq_hz: f64,
     pub(crate) sample_rate_hz: f64,
-}
-
-enum WorkerCommand {
-    SetFrequency(f64),
-    SetVfoOffset(f64),
-    SetGain(f64),
-    SetDemod(DemodUpdate),
-    SetCwAfc(bool),
-    AutoTune,
-    StartRecording(PathBuf),
-    StopRecording,
-    Stop,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct DemodUpdate {
-    mode: DemodMode,
-    bandwidth_hz: f64,
-    audio_bandwidth_hz: f64,
-    deemphasis_us: f64,
-    bfo_hz: f64,
-    channel_rate_hz: f64,
 }
 
 struct WorkerOptions {
@@ -89,46 +70,10 @@ enum WorkerSource {
     File { path: PathBuf, loop_file: bool },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PluginSource {
-    Cw,
-    Sstv,
-    Ssdv,
-}
-
 struct DopplerOptions {
     tle_path: PathBuf,
     grid: String,
     downlink_hz: f64,
-}
-
-enum WorkerEvent {
-    Connected(StreamSpec),
-    Info(String),
-    Error(String),
-    Fatal(String),
-    Doppler {
-        offset_hz: f64,
-        rate_hz_s: f64,
-    },
-    Plugin {
-        source: PluginSource,
-        event: PluginEvent,
-    },
-    VfoOffset {
-        offset_hz: f64,
-    },
-    AutoTuneDone {
-        offset_hz: Option<f64>,
-    },
-    FileEnded,
-    RecordingStarted(PathBuf),
-    RecordingError(String),
-    RecordingStopped {
-        path: PathBuf,
-        samples: u64,
-        seconds: f64,
-    },
 }
 
 // ---------------------------------------------------------------------------
@@ -141,9 +86,10 @@ pub struct MidoriApp {
     config_warning: Option<String>,
 
     data_rx: Option<Receiver<SpectrumFrame>>,
-    event_rx: Option<Receiver<WorkerEvent>>,
-    cmd_tx: Option<Sender<WorkerCommand>>,
+    event_rx: Option<EventReceiver>,
+    cmd_tx: Option<CommandSender>,
     worker: Option<JoinHandle<()>>,
+    worker_stopping: bool,
     stop_flag: Arc<AtomicBool>,
 
     current_spectrum: Vec<[f64; 2]>,
@@ -273,6 +219,7 @@ impl Default for MidoriApp {
             event_rx: None,
             cmd_tx: None,
             worker: None,
+            worker_stopping: false,
             stop_flag: Arc::new(AtomicBool::new(false)),
             current_spectrum: Vec::new(),
             center_freq_hz,
@@ -365,6 +312,20 @@ impl MidoriApp {
         if self.is_connected || self.is_connecting {
             return;
         }
+        if self.worker_stopping || self.worker.is_some() {
+            // A previous worker is still releasing the SDR, or has exited but
+            // has not had its final events drained yet. Starting another one
+            // now would make two threads touch the same hardware and could
+            // lose the shutdown output.
+            let message = if self.worker_stopping {
+                "previous worker is still stopping; try again"
+            } else {
+                "previous worker has not shut down yet; try again"
+            };
+            self.push_log(message);
+            self.error_msg = Some(message.to_string());
+            return;
+        }
         // `disconnect` clears the transient state, including the VFO offset.
         // Keep a file replay's initial offset across the implicit disconnect
         // so MIDORI_VFO / a previous file tuning still starts where expected.
@@ -443,8 +404,8 @@ impl MidoriApp {
         });
 
         let (data_tx, data_rx) = bounded(4);
-        let (event_tx, event_rx) = bounded(64);
-        let (cmd_tx, cmd_rx) = bounded(16);
+        let (event_tx, event_rx) = EventSender::new();
+        let (cmd_tx, cmd_rx) = CommandSender::new();
         let stop_flag = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop_flag);
         let options = WorkerOptions {
@@ -497,15 +458,21 @@ impl MidoriApp {
 
     fn disconnect(&mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
-        if let Some(tx) = &self.cmd_tx {
-            let _ = tx.try_send(WorkerCommand::Stop);
+        let stop_result = self.cmd_tx.as_ref().map(|tx| tx.send(WorkerCommand::Stop));
+        if let Some(Err(error)) = stop_result {
+            self.push_log(format!("stop command not delivered: {error}"));
         }
-        if let Some(handle) = self.worker.take() {
-            let _ = handle.join();
+        if self.worker.is_some() {
+            // Do not join or drop the receivers here. The worker's shutdown
+            // path still emits final plugin output and RecordingStopped; those
+            // are drained by `poll_worker_state` before the channels close.
+            self.worker_stopping = true;
+        } else {
+            self.worker_stopping = false;
+            self.data_rx = None;
+            self.event_rx = None;
+            self.cmd_tx = None;
         }
-        self.data_rx = None;
-        self.event_rx = None;
-        self.cmd_tx = None;
         self.is_connected = false;
         self.is_connecting = false;
         self.is_recording = false;
@@ -526,9 +493,64 @@ impl MidoriApp {
         self.status_msg = "Disconnected".to_string();
     }
 
+    /// Join a worker that has already exited, drain its final events, and
+    /// surface a worker that died without telling the UI (for example if its
+    /// panic message could not be delivered).
+    fn poll_worker_state(&mut self, ctx: &egui::Context) {
+        let Some(handle) = &self.worker else {
+            self.worker_stopping = false;
+            return;
+        };
+        if !handle.is_finished() {
+            return;
+        }
+
+        let handle = self.worker.take().expect("worker handle checked");
+        let _ = handle.join();
+
+        // The thread has ended, so no more events can be produced. Drain the
+        // shutdown output one last time while the receiver is still alive;
+        // this is where final plugin output and RecordingStopped are applied.
+        self.poll_events(ctx);
+
+        let was_stopping = self.worker_stopping;
+        self.worker_stopping = false;
+        self.data_rx = None;
+        self.event_rx = None;
+        self.cmd_tx = None;
+        self.is_recording = false;
+
+        if !was_stopping && (self.is_connected || self.is_connecting) {
+            let message = "worker stopped unexpectedly".to_string();
+            self.push_log(format!("fatal: {message}"));
+            self.error_msg = Some(message);
+            self.status_msg = "Device error".to_string();
+            self.is_connected = false;
+            self.is_connecting = false;
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Commands
     // -----------------------------------------------------------------------
+
+    /// Deliver a command to the worker, logging if the bounded queue is full
+    /// or the worker has gone away. The UI is the only producer and commands
+    /// are generated at human rates, so a short wait is preferable to silently
+    /// losing a retune or recording request.
+    fn send_command(&mut self, command: WorkerCommand) -> bool {
+        let result = self.cmd_tx.as_ref().map(|tx| tx.send(command));
+        match result {
+            None => false,
+            Some(Ok(())) => true,
+            Some(Err(error)) => {
+                let message = format!("command not delivered: {error}");
+                self.push_log(message.clone());
+                self.error_msg = Some(message);
+                false
+            }
+        }
+    }
 
     fn set_frequency_mhz(&mut self, mhz: f64) {
         if self.is_recording {
@@ -541,6 +563,13 @@ impl MidoriApp {
     }
 
     fn send_frequency(&mut self) {
+        if self.is_recording {
+            // Both the Enter key in the frequency field and the tuning
+            // buttons end up here, so the recording guard cannot be bypassed.
+            self.freq_input = format!("{:.6}", self.tuned_freq_hz() / 1e6);
+            self.error_msg = Some("stop recording before retuning".to_string());
+            return;
+        }
         let Ok(freq_mhz) = self.freq_input.parse::<f64>() else {
             self.error_msg = Some("invalid centre frequency".to_string());
             return;
@@ -550,23 +579,36 @@ impl MidoriApp {
         if self.is_file_source() && (self.is_connected || self.is_connecting) {
             let max_offset = (self.sample_rate_hz / 2.0 - self.demod_bandwidth_hz() / 2.0).max(0.0);
             let offset = (hz - self.center_freq_hz).clamp(-max_offset, max_offset);
+            let previous_offset = self.vfo_offset_hz;
             self.vfo_offset_hz = offset;
             self.freq_input = format!("{:.6}", (self.center_freq_hz + offset) / 1e6);
-            if let Some(tx) = &self.cmd_tx {
-                let _ = tx.try_send(WorkerCommand::SetVfoOffset(offset));
+            if !self.send_command(WorkerCommand::SetTuning {
+                frequency_hz: None,
+                vfo_offset_hz: offset,
+            }) {
+                self.vfo_offset_hz = previous_offset;
+                self.freq_input = format!("{:.6}", self.tuned_freq_hz() / 1e6);
             }
             return;
         }
 
+        let previous_center = self.center_freq_hz;
+        let previous_offset = self.vfo_offset_hz;
         self.center_freq_hz = hz;
         // A hardware retune starts with a fresh digital VFO. This also clears
         // any AFC correction from the previous frequency.
         self.vfo_offset_hz = 0.0;
-        if (self.is_connected || self.is_connecting)
-            && let Some(tx) = &self.cmd_tx
-        {
-            let _ = tx.try_send(WorkerCommand::SetVfoOffset(0.0));
-            let _ = tx.try_send(WorkerCommand::SetFrequency(hz));
+        if self.is_connected || self.is_connecting {
+            // Offset reset and hardware retune travel as one atomic command so
+            // the worker cannot apply only half of the change.
+            if !self.send_command(WorkerCommand::SetTuning {
+                frequency_hz: Some(hz),
+                vfo_offset_hz: 0.0,
+            }) {
+                self.center_freq_hz = previous_center;
+                self.vfo_offset_hz = previous_offset;
+                self.freq_input = format!("{:.6}", self.tuned_freq_hz() / 1e6);
+            }
         }
     }
 
@@ -575,9 +617,7 @@ impl MidoriApp {
             self.error_msg = Some("invalid gain".to_string());
             return;
         };
-        if let Some(tx) = &self.cmd_tx {
-            let _ = tx.try_send(WorkerCommand::SetGain(gain_db));
-        }
+        self.send_command(WorkerCommand::SetGain(gain_db));
     }
 
     fn send_demod_update(&mut self) {
@@ -591,11 +631,7 @@ impl MidoriApp {
             bfo_hz: params.bfo_hz,
             channel_rate_hz: params.channel_rate_hz,
         };
-        if let Some(tx) = &self.cmd_tx
-            && tx.try_send(WorkerCommand::SetDemod(update)).is_err()
-        {
-            self.error_msg = Some("could not send demod update".to_string());
-        }
+        self.send_command(WorkerCommand::SetDemod(update));
     }
 
     fn mark_demod_dirty(&mut self) {
@@ -604,9 +640,7 @@ impl MidoriApp {
     }
 
     fn send_cw_afc(&mut self) {
-        if let Some(tx) = &self.cmd_tx {
-            let _ = tx.try_send(WorkerCommand::SetCwAfc(self.cw_afc));
-        }
+        self.send_command(WorkerCommand::SetCwAfc(self.cw_afc));
     }
 
     fn start_auto_tune(&mut self) {
@@ -619,11 +653,8 @@ impl MidoriApp {
             self.auto_tune_span_khz()
         );
         self.auto_tune_failed = false;
-        if let Some(tx) = &self.cmd_tx
-            && tx.try_send(WorkerCommand::AutoTune).is_err()
-        {
+        if !self.send_command(WorkerCommand::AutoTune) {
             self.auto_tune_status = "could not start the scan".to_string();
-            self.error_msg = Some(self.auto_tune_status.clone());
         }
     }
 
@@ -657,19 +688,14 @@ impl MidoriApp {
         self.is_recording = true;
         self.recording_path = Some(path.clone());
         self.status_msg = "Starting recording...".to_string();
-        if let Some(tx) = &self.cmd_tx
-            && tx.try_send(WorkerCommand::StartRecording(path)).is_err()
-        {
+        if !self.send_command(WorkerCommand::StartRecording(path)) {
             self.is_recording = false;
             self.recording_path = None;
-            self.error_msg = Some("could not send recording command".to_string());
         }
     }
 
     fn stop_recording(&mut self) {
-        if let Some(tx) = &self.cmd_tx {
-            let _ = tx.try_send(WorkerCommand::StopRecording);
-        }
+        self.send_command(WorkerCommand::StopRecording);
     }
 
     fn save_config(&mut self) {
@@ -868,13 +894,17 @@ impl MidoriApp {
         let events: Vec<WorkerEvent> = {
             let Some(rx) = &self.event_rx else { return };
             let mut events = Vec::new();
-            while let Ok(event) = rx.try_recv() {
+            while let Some(event) = rx.try_recv() {
                 events.push(event);
             }
             events
         };
 
         for event in events {
+            if !accept_worker_event(self.worker_stopping, &event) {
+                self.push_log("ignored a late Connected event while stopping");
+                continue;
+            }
             match event {
                 WorkerEvent::Connected(spec) => {
                     self.is_connecting = false;
@@ -923,9 +953,9 @@ impl MidoriApp {
                     self.push_log(format!("fatal: {message}"));
                     self.error_msg = Some(message);
                     self.status_msg = "Device error".to_string();
-                    if let Some(handle) = self.worker.take() {
-                        let _ = handle.join();
-                    }
+                    // The worker is unwinding. Let `poll_worker_state` join it
+                    // instead of blocking the UI on plugin/source teardown.
+                    self.worker_stopping = true;
                 }
                 WorkerEvent::FileEnded => {
                     self.is_connected = false;
@@ -1798,7 +1828,13 @@ impl MidoriApp {
                 ui.heading("Radio");
                 ui.separator();
 
-                if self.is_connected || self.is_connecting {
+                if self.worker_stopping {
+                    ui.add_enabled(
+                        false,
+                        egui::Button::new("Stopping worker...")
+                            .min_size(egui::vec2(ui.available_width(), 30.0)),
+                    );
+                } else if self.is_connected || self.is_connecting {
                     if ui
                         .add_sized(
                             [ui.available_width(), 30.0],
@@ -2703,6 +2739,7 @@ impl eframe::App for MidoriApp {
         }
 
         self.poll_events(ctx);
+        self.poll_worker_state(ctx);
         self.poll_data(ctx);
         self.handle_keyboard(ctx);
 
@@ -2714,7 +2751,7 @@ impl eframe::App for MidoriApp {
             self.send_demod_update();
         }
 
-        if self.is_connected || self.is_connecting {
+        if self.is_connected || self.is_connecting || self.worker_stopping {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
 
@@ -2730,6 +2767,11 @@ impl eframe::App for MidoriApp {
 impl Drop for MidoriApp {
     fn drop(&mut self) {
         self.disconnect();
+        // At exit it is fine to wait for the worker: Stop was already sent and
+        // the stop flag is set, so this only covers plugin/source teardown.
+        if let Some(handle) = self.worker.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -2752,12 +2794,9 @@ fn cw_plugin_path() -> Option<PathBuf> {
     path.exists().then_some(path)
 }
 
-fn start_cw_plugin(
-    event_tx: &Sender<WorkerEvent>,
-    tone_hz: f64,
-) -> Option<(PluginSink, PluginHandle)> {
+fn start_cw_plugin(event_tx: &EventSender, tone_hz: f64) -> Option<(PluginSink, PluginHandle)> {
     let Some(path) = cw_plugin_path() else {
-        let _ = event_tx.try_send(WorkerEvent::Error(
+        event_tx.best_effort(WorkerEvent::Error(
             "CW plugin binary not found; build the workspace first".to_string(),
         ));
         return None;
@@ -2779,12 +2818,12 @@ fn start_cw_plugin(
     let mut plugin = match SidecarPlugin::new(manifest) {
         Ok(plugin) => plugin,
         Err(error) => {
-            let _ = event_tx.try_send(WorkerEvent::Error(format!("CW plugin manifest: {error}")));
+            event_tx.best_effort(WorkerEvent::Error(format!("CW plugin manifest: {error}")));
             return None;
         }
     };
     if let Err(error) = plugin.start() {
-        let _ = event_tx.try_send(WorkerEvent::Error(format!("CW plugin start: {error}")));
+        event_tx.best_effort(WorkerEvent::Error(format!("CW plugin start: {error}")));
         return None;
     }
     if let Err(error) = plugin.configure(&serde_json::json!({
@@ -2795,7 +2834,7 @@ fn start_cw_plugin(
         "start_at_signal": true,
     })) {
         let _ = plugin.stop();
-        let _ = event_tx.try_send(WorkerEvent::Error(format!("CW plugin configure: {error}")));
+        event_tx.best_effort(WorkerEvent::Error(format!("CW plugin configure: {error}")));
         return None;
     }
 
@@ -2819,11 +2858,11 @@ fn sstv_plugin_path() -> Option<PathBuf> {
 }
 
 fn start_sstv_plugin(
-    event_tx: &Sender<WorkerEvent>,
+    event_tx: &EventSender,
     output_dir: &Path,
 ) -> Option<(PluginSink, PluginHandle)> {
     let Some(path) = sstv_plugin_path() else {
-        let _ = event_tx.try_send(WorkerEvent::Error(
+        event_tx.best_effort(WorkerEvent::Error(
             "SSTV plugin binary not found; build the workspace first".to_string(),
         ));
         return None;
@@ -2845,19 +2884,19 @@ fn start_sstv_plugin(
     let mut plugin = match SidecarPlugin::new(manifest) {
         Ok(plugin) => plugin,
         Err(error) => {
-            let _ = event_tx.try_send(WorkerEvent::Error(format!("SSTV plugin manifest: {error}")));
+            event_tx.best_effort(WorkerEvent::Error(format!("SSTV plugin manifest: {error}")));
             return None;
         }
     };
     if let Err(error) = plugin.start() {
-        let _ = event_tx.try_send(WorkerEvent::Error(format!("SSTV plugin start: {error}")));
+        event_tx.best_effort(WorkerEvent::Error(format!("SSTV plugin start: {error}")));
         return None;
     }
     if let Err(error) = plugin.configure(&serde_json::json!({
         "output_dir": output_dir.display().to_string(),
     })) {
         let _ = plugin.stop();
-        let _ = event_tx.try_send(WorkerEvent::Error(format!(
+        event_tx.best_effort(WorkerEvent::Error(format!(
             "SSTV plugin configure: {error}"
         )));
         return None;
@@ -2883,14 +2922,14 @@ fn ssdv_plugin_path() -> Option<PathBuf> {
 }
 
 fn start_ssdv_plugin(
-    event_tx: &Sender<WorkerEvent>,
+    event_tx: &EventSender,
     output_dir: &Path,
     crc_inits: &[String],
     frame_header_len: usize,
     audio_if: bool,
 ) -> Option<(PluginSink, PluginHandle)> {
     let Some(path) = ssdv_plugin_path() else {
-        let _ = event_tx.try_send(WorkerEvent::Error(
+        event_tx.best_effort(WorkerEvent::Error(
             "SSDV plugin binary not found; build the workspace first".to_string(),
         ));
         return None;
@@ -2920,12 +2959,12 @@ fn start_ssdv_plugin(
     let mut plugin = match SidecarPlugin::new(manifest) {
         Ok(plugin) => plugin,
         Err(error) => {
-            let _ = event_tx.try_send(WorkerEvent::Error(format!("SSDV plugin manifest: {error}")));
+            event_tx.best_effort(WorkerEvent::Error(format!("SSDV plugin manifest: {error}")));
             return None;
         }
     };
     if let Err(error) = plugin.start() {
-        let _ = event_tx.try_send(WorkerEvent::Error(format!("SSDV plugin start: {error}")));
+        event_tx.best_effort(WorkerEvent::Error(format!("SSDV plugin start: {error}")));
         return None;
     }
     if let Err(error) = plugin.configure(&serde_json::json!({
@@ -2935,7 +2974,7 @@ fn start_ssdv_plugin(
         "frame_header_len": frame_header_len,
     })) {
         let _ = plugin.stop();
-        let _ = event_tx.try_send(WorkerEvent::Error(format!(
+        event_tx.best_effort(WorkerEvent::Error(format!(
             "SSDV plugin configure: {error}"
         )));
         return None;
@@ -2947,12 +2986,12 @@ fn start_ssdv_plugin(
 
 fn build_doppler(
     options: &DopplerOptions,
-    event_tx: &Sender<WorkerEvent>,
+    event_tx: &EventSender,
 ) -> Option<Box<dyn midori_core::DopplerSource>> {
     let tle = match Tle::from_file(&options.tle_path) {
         Ok(tle) => tle,
         Err(error) => {
-            let _ = event_tx.try_send(WorkerEvent::Error(format!(
+            event_tx.best_effort(WorkerEvent::Error(format!(
                 "Doppler: could not load TLE {}: {error}",
                 options.tle_path.display()
             )));
@@ -2962,7 +3001,7 @@ fn build_doppler(
     let grid = match GridSquare::parse(&options.grid) {
         Ok(grid) => grid,
         Err(error) => {
-            let _ = event_tx.try_send(WorkerEvent::Error(format!(
+            event_tx.best_effort(WorkerEvent::Error(format!(
                 "Doppler: invalid grid '{}': {error}",
                 options.grid
             )));
@@ -2972,13 +3011,13 @@ fn build_doppler(
     let predictor = match PassPredictor::new(&tle, grid.observer(0.0)) {
         Ok(predictor) => predictor,
         Err(error) => {
-            let _ = event_tx.try_send(WorkerEvent::Error(format!(
+            event_tx.best_effort(WorkerEvent::Error(format!(
                 "Doppler: SGP4 setup failed: {error}"
             )));
             return None;
         }
     };
-    let _ = event_tx.try_send(WorkerEvent::Info(format!(
+    event_tx.best_effort(WorkerEvent::Info(format!(
         "Doppler: tracking {} at {:.6} MHz",
         tle.name
             .clone()
@@ -2988,12 +3027,49 @@ fn build_doppler(
     Some(Box::new(Sgp4Doppler::new(predictor, options.downlink_hz)))
 }
 
+const MAX_PLUGIN_EVENTS_PER_STEP: usize = 64;
+
+/// Worker thread entry point.
+///
+/// The real loop lives in [`run_worker_inner`]; catching panics here guarantees
+/// that the UI receives a terminal `Fatal` event instead of remaining
+/// "connected" to a thread that has already died.
 fn run_worker(
+    config: SourceConfig,
+    vfo: VfoConfig,
+    options: WorkerOptions,
+    data_tx: Sender<SpectrumFrame>,
+    event_tx: EventSender,
+    cmd_rx: Receiver<WorkerCommand>,
+    stop: Arc<AtomicBool>,
+) {
+    let panic_tx = event_tx.clone();
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(move || {
+        run_worker_inner(config, vfo, options, data_tx, event_tx, cmd_rx, stop);
+    }));
+    if let Err(payload) = result {
+        let message = panic_message(payload.as_ref());
+        eprintln!("[worker] panicked: {message}");
+        panic_tx.critical(WorkerEvent::Fatal(format!("worker panicked: {message}")));
+    }
+}
+
+fn panic_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
+fn run_worker_inner(
     config: SourceConfig,
     mut vfo: VfoConfig,
     options: WorkerOptions,
     data_tx: Sender<SpectrumFrame>,
-    event_tx: Sender<WorkerEvent>,
+    event_tx: EventSender,
     cmd_rx: Receiver<WorkerCommand>,
     stop: Arc<AtomicBool>,
 ) {
@@ -3002,13 +3078,13 @@ fn run_worker(
             Ok(source) => Box::new(source),
             Err(error) => {
                 eprintln!("[worker] connect failed: {error}");
-                let _ = event_tx.try_send(WorkerEvent::Fatal(format!("connect failed: {error}")));
+                event_tx.critical(WorkerEvent::Fatal(format!("connect failed: {error}")));
                 return;
             }
         },
         WorkerSource::File { path, loop_file } => match WavIqSource::open(path, *loop_file) {
             Ok(source) => {
-                let _ = event_tx.try_send(WorkerEvent::Info(format!(
+                event_tx.best_effort(WorkerEvent::Info(format!(
                     "file: {} | {} ch | {:.3} MSPS | {:.1} s{}",
                     path.display(),
                     source.file_spec().channels,
@@ -3020,7 +3096,7 @@ fn run_worker(
             }
             Err(error) => {
                 eprintln!("[worker] file open failed: {error}");
-                let _ = event_tx.try_send(WorkerEvent::Fatal(format!("file open failed: {error}")));
+                event_tx.critical(WorkerEvent::Fatal(format!("file open failed: {error}")));
                 return;
             }
         },
@@ -3036,7 +3112,7 @@ fn run_worker(
         Ok((output, producer)) => (Some(output), Some(producer)),
         Err(error) => {
             eprintln!("[worker] audio unavailable: {error}");
-            let _ = event_tx.try_send(WorkerEvent::Error(format!("audio unavailable: {error}")));
+            event_tx.best_effort(WorkerEvent::Error(format!("audio unavailable: {error}")));
             (None, None)
         }
     };
@@ -3111,12 +3187,12 @@ fn run_worker(
 
     if let Err(error) = session.start() {
         eprintln!("[worker] start failed: {error}");
-        let _ = event_tx.try_send(WorkerEvent::Fatal(format!("start failed: {error}")));
+        event_tx.critical(WorkerEvent::Fatal(format!("start failed: {error}")));
         return;
     }
 
     let Some(spec) = session.current_spec() else {
-        let _ = event_tx.try_send(WorkerEvent::Fatal("session has no stream spec".to_string()));
+        event_tx.critical(WorkerEvent::Fatal("session has no stream spec".to_string()));
         return;
     };
     eprintln!(
@@ -3129,7 +3205,7 @@ fn run_worker(
             "without"
         }
     );
-    let _ = event_tx.try_send(WorkerEvent::Connected(spec));
+    event_tx.critical(WorkerEvent::Connected(spec));
 
     let mut plugin_events = 0u64;
     let track_doppler = doppler_active;
@@ -3140,33 +3216,28 @@ fn run_worker(
     while !stop.load(Ordering::SeqCst) {
         while let Ok(command) = cmd_rx.try_recv() {
             match command {
-                WorkerCommand::SetFrequency(hz) => {
+                WorkerCommand::SetTuning {
+                    frequency_hz,
+                    vfo_offset_hz,
+                } => {
                     if recorder_handle.is_recording() {
-                        let _ = event_tx.try_send(WorkerEvent::Error(
+                        event_tx.best_effort(WorkerEvent::Error(
                             "stop recording before retuning".to_string(),
                         ));
                         continue;
                     }
-                    if let Err(error) = session.set_frequency(hz) {
-                        let _ =
-                            event_tx.try_send(WorkerEvent::Error(format!("tune failed: {error}")));
+                    session.set_vfo_offset(vfo_offset_hz);
+                    vfo.offset_hz = vfo_offset_hz;
+                    last_vfo_offset = vfo_offset_hz;
+                    if let Some(hz) = frequency_hz
+                        && let Err(error) = session.set_frequency(hz)
+                    {
+                        event_tx.best_effort(WorkerEvent::Error(format!("tune failed: {error}")));
                     }
-                }
-                WorkerCommand::SetVfoOffset(offset) => {
-                    if recorder_handle.is_recording() {
-                        let _ = event_tx.try_send(WorkerEvent::Error(
-                            "stop recording before retuning".to_string(),
-                        ));
-                        continue;
-                    }
-                    session.set_vfo_offset(offset);
-                    vfo.offset_hz = offset;
-                    last_vfo_offset = offset;
                 }
                 WorkerCommand::SetGain(db) => {
                     if let Err(error) = session.set_gain(db) {
-                        let _ =
-                            event_tx.try_send(WorkerEvent::Error(format!("gain failed: {error}")));
+                        event_tx.best_effort(WorkerEvent::Error(format!("gain failed: {error}")));
                     }
                 }
                 WorkerCommand::SetDemod(update) => {
@@ -3179,14 +3250,14 @@ fn run_worker(
                     vfo.offset_hz = session.vfo_offset_hz();
                     match session.reconfigure_vfo(vfo.clone()) {
                         Ok(()) => {
-                            let _ = event_tx.try_send(WorkerEvent::Info(format!(
+                            event_tx.best_effort(WorkerEvent::Info(format!(
                                 "demod {} · RF BW {:.1} kHz",
                                 format_demod(update.mode),
                                 update.bandwidth_hz / 1e3
                             )));
                         }
                         Err(error) => {
-                            let _ = event_tx.try_send(WorkerEvent::Error(format!(
+                            event_tx.best_effort(WorkerEvent::Error(format!(
                                 "demod update failed: {error}"
                             )));
                         }
@@ -3195,36 +3266,36 @@ fn run_worker(
                 WorkerCommand::SetCwAfc(enabled) => {
                     cw_afc_enabled = enabled;
                     session.set_afc(enabled);
-                    let _ = event_tx.try_send(WorkerEvent::Info(format!(
+                    event_tx.best_effort(WorkerEvent::Info(format!(
                         "CW AFC {}",
                         if enabled { "enabled" } else { "disabled" }
                     )));
                 }
                 WorkerCommand::AutoTune => {
                     if recorder_handle.is_recording() {
-                        let _ = event_tx.try_send(WorkerEvent::Error(
+                        event_tx.best_effort(WorkerEvent::Error(
                             "stop recording before auto tuning".to_string(),
                         ));
                     } else {
                         *auto_tune_state.lock().unwrap() = AutoTuneState::Scanning;
-                        let _ = event_tx.try_send(WorkerEvent::Info(
+                        event_tx.best_effort(WorkerEvent::Info(
                             "auto tune: scanning 4 s for a narrowband carrier".to_string(),
                         ));
                     }
                 }
                 WorkerCommand::StartRecording(path) => {
                     let Some(spec) = session.current_spec() else {
-                        let _ = event_tx.try_send(WorkerEvent::RecordingError(
+                        event_tx.critical(WorkerEvent::RecordingError(
                             "session has no stream spec".to_string(),
                         ));
                         continue;
                     };
                     match recorder_handle.start(path.clone(), spec) {
                         Ok(()) => {
-                            let _ = event_tx.try_send(WorkerEvent::RecordingStarted(path));
+                            event_tx.critical(WorkerEvent::RecordingStarted(path));
                         }
                         Err(error) => {
-                            let _ = event_tx.try_send(WorkerEvent::RecordingError(format!(
+                            event_tx.critical(WorkerEvent::RecordingError(format!(
                                 "could not start recording: {error}"
                             )));
                         }
@@ -3232,7 +3303,7 @@ fn run_worker(
                 }
                 WorkerCommand::StopRecording => match recorder_handle.stop() {
                     Ok(Some(info)) => {
-                        let _ = event_tx.try_send(WorkerEvent::RecordingStopped {
+                        event_tx.critical(WorkerEvent::RecordingStopped {
                             path: info.path,
                             samples: info.samples,
                             seconds: info.seconds,
@@ -3240,7 +3311,7 @@ fn run_worker(
                     }
                     Ok(None) => {}
                     Err(error) => {
-                        let _ = event_tx.try_send(WorkerEvent::RecordingError(format!(
+                        event_tx.critical(WorkerEvent::RecordingError(format!(
                             "recording finalise failed: {error}"
                         )));
                     }
@@ -3257,14 +3328,18 @@ fn run_worker(
         }
 
         if session.source_finished() {
-            let _ = event_tx.try_send(WorkerEvent::FileEnded);
+            event_tx.critical(WorkerEvent::FileEnded);
             break;
         }
 
         if let Err(error) = session.step() {
             eprintln!("[worker] receive failed: {error}");
-            let _ = event_tx.try_send(WorkerEvent::Fatal(format!("receive failed: {error}")));
+            event_tx.critical(WorkerEvent::Fatal(format!("receive failed: {error}")));
             break;
+        }
+        for error in session.take_sink_errors() {
+            eprintln!("[worker] {error}");
+            event_tx.critical(WorkerEvent::Error(error));
         }
 
         let tune_result = {
@@ -3284,9 +3359,9 @@ fn run_worker(
                 vfo.offset_hz = offset;
                 last_vfo_offset = offset;
                 last_vfo_event = Some(Instant::now());
-                let _ = event_tx.try_send(WorkerEvent::VfoOffset { offset_hz: offset });
+                event_tx.best_effort(WorkerEvent::VfoOffset { offset_hz: offset });
             }
-            let _ = event_tx.try_send(WorkerEvent::AutoTuneDone { offset_hz: result });
+            event_tx.critical(WorkerEvent::AutoTuneDone { offset_hz: result });
         }
 
         let offset = session.vfo_offset_hz();
@@ -3297,7 +3372,7 @@ fn run_worker(
             last_vfo_offset = offset;
             last_vfo_event = Some(Instant::now());
             vfo.offset_hz = offset;
-            let _ = event_tx.try_send(WorkerEvent::VfoOffset { offset_hz: offset });
+            event_tx.best_effort(WorkerEvent::VfoOffset { offset_hz: offset });
         }
 
         if track_doppler {
@@ -3306,7 +3381,7 @@ fn run_worker(
                 .is_none_or(|last| now.duration_since(last) >= Duration::from_millis(500));
             if due {
                 last_doppler_event = Some(now);
-                let _ = event_tx.try_send(WorkerEvent::Doppler {
+                event_tx.best_effort(WorkerEvent::Doppler {
                     offset_hz: session.doppler_hz(),
                     rate_hz_s: session.doppler_rate_hz_s(),
                 });
@@ -3314,26 +3389,35 @@ fn run_worker(
         }
 
         if let Some(error) = recorder_handle.take_error() {
-            let _ = event_tx.try_send(WorkerEvent::RecordingError(error));
+            event_tx.critical(WorkerEvent::RecordingError(error));
         }
 
-        for (source, handle) in &plugin_handles {
+        event_tx.report_drops();
+
+        let mut forwarded_events = 0usize;
+        'plugins: for (source, handle) in &plugin_handles {
             loop {
+                if forwarded_events >= MAX_PLUGIN_EVENTS_PER_STEP {
+                    // Leave the remaining events queued so this step can still
+                    // run the SDR session; the next iteration picks them up.
+                    break 'plugins;
+                }
                 match handle.try_recv() {
                     Ok(Some(event)) => {
                         if plugin_events == 0 {
                             eprintln!("[plugin] first event");
                         }
                         plugin_events += 1;
-                        let _ = event_tx.try_send(WorkerEvent::Plugin {
+                        forwarded_events += 1;
+                        event_tx.best_effort(WorkerEvent::Plugin {
                             source: *source,
                             event,
                         });
                     }
                     Ok(None) => break,
                     Err(error) => {
-                        let _ = event_tx
-                            .try_send(WorkerEvent::Error(format!("plugin {source:?}: {error}")));
+                        event_tx
+                            .best_effort(WorkerEvent::Error(format!("plugin {source:?}: {error}")));
                         break;
                     }
                 }
@@ -3345,26 +3429,30 @@ fn run_worker(
         match handle.stop() {
             Ok(events) => {
                 for event in events {
-                    let _ = event_tx.try_send(WorkerEvent::Plugin {
+                    // Final decoder output (last CW text, completed images) is
+                    // shown while the user is disconnecting, so it must use the
+                    // non-lossy control path.
+                    event_tx.critical(WorkerEvent::Plugin {
                         source: *source,
                         event,
                     });
                 }
             }
             Err(error) => {
-                let _ =
-                    event_tx.try_send(WorkerEvent::Error(format!("plugin {source:?}: {error}")));
+                event_tx.critical(WorkerEvent::Error(format!("plugin {source:?}: {error}")));
             }
         }
     }
     if let Ok(Some(info)) = recorder_handle.stop() {
-        let _ = event_tx.try_send(WorkerEvent::RecordingStopped {
+        event_tx.critical(WorkerEvent::RecordingStopped {
             path: info.path,
             samples: info.samples,
             seconds: info.seconds,
         });
     }
-    let _ = session.stop();
+    if let Err(error) = session.stop() {
+        event_tx.critical(WorkerEvent::Error(format!("session stop: {error:#}")));
+    }
     eprintln!("[worker] stopped");
 }
 
