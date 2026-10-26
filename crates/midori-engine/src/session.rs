@@ -17,7 +17,7 @@ pub struct LiveSession {
     config: SourceConfig,
     source: Box<dyn IqSource>,
     channels: Vec<Box<dyn Channel>>,
-    sinks: Vec<Box<dyn Sink>>,
+    sinks: Vec<SinkSlot>,
     doppler: Option<Box<dyn DopplerSource>>,
     doppler_hz: f64,
     doppler_rate_hz_s: f64,
@@ -25,6 +25,15 @@ pub struct LiveSession {
     seq: u64,
     stats: SessionStats,
     frames: Vec<Frame>,
+    sink_errors: Vec<String>,
+}
+
+/// One sink plus its health. A sink that returns an error from `on_frame` is
+/// disabled instead of aborting the session: a broken decoder bridge or audio
+/// device must not kill the receiver for every other consumer.
+struct SinkSlot {
+    sink: Box<dyn Sink>,
+    enabled: bool,
 }
 
 impl LiveSession {
@@ -38,7 +47,13 @@ impl LiveSession {
             config,
             source,
             channels,
-            sinks,
+            sinks: sinks
+                .into_iter()
+                .map(|sink| SinkSlot {
+                    sink,
+                    enabled: true,
+                })
+                .collect(),
             doppler: None,
             doppler_hz: 0.0,
             doppler_rate_hz_s: 0.0,
@@ -46,6 +61,42 @@ impl LiveSession {
             seq: 0,
             stats: SessionStats::default(),
             frames: Vec::new(),
+            sink_errors: Vec::new(),
+        }
+    }
+
+    /// Drain the errors reported by sinks that were disabled after an
+    /// `on_frame` failure. Call this from the UI/driver loop and surface the
+    /// messages to the user; the session itself keeps running.
+    ///
+    /// The returned strings identify the sink by its position in the sink list
+    /// and include the underlying error.
+    pub fn take_sink_errors(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.sink_errors)
+    }
+
+    /// Deliver one frame to every enabled sink. A sink that errors is disabled
+    /// and recorded in `sink_errors`; the remaining sinks still receive the
+    /// frame. Frames skipped for already-disabled sinks increment
+    /// [`SessionStats::dropped`].
+    fn deliver(&mut self, frame: &Frame) {
+        let Self {
+            sinks,
+            sink_errors,
+            stats,
+            ..
+        } = self;
+        for (index, slot) in sinks.iter_mut().enumerate() {
+            if !slot.enabled {
+                stats.dropped += 1;
+                continue;
+            }
+            if let Err(error) = slot.sink.on_frame(frame.clone()) {
+                slot.enabled = false;
+                sink_errors.push(format!(
+                    "sink #{index} disabled after frame error: {error:#}"
+                ));
+            }
         }
     }
 
@@ -120,9 +171,15 @@ impl LiveSession {
 
     /// Rebuild every channel in place after a demod/bandwidth change, keeping
     /// the source and sinks running.
+    ///
+    /// Errors when the session has not started yet: without a stream spec the
+    /// channels cannot be rebuilt, and returning `Ok` would make the caller
+    /// believe the new configuration was applied. The session deliberately
+    /// does not queue a pending configuration; construct the channels with the
+    /// desired config, or reconfigure after `start`.
     pub fn reconfigure_vfo(&mut self, config: VfoConfig) -> Result<()> {
         let Some(spec) = self.spec else {
-            return Ok(());
+            anyhow::bail!("cannot reconfigure a VFO before the session has started");
         };
         for channel in &mut self.channels {
             channel.reconfigure(config.clone(), &spec)?;
@@ -180,6 +237,12 @@ impl Session for LiveSession {
         self.update_nominal_frequency(spec.center_freq_hz);
         self.stats = SessionStats::default();
         self.seq = 0;
+        // A new run gives every sink (including ones disabled by an earlier
+        // error) a fresh chance.
+        self.sink_errors.clear();
+        for slot in &mut self.sinks {
+            slot.enabled = true;
+        }
         Ok(())
     }
 
@@ -192,9 +255,7 @@ impl Session for LiveSession {
         // Fan the raw IQ out first: recorder, waterfall, IQ plugins.
         let iq_frame = block.clone().into_frame(self.seq);
         self.seq += 1;
-        for sink in &mut self.sinks {
-            sink.on_frame(iq_frame.clone())?;
-        }
+        self.deliver(&iq_frame);
 
         // Compute the correction once per block, then hand it to every VFO.
         // Updating NCO phase increments (not phase) keeps the mixers
@@ -216,21 +277,42 @@ impl Session for LiveSession {
 
         let mut frames = std::mem::take(&mut self.frames);
         self.stats.frames += frames.len() as u64;
-        for frame in frames.drain(..) {
-            for sink in &mut self.sinks {
-                sink.on_frame(frame.clone())?;
-            }
+        for frame in &frames {
+            self.deliver(frame);
         }
+        frames.clear();
         self.frames = frames;
 
         Ok(self.stats)
     }
 
+    /// Flush every enabled sink and stop the source, always attempting both.
+    ///
+    /// The first sink flush error is returned unless the source itself fails
+    /// to stop, in which case the source error takes precedence and the sink
+    /// error is attached as context. Disabled sinks are not flushed.
     fn stop(&mut self) -> Result<()> {
-        for sink in &mut self.sinks {
-            sink.flush()?;
+        let mut first_sink_error: Option<anyhow::Error> = None;
+        for slot in &mut self.sinks {
+            if !slot.enabled {
+                continue;
+            }
+            if let Err(error) = slot.sink.flush()
+                && first_sink_error.is_none()
+            {
+                first_sink_error = Some(error);
+            }
         }
-        self.source.stop()
+
+        let source_result = self.source.stop();
+        match (source_result, first_sink_error) {
+            (Ok(()), None) => Ok(()),
+            (Ok(()), Some(error)) => Err(error),
+            (Err(error), None) => Err(error),
+            (Err(error), Some(sink_error)) => {
+                Err(error.context(format!("sink flush also failed: {sink_error:#}")))
+            }
+        }
     }
 }
 
@@ -245,7 +327,7 @@ fn now_ns() -> u64 {
 mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use midori_core::{
         BlockFlags, Channel, DemodMode, FrameMeta, IqBlock, IqSource, Sample, SampleFormat,
@@ -257,6 +339,7 @@ mod tests {
     struct MockSource {
         spec: StreamSpec,
         remaining: usize,
+        stop_called: Option<Arc<AtomicBool>>,
     }
 
     impl IqSource for MockSource {
@@ -301,6 +384,13 @@ mod tests {
         }
 
         fn set_gain(&mut self, _db: f64) -> Result<()> {
+            Ok(())
+        }
+
+        fn stop(&mut self) -> Result<()> {
+            if let Some(called) = &self.stop_called {
+                called.store(true, Ordering::SeqCst);
+            }
             Ok(())
         }
     }
@@ -356,6 +446,28 @@ mod tests {
         }
     }
 
+    /// Fails every frame; used to check that one broken sink does not take the
+    /// session down with it.
+    struct FailingSink;
+
+    impl Sink for FailingSink {
+        fn on_frame(&mut self, _frame: Frame) -> Result<()> {
+            anyhow::bail!("decoder bridge is down")
+        }
+    }
+
+    struct FlushFailingSink;
+
+    impl Sink for FlushFailingSink {
+        fn on_frame(&mut self, _frame: Frame) -> Result<()> {
+            Ok(())
+        }
+
+        fn flush(&mut self) -> Result<()> {
+            anyhow::bail!("flush failed")
+        }
+    }
+
     struct DopplerRecordingChannel {
         config: VfoConfig,
         seen: Arc<Mutex<Vec<(f64, f64)>>>,
@@ -384,7 +496,11 @@ mod tests {
             format: SampleFormat::Cf32Le,
             full_scale: 1.0,
         };
-        let source = MockSource { spec, remaining: 2 };
+        let source = MockSource {
+            spec,
+            remaining: 2,
+            stop_called: None,
+        };
         let channel = TestChannel {
             config: VfoConfig::new(1, 0.0, 200_000.0, DemodMode::Fm),
         };
@@ -423,7 +539,11 @@ mod tests {
             format: SampleFormat::Cf32Le,
             full_scale: 1.0,
         };
-        let source = MockSource { spec, remaining: 2 };
+        let source = MockSource {
+            spec,
+            remaining: 2,
+            stop_called: None,
+        };
         let seen = Arc::new(Mutex::new(Vec::new()));
         let channel = DopplerRecordingChannel {
             config: VfoConfig::new(0, 0.0, 15_000.0, DemodMode::Fm),
@@ -448,6 +568,137 @@ mod tests {
         assert_eq!(
             seen.lock().unwrap().as_slice(),
             &[(1_500.0, 0.0), (1_500.0, 0.0)]
+        );
+    }
+
+    fn test_spec() -> StreamSpec {
+        StreamSpec {
+            sample_rate_hz: 2_400_000.0,
+            center_freq_hz: 145_800_000.0,
+            bandwidth_hz: 2_000_000.0,
+            format: SampleFormat::Cf32Le,
+            full_scale: 1.0,
+        }
+    }
+
+    #[test]
+    fn failing_sink_is_disabled_without_stopping_the_session() {
+        let source = MockSource {
+            spec: test_spec(),
+            remaining: 3,
+            stop_called: None,
+        };
+        let channel = TestChannel {
+            config: VfoConfig::new(1, 0.0, 200_000.0, DemodMode::Fm),
+        };
+        let iq_count = Arc::new(AtomicUsize::new(0));
+        let audio_count = Arc::new(AtomicUsize::new(0));
+        let counting = CountingSink {
+            iq: Arc::clone(&iq_count),
+            audio: Arc::clone(&audio_count),
+        };
+
+        let mut session = LiveSession::new(
+            SourceConfig::default(),
+            Box::new(source),
+            vec![Box::new(channel)],
+            vec![Box::new(FailingSink), Box::new(counting)],
+        );
+
+        session.start().unwrap();
+        // The failing sink is first, so it is disabled on the first IQ frame.
+        // Every step must still succeed and the counting sink keeps receiving
+        // the IQ and audio frames.
+        let first = session.step().unwrap();
+        let second = session.step().unwrap();
+        let third = session.step().unwrap();
+        session.stop().unwrap();
+
+        assert_eq!(iq_count.load(Ordering::SeqCst), 3);
+        assert_eq!(audio_count.load(Ordering::SeqCst), 3);
+        assert_eq!(first.frames, 1);
+        assert_eq!(second.frames, 2);
+        // One skipped audio frame in the first block, then two skipped frames
+        // (IQ + audio) per block after the sink was disabled.
+        assert_eq!(first.dropped, 1);
+        assert_eq!(second.dropped, 3);
+        assert_eq!(third.dropped, 5);
+
+        // Only the first failure is recorded; later frames are not attempted.
+        let errors = session.take_sink_errors();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("sink #0"), "{errors:?}");
+        assert!(errors[0].contains("decoder bridge is down"), "{errors:?}");
+        assert!(session.take_sink_errors().is_empty());
+    }
+
+    #[test]
+    fn stop_calls_source_even_when_a_sink_flush_fails() {
+        let source_stopped = Arc::new(AtomicBool::new(false));
+        let source = MockSource {
+            spec: test_spec(),
+            remaining: 0,
+            stop_called: Some(Arc::clone(&source_stopped)),
+        };
+        let mut session = LiveSession::new(
+            SourceConfig::default(),
+            Box::new(source),
+            Vec::new(),
+            vec![Box::new(FlushFailingSink)],
+        );
+
+        session.start().unwrap();
+        let error = session.stop().unwrap_err();
+
+        assert!(error.to_string().contains("flush failed"), "{error:#}");
+        assert!(
+            source_stopped.load(Ordering::SeqCst),
+            "source.stop() must run even when a sink flush fails"
+        );
+    }
+
+    #[test]
+    fn default_channel_reconfigure_reports_unsupported() {
+        let spec = test_spec();
+        let mut channel = TestChannel {
+            config: VfoConfig::new(1, 0.0, 200_000.0, DemodMode::Fm),
+        };
+
+        let error = channel
+            .reconfigure(VfoConfig::new(2, 10_000.0, 12_500.0, DemodMode::Usb), &spec)
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("does not support reconfiguration"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn reconfigure_before_start_is_an_error() {
+        let source = MockSource {
+            spec: test_spec(),
+            remaining: 0,
+            stop_called: None,
+        };
+        let mut session = LiveSession::new(
+            SourceConfig::default(),
+            Box::new(source),
+            vec![Box::new(TestChannel {
+                config: VfoConfig::new(1, 0.0, 200_000.0, DemodMode::Fm),
+            })],
+            Vec::new(),
+        );
+
+        let error = session
+            .reconfigure_vfo(VfoConfig::new(1, 0.0, 12_500.0, DemodMode::Usb))
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("before the session has started"),
+            "{error:#}"
         );
     }
 }

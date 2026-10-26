@@ -262,8 +262,8 @@ impl VfoConfig {
     }
 }
 
-/// Orbital tracking parameters. The actual SGP4 implementation will live in
-/// `midori-orbit`; this type is the core-side contract used by presets.
+/// Orbital tracking parameters. The SGP4 propagation and pass prediction live
+/// in `midori-orbit`; this type is the core-side contract used by presets.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrackingConfig {
     pub norad_id: u32,
@@ -323,11 +323,14 @@ pub trait Channel: Send {
     /// one. The default implementation ignores the request.
     fn set_afc(&mut self, _enabled: bool) {}
 
-    /// Rebuild the channel in place with a new VFO/demod configuration. The
-    /// default implementation ignores the request, so simple channels keep
-    /// working unchanged.
+    /// Rebuild the channel in place with a new VFO/demod configuration.
+    ///
+    /// Channels that do not support live reconfiguration keep the default
+    /// implementation, which returns an error rather than silently ignoring
+    /// the request: callers must not be told a change took effect when it did
+    /// not.
     fn reconfigure(&mut self, _config: VfoConfig, _spec: &StreamSpec) -> anyhow::Result<()> {
-        Ok(())
+        anyhow::bail!("channel does not support reconfiguration")
     }
 
     /// Process one source block. Implementations append zero or more frames.
@@ -348,14 +351,18 @@ pub struct SessionStats {
     pub blocks: u64,
     pub samples: u64,
     pub frames: u64,
+    /// Frames produced by the session that were never handed to a sink because
+    /// that sink had been disabled after an earlier `on_frame` error. The frame
+    /// on which a sink failed is not counted; only the frames skipped
+    /// afterwards. One frame skipped for two disabled sinks counts twice.
     pub dropped: u64,
 }
 
 /// The runtime that owns a source, its channels, and its sinks.
 ///
-/// A concrete implementation will be added with the live-audio/VFO work. The
-/// important part for now is that the application talks to a session rather
-/// than to libiio directly.
+/// `midori-engine::LiveSession` is the concrete implementation used by the
+/// application. The application talks to a session rather than to libiio
+/// directly.
 pub trait Session: Send {
     fn spec(&self) -> Option<StreamSpec>;
 
@@ -364,6 +371,9 @@ pub trait Session: Send {
     /// Read and process one source block.
     fn step(&mut self) -> anyhow::Result<SessionStats>;
 
+    /// Flush sinks and stop the source. Implementations should always attempt
+    /// to stop the source even when a sink flush fails, and return the error
+    /// that occurred.
     fn stop(&mut self) -> anyhow::Result<()>;
 }
 
