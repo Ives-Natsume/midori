@@ -1,8 +1,7 @@
 mod app;
 mod audio;
 mod sinks;
-mod worker_commands;
-mod worker_events;
+mod worker;
 
 use app::MidoriApp;
 use eframe::egui;

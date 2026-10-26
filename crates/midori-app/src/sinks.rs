@@ -7,7 +7,7 @@ use crossbeam_channel::Sender;
 use midori_core::{Frame, Sink, StreamData};
 use midori_dsp::{OffsetScan, SpectrumAnalyzer, fftshift, frequency_axis};
 
-use crate::app::SpectrumFrame;
+use crate::worker::SpectrumFrame;
 
 /// Shared state for the GUI auto-tune scan.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
