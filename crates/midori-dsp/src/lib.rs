@@ -12,6 +12,20 @@ use midori_core::{Sample, StreamSpec};
 use num_complex::Complex32;
 use rustfft::{Fft, FftPlanner};
 
+/// Wrap an oscillator phase into `[0, TAU)`.
+///
+/// Handles both signs: negative offsets (LSB-side VFO, Doppler correction) must
+/// not accumulate without bound, and `rem_euclid` keeps the result correct even
+/// if a single increment is larger than `TAU`.
+#[inline]
+fn wrap_phase(phase: f64) -> f64 {
+    if (0.0..std::f64::consts::TAU).contains(&phase) {
+        phase
+    } else {
+        phase.rem_euclid(std::f64::consts::TAU)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Spectrum
 // ---------------------------------------------------------------------------
@@ -355,10 +369,7 @@ impl AmDemod {
             let i = sample.re as f64 * cos + sample.im as f64 * sin;
             let q = sample.im as f64 * cos - sample.re as f64 * sin;
 
-            self.phase += self.phase_inc;
-            if self.phase > std::f64::consts::TAU {
-                self.phase -= std::f64::consts::TAU;
-            }
+            self.phase = wrap_phase(self.phase + self.phase_inc);
 
             let i = self.lp_i.process(i);
             let q = self.lp_q.process(q);
@@ -485,11 +496,14 @@ impl Nco {
         let i = sample.re as f64 * cos + sample.im as f64 * sin;
         let q = sample.im as f64 * cos - sample.re as f64 * sin;
 
-        self.phase += self.phase_inc;
-        if self.phase > std::f64::consts::TAU {
-            self.phase -= std::f64::consts::TAU;
-        }
+        self.phase = wrap_phase(self.phase + self.phase_inc);
         Complex32::new(i as f32, q as f32)
+    }
+
+    /// Current phase in radians, for tests that verify phase stability.
+    #[cfg(test)]
+    pub(crate) fn phase(&self) -> f64 {
+        self.phase
     }
 
     pub fn reset(&mut self) {
@@ -935,10 +949,7 @@ impl CwDemod {
             let sample = self.baseband[index];
             let (sin, cos) = self.bfo_phase.sin_cos();
             let audio = sample.re as f64 * cos - sample.im as f64 * sin;
-            self.bfo_phase += self.bfo_phase_inc;
-            if self.bfo_phase > std::f64::consts::TAU {
-                self.bfo_phase -= std::f64::consts::TAU;
-            }
+            self.bfo_phase = wrap_phase(self.bfo_phase + self.bfo_phase_inc);
 
             let audio = self.audio_lp.process(audio);
             self.input_index += 1.0;
@@ -1348,10 +1359,7 @@ mod tests {
                 (phase.cos() as f32) * amplitude,
                 (phase.sin() as f32) * amplitude,
             ));
-            phase += std::f64::consts::TAU * frequency / sample_rate;
-            if phase > std::f64::consts::TAU {
-                phase -= std::f64::consts::TAU;
-            }
+            phase = wrap_phase(phase + std::f64::consts::TAU * frequency / sample_rate);
         }
         samples
     }
@@ -1450,7 +1458,7 @@ mod tests {
                 let t = i as f64 / fs;
                 let instantaneous =
                     offset + deviation * (2.0 * std::f64::consts::PI * tone * t).sin();
-                phase += 2.0 * std::f64::consts::PI * instantaneous / fs;
+                phase = wrap_phase(phase + 2.0 * std::f64::consts::PI * instantaneous / fs);
                 Complex32::new(phase.cos() as f32, phase.sin() as f32)
             })
             .collect();
@@ -1511,6 +1519,35 @@ mod tests {
             (measured - 700.0).abs() < 30.0,
             "measured {measured} Hz, expected 700 Hz"
         );
+    }
+
+    #[test]
+    fn nco_negative_offset_stays_bounded_and_mixes_to_dc() {
+        let fs = 240_000.0;
+        let offset = -20_000.0;
+        let amplitude = 0.5f32;
+        let n = 240_000;
+        let input = complex_tone(fs, offset, n, amplitude);
+
+        let mut nco = Nco::new(fs, offset);
+        let mut sum = Complex32::new(0.0, 0.0);
+        for &sample in &input {
+            sum += nco.mix(sample);
+            assert!(
+                nco.phase().abs() <= 2.0 * std::f64::consts::TAU,
+                "phase escaped after {n} negative-offset steps: {}",
+                nco.phase()
+            );
+        }
+
+        // Mixing a tone at -offset with an NCO at -offset must land on DC.
+        let mean = sum / n as f32;
+        assert!(
+            (mean.re - amplitude).abs() < 1e-3,
+            "mixed I mean {}, expected {amplitude}",
+            mean.re
+        );
+        assert!(mean.im.abs() < 1e-3, "mixed Q mean {}, expected 0", mean.im);
     }
 
     #[test]
