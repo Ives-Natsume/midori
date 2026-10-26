@@ -72,7 +72,7 @@ impl Pipeline {
         match self {
             Self::Iq(receiver) => receiver.flush(),
             Self::AudioIf(receiver) => receiver.flush(),
-            Self::Bytes(_) => Vec::new(),
+            Self::Bytes(session) => session.flush(),
         }
     }
 
@@ -130,7 +130,14 @@ fn main() -> Result<()> {
     loop {
         let message = match read_message(&mut reader) {
             Ok(message) => message,
-            Err(_) => break,
+            Err(_) => {
+                // stdin EOF means the host closed the pipe: flush partial
+                // images just like an explicit shutdown request.
+                for event in pipeline.flush() {
+                    send_event(&mut writer, event)?;
+                }
+                break;
+            }
         };
 
         match message {

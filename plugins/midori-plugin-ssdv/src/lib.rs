@@ -17,7 +17,7 @@
 //! (CRC initial value, frame header length) are supplied by the caller.
 
 use std::collections::BTreeMap;
-use std::io::Cursor;
+use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -44,6 +44,11 @@ pub const DEFAULT_CRC_INIT: u32 = 0xFFFF_FFFF;
 
 const PREVIEW_INTERVAL: Duration = Duration::from_millis(650);
 const MAX_JPEG_BYTES: usize = 32 * 1024 * 1024;
+/// Silence after which a packet for an existing image id is treated as the
+/// start of a new transmission, even without a conflicting packet.
+const IMAGE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Upper bound on images kept in memory for duplicate suppression.
+const MAX_IMAGES: usize = 8;
 
 /// A validated SSDV packet in a common form for image assembly.
 #[derive(Debug, Clone)]
@@ -300,7 +305,11 @@ struct ImageState {
     complete: bool,
     progress: f32,
     first_seen: Instant,
+    last_seen: Instant,
     last_preview: Option<Instant>,
+    rendered_packets: usize,
+    rendered_complete: bool,
+    bin_started: bool,
     jpeg_path: PathBuf,
     png_path: PathBuf,
     packet_path: PathBuf,
@@ -326,7 +335,11 @@ impl ImageState {
             complete: false,
             progress: 0.0,
             first_seen: Instant::now(),
+            last_seen: Instant::now(),
             last_preview: None,
+            rendered_packets: 0,
+            rendered_complete: false,
+            bin_started: false,
             jpeg_path: dir.join(format!("{base}.jpg")),
             png_path: dir.join(format!("{base}.png")),
             packet_path: dir.join(format!("{base}.bin")),
@@ -417,19 +430,110 @@ impl ImageState {
         (!jpeg.is_empty() && jpeg.len() <= MAX_JPEG_BYTES).then_some(jpeg)
     }
 
-    fn save_packet_bin(&self) -> Result<()> {
+    /// Append one packet to the raw packet log.
+    ///
+    /// The file name is unique per image instance, and packet ids are never
+    /// rewritten inside an instance, so appending is enough and avoids
+    /// rewriting the whole log for every received packet.
+    fn save_packet_bin(&mut self, packet: &PacketInfo) -> Result<()> {
         if !self.save {
             return Ok(());
         }
-        let mut bytes = Vec::new();
-        for packet in self.packets.values() {
-            bytes.extend_from_slice(&packet.raw);
-        }
-        if let Some(parent) = self.packet_path.parent() {
+        if let Some(parent) = self.packet_path.parent()
+            && !self.bin_started
+        {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&self.packet_path, bytes)
-            .with_context(|| format!("writing {}", self.packet_path.display()))
+        let mut file = if self.bin_started {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&self.packet_path)
+        } else {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&self.packet_path)
+        }
+        .with_context(|| format!("opening {}", self.packet_path.display()))?;
+        file.write_all(&packet.raw)
+            .with_context(|| format!("writing {}", self.packet_path.display()))?;
+        self.bin_started = true;
+        Ok(())
+    }
+}
+
+/// Build a JPEG/PNG preview for `state` and describe it as an image event.
+///
+/// Returns `Ok(None)` when no JPEG can be built yet. Save errors are reported
+/// through `events` so the caller can keep the event stream flowing.
+fn render_image(
+    state: &ImageState,
+    crc_errors: u64,
+    events: &mut Vec<SessionEvent>,
+) -> Result<Option<SsdvImage>> {
+    let Some(jpeg) = state.build_jpeg() else {
+        return Ok(None);
+    };
+    let (width, height, rgb) = decode_jpeg(&jpeg)?;
+    let png = encode_png(width, height, &rgb)?;
+
+    if state.save {
+        if let Some(parent) = state.jpeg_path.parent()
+            && let Err(error) = std::fs::create_dir_all(parent)
+        {
+            events.push(SessionEvent::Status {
+                level: StatusLevel::Warning,
+                message: format!("SSDV output directory: {error}"),
+            });
+        }
+        if let Err(error) = std::fs::write(&state.jpeg_path, &jpeg) {
+            events.push(SessionEvent::Status {
+                level: StatusLevel::Warning,
+                message: format!("SSDV JPEG: {error}"),
+            });
+        }
+        if state.complete {
+            let _ = std::fs::write(&state.png_path, &png);
+        }
+    }
+
+    Ok(Some(SsdvImage {
+        image_id: state.image_id,
+        width: u16::try_from(width).unwrap_or(u16::MAX),
+        height: u16::try_from(height).unwrap_or(u16::MAX),
+        quality: state.quality,
+        received_packets: state.packets.len(),
+        missing_packets: state.missing(),
+        crc_errors,
+        complete: state.complete,
+        jpeg,
+        png,
+        jpeg_path: state.save.then(|| state.jpeg_path.clone()),
+        png_path: (state.save && state.complete).then(|| state.png_path.clone()),
+        packet_path: state.save.then(|| state.packet_path.clone()),
+    }))
+}
+
+/// Render `state` if it has packets that have not been rendered yet, pushing
+/// the resulting image event (and any save warning) onto `events`.
+fn render_state(state: &mut ImageState, crc_errors: u64, events: &mut Vec<SessionEvent>) {
+    if state.rendered_packets == state.packets.len() && state.rendered_complete == state.complete {
+        return;
+    }
+    let rendered_packets = state.packets.len();
+    let rendered_complete = state.complete;
+    match render_image(state, crc_errors, events) {
+        Ok(Some(image)) => {
+            state.rendered_packets = rendered_packets;
+            state.rendered_complete = rendered_complete;
+            events.push(SessionEvent::Image(image));
+        }
+        Ok(None) => {}
+        Err(error) => events.push(SessionEvent::Status {
+            level: StatusLevel::Warning,
+            message: format!("SSDV preview: {error}"),
+        }),
     }
 }
 
@@ -618,60 +722,98 @@ impl SsdvSession {
 
     fn ingest(&mut self, packet: PacketInfo) -> Vec<SessionEvent> {
         let image_id = packet.image_id;
+        let now = Instant::now();
         let mut reset = false;
+        let mut duplicate = false;
 
         if let Some(state) = self.images.get(&image_id) {
-            if !state.matches(&packet) {
-                reset = true;
-            } else if packet.packet_id == 0 {
-                // A fresh, different packet 0 means the sender restarted the
-                // image. A duplicate is ignored.
-                if let Some(existing) = state.packets.get(&0) {
-                    if existing.raw != packet.raw {
-                        reset = true;
-                    } else {
-                        return Vec::new();
-                    }
+            if let Some(existing) = state.packets.get(&packet.packet_id) {
+                if existing.raw == packet.raw {
+                    // Retransmission of a packet we already hold. Check this
+                    // before the idle timeout so a late replay cannot start a
+                    // new image.
+                    duplicate = true;
+                } else {
+                    // The same packet index with different contents cannot be
+                    // a retransmission. The sender reused the image id for a
+                    // new transmission whose packet 0 we missed.
+                    reset = true;
                 }
+            } else if !state.matches(&packet)
+                || now.saturating_duration_since(state.last_seen) > IMAGE_TIMEOUT
+            {
+                // Header change or a long gap: the sender started again.
+                reset = true;
             }
+        }
+
+        if duplicate {
+            // Keep the idle timer fresh, but do not rebuild or append.
+            if let Some(state) = self.images.get_mut(&image_id) {
+                state.last_seen = now;
+            }
+            return Vec::new();
+        }
+
+        let mut events = Vec::new();
+        if reset {
+            // Finalize the old transmission before the id is reused.
+            events.extend(self.flush_image(image_id));
         }
 
         if reset || !self.images.contains_key(&image_id) {
             self.serial += 1;
             let state = ImageState::new(image_id, &packet, self.serial, self.output_dir.as_deref());
             self.images.insert(image_id, state);
+            events.extend(self.prune_images(image_id));
         }
 
         let Some(state) = self.images.get_mut(&image_id) else {
-            return Vec::new();
+            return events;
         };
-        let previous = state.packets.get(&packet.packet_id);
-        if previous.is_some_and(|existing| existing.raw == packet.raw) {
-            return Vec::new();
-        }
         state.packets.insert(packet.packet_id, packet.clone());
         state.complete |= packet.eoi;
+        state.last_seen = now;
 
-        if let Err(error) = state.save_packet_bin() {
-            return vec![SessionEvent::Status {
+        if let Err(error) = state.save_packet_bin(&packet) {
+            let mut warning = vec![SessionEvent::Status {
                 level: StatusLevel::Warning,
                 message: format!("SSDV packet log: {error}"),
             }];
+            warning.append(&mut events);
+            return warning;
         }
 
-        let now = Instant::now();
-        let due = state.complete
-            || state
+        // The packet set only changes here (duplicates returned above), but
+        // keep the guard explicit so a future replacement path cannot rebuild
+        // the same image twice.
+        let changed = state.rendered_packets != state.packets.len()
+            || state.rendered_complete != state.complete;
+        if !changed {
+            return events;
+        }
+        let due = if state.complete {
+            // EOI only proves the sender finished, not that we have every
+            // packet. Render the final image once, then re-render late
+            // gap-filling packets under the normal preview throttle. An image
+            // with no gaps left is rendered immediately.
+            !state.rendered_complete
+                || state.missing() == 0
+                || state
+                    .last_preview
+                    .is_none_or(|last| now.saturating_duration_since(last) >= self.preview_interval)
+        } else {
+            state
                 .last_preview
-                .is_none_or(|last| now.duration_since(last) >= self.preview_interval);
+                .is_none_or(|last| now.saturating_duration_since(last) >= self.preview_interval)
+        };
         if !due {
-            return Vec::new();
+            return events;
         }
         state.last_preview = Some(now);
 
-        let missing = state.missing();
-        let mut events = Vec::new();
         if !state.complete {
+            let missing = state.missing();
             let (fraction, total_hint) = state.update_progress().unwrap_or((0.0, 0));
             events.push(SessionEvent::Progress {
                 title: format!(
@@ -686,67 +828,73 @@ impl SsdvSession {
             });
         }
 
-        let Some(jpeg) = state.build_jpeg() else {
-            return events;
-        };
-        let (width, height, rgb) = match decode_jpeg(&jpeg) {
-            Ok(decoded) => decoded,
-            Err(error) => {
-                events.push(SessionEvent::Status {
-                    level: StatusLevel::Warning,
-                    message: format!("SSDV JPEG decode: {error}"),
-                });
-                return events;
-            }
-        };
-        let png = match encode_png(width, height, &rgb) {
-            Ok(png) => png,
-            Err(error) => {
-                events.push(SessionEvent::Status {
-                    level: StatusLevel::Warning,
-                    message: format!("SSDV PNG encode: {error}"),
-                });
-                return events;
-            }
-        };
+        render_state(state, self.crc_errors, &mut events);
+        events
+    }
 
-        if state.save {
-            if let Some(parent) = state.jpeg_path.parent()
-                && let Err(error) = std::fs::create_dir_all(parent)
-            {
-                events.push(SessionEvent::Status {
-                    level: StatusLevel::Warning,
-                    message: format!("SSDV output directory: {error}"),
-                });
-            }
-            if let Err(error) = std::fs::write(&state.jpeg_path, &jpeg) {
-                events.push(SessionEvent::Status {
-                    level: StatusLevel::Warning,
-                    message: format!("SSDV JPEG: {error}"),
-                });
-            }
-            if state.complete {
-                let _ = std::fs::write(&state.png_path, &png);
-            }
+    /// Emit a final preview for an image that is being replaced, then drop it.
+    fn flush_image(&mut self, image_id: u8) -> Vec<SessionEvent> {
+        let Some(mut state) = self.images.remove(&image_id) else {
+            return Vec::new();
+        };
+        let mut events = Vec::new();
+        render_state(&mut state, self.crc_errors, &mut events);
+        events
+    }
+
+    /// Keep the image table small: drop long-idle images and, when over the
+    /// bound, evict finished images before in-progress ones and oldest first.
+    ///
+    /// Evicted images are finalized through [`Self::flush_image`], so packets
+    /// that were throttled out of a preview are not lost silently.
+    fn prune_images(&mut self, keep: u8) -> Vec<SessionEvent> {
+        let now = Instant::now();
+        let stale: Vec<u8> = self
+            .images
+            .iter()
+            .filter(|(id, state)| {
+                **id != keep && now.saturating_duration_since(state.last_seen) > IMAGE_TIMEOUT
+            })
+            .map(|(id, _)| *id)
+            .collect();
+
+        let mut events = Vec::new();
+        for image_id in stale {
+            events.extend(self.flush_image(image_id));
         }
+        while self.images.len() > MAX_IMAGES {
+            let victim = self
+                .images
+                .iter()
+                .filter(|(id, _)| **id != keep)
+                .min_by(|(_, left), (_, right)| {
+                    right
+                        .complete
+                        .cmp(&left.complete)
+                        .then_with(|| left.last_seen.cmp(&right.last_seen))
+                })
+                .map(|(id, _)| *id);
+            let Some(victim) = victim else {
+                break;
+            };
+            events.extend(self.flush_image(victim));
+        }
+        events
+    }
 
-        let width = u16::try_from(width).unwrap_or(u16::MAX);
-        let height = u16::try_from(height).unwrap_or(u16::MAX);
-        events.push(SessionEvent::Image(SsdvImage {
-            image_id: state.image_id,
-            width,
-            height,
-            quality: state.quality,
-            received_packets: state.packets.len(),
-            missing_packets: state.missing(),
-            crc_errors: self.crc_errors,
-            complete: state.complete,
-            jpeg,
-            png,
-            jpeg_path: state.save.then(|| state.jpeg_path.clone()),
-            png_path: (state.save && state.complete).then(|| state.png_path.clone()),
-            packet_path: state.save.then(|| state.packet_path.clone()),
-        }));
+    /// Render any packets that are still waiting for a throttled preview.
+    ///
+    /// Call this at end of stream so the last packets of every retained image
+    /// reach the UI and, when saved, the JPEG/PNG on disk.
+    pub fn flush(&mut self) -> Vec<SessionEvent> {
+        let image_ids: Vec<u8> = self.images.keys().copied().collect();
+        let mut events = Vec::new();
+        for image_id in image_ids {
+            let Some(state) = self.images.get_mut(&image_id) else {
+                continue;
+            };
+            render_state(state, self.crc_errors, &mut events);
+        }
         events
     }
 
@@ -836,7 +984,9 @@ impl Bpsk9600Receiver {
     /// Feed the decoder's trailing partial block at end of stream.
     pub fn flush(&mut self) -> Vec<SessionEvent> {
         self.modem.flush();
-        self.drain()
+        let mut events = self.drain();
+        events.extend(self.session.flush());
+        events
     }
 
     fn drain(&mut self) -> Vec<SessionEvent> {
@@ -931,7 +1081,9 @@ impl Bpsk9600AudioReceiver {
 
     pub fn flush(&mut self) -> Vec<SessionEvent> {
         self.modem.flush();
-        self.drain()
+        let mut events = self.drain();
+        events.extend(self.session.flush());
+        events
     }
 
     fn drain(&mut self) -> Vec<SessionEvent> {
@@ -1063,5 +1215,267 @@ mod tests {
     fn byte_autodetect_requires_a_whole_block() {
         let mut session = SsdvSession::new(None);
         assert!(session.process_bytes(&[0u8; 100]).is_err());
+    }
+
+    fn make_dslwp_image_packet(image_id: u8, packet_id: u16, fill: u8, eoi: bool) -> Vec<u8> {
+        let mut packet = make_dslwp_packet(image_id, packet_id);
+        packet[DSLWP_HEADER_LEN..DSLWP_PACKET_LEN - 4].fill(fill);
+        if eoi {
+            packet[5] |= 0x04;
+        }
+        let crc = crc32(&packet[..DSLWP_PACKET_LEN - 4], TEST_CRC_INIT);
+        packet[214..218].copy_from_slice(&crc.to_be_bytes());
+        packet
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("midori-ssdv-{name}-{nanos}"))
+    }
+
+    fn collect_images(events: Vec<SessionEvent>, images: &mut Vec<SsdvImage>) {
+        for event in events {
+            if let SessionEvent::Image(image) = event {
+                images.push(image);
+            }
+        }
+    }
+
+    #[test]
+    fn reused_image_id_without_packet_zero_starts_a_new_image() {
+        let out_dir = temp_dir("reused-id");
+        let mut session = SsdvSession::with_crc_inits(Some(out_dir.clone()), vec![TEST_CRC_INIT]);
+        session.set_preview_interval(Duration::ZERO);
+
+        // First transmission: packets 0..=3 with the EOI flag on the last one.
+        let mut events = Vec::new();
+        for packet_id in 0..=3u16 {
+            let packet = make_dslwp_image_packet(7, packet_id, 0x11, packet_id == 3);
+            events.extend(session.process_dslwp_packet(&packet));
+        }
+        // Second transmission reuses image id 7 but its packet 0 is lost.
+        for packet_id in 1..=4u16 {
+            let packet = make_dslwp_image_packet(7, packet_id, 0x22, packet_id == 4);
+            events.extend(session.process_dslwp_packet(&packet));
+        }
+
+        let mut images = Vec::new();
+        collect_images(events, &mut images);
+
+        let mut order = Vec::new();
+        for image in &images {
+            let path = image.packet_path.clone().expect("saved image path");
+            if !order.contains(&path) {
+                order.push(path);
+            }
+        }
+        assert_eq!(order.len(), 2, "expected two separate images");
+
+        let first: Vec<_> = images
+            .iter()
+            .filter(|image| image.packet_path.as_ref() == Some(&order[0]))
+            .collect();
+        assert!(first.iter().any(|image| image.complete));
+
+        let second: Vec<_> = images
+            .iter()
+            .filter(|image| image.packet_path.as_ref() == Some(&order[1]))
+            .collect();
+        assert!(second.len() >= 2);
+        assert!(
+            second.iter().rev().skip(1).all(|image| !image.complete),
+            "the second image completed before its own EOI"
+        );
+        let last = second.last().expect("second image event");
+        assert!(last.complete);
+        assert_eq!(last.received_packets, 4);
+        assert_eq!(
+            last.missing_packets, 1,
+            "packet 0 of the new image is missing"
+        );
+
+        // Each instance must own its own packet log; no packets are mixed or
+        // overwritten by the reused id.
+        for path in &order {
+            let size = std::fs::metadata(path).expect("packet log").len();
+            assert_eq!(size, 4 * DSLWP_PACKET_LEN as u64);
+        }
+
+        let _ = std::fs::remove_dir_all(out_dir);
+    }
+
+    #[test]
+    fn duplicate_packet_does_not_start_a_new_image() {
+        let out_dir = temp_dir("duplicate");
+        let mut session = SsdvSession::with_crc_inits(Some(out_dir.clone()), vec![TEST_CRC_INIT]);
+        session.set_preview_interval(Duration::ZERO);
+
+        let first = make_dslwp_image_packet(9, 0, 0x33, false);
+        let eoi = make_dslwp_image_packet(9, 1, 0x33, true);
+
+        let mut events = Vec::new();
+        events.extend(session.process_dslwp_packet(&first));
+        events.extend(session.process_dslwp_packet(&first));
+        events.extend(session.process_dslwp_packet(&eoi));
+        // Even after the idle timeout, identical retransmissions must not
+        // reopen the image.
+        let state = session.images.get_mut(&9).expect("image state");
+        state.last_seen = Instant::now() - IMAGE_TIMEOUT - Duration::from_secs(1);
+        events.extend(session.process_dslwp_packet(&first));
+        events.extend(session.process_dslwp_packet(&eoi));
+
+        let mut images = Vec::new();
+        collect_images(events, &mut images);
+        let paths: std::collections::HashSet<_> = images
+            .iter()
+            .filter_map(|image| image.packet_path.clone())
+            .collect();
+        assert_eq!(paths.len(), 1, "duplicates must not create a second image");
+        assert_eq!(session.serial, 1);
+        assert_eq!(session.images.len(), 1);
+
+        let last = images.last().expect("image event");
+        assert!(last.complete);
+        assert_eq!(last.received_packets, 2);
+
+        let path = paths.iter().next().expect("packet log");
+        let size = std::fs::metadata(path).expect("packet log").len();
+        assert_eq!(
+            size,
+            2 * DSLWP_PACKET_LEN as u64,
+            "duplicates must not be appended to the packet log"
+        );
+
+        let _ = std::fs::remove_dir_all(out_dir);
+    }
+
+    #[test]
+    fn image_map_is_bounded() {
+        let mut session = SsdvSession::with_crc_inits(None, vec![TEST_CRC_INIT]);
+        for image_id in 1..=20u8 {
+            let packet = make_dslwp_image_packet(image_id, 0, image_id, true);
+            session.process_dslwp_packet(&packet);
+        }
+        assert_eq!(
+            session.images.len(),
+            MAX_IMAGES,
+            "distinct image ids must not grow the map without bound"
+        );
+    }
+
+    #[test]
+    fn idle_image_is_replaced_after_timeout() {
+        let mut session = SsdvSession::with_crc_inits(None, vec![TEST_CRC_INIT]);
+        let old = make_dslwp_image_packet(11, 5, 0x44, false);
+        session.process_dslwp_packet(&old);
+        let serial = session.serial;
+
+        let state = session.images.get_mut(&11).expect("image state");
+        state.last_seen = Instant::now() - IMAGE_TIMEOUT - Duration::from_secs(1);
+
+        let new = make_dslwp_image_packet(11, 6, 0x44, true);
+        session.process_dslwp_packet(&new);
+        assert_eq!(
+            session.serial,
+            serial + 1,
+            "a packet after the idle timeout must start a new image"
+        );
+        assert_eq!(
+            session.images.get(&11).map(|state| state.packets.len()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn late_gap_fill_after_eoi_renders_final_image() {
+        let out_dir = temp_dir("eoi-gap");
+        let mut session = SsdvSession::with_crc_inits(Some(out_dir.clone()), vec![TEST_CRC_INIT]);
+        // Long enough that only the explicit complete-image rules can render.
+        session.set_preview_interval(Duration::from_secs(3600));
+
+        session.process_dslwp_packet(&make_dslwp_image_packet(21, 0, 0x55, false));
+        let mut eoi_images = Vec::new();
+        collect_images(
+            session.process_dslwp_packet(&make_dslwp_image_packet(21, 2, 0x55, true)),
+            &mut eoi_images,
+        );
+        let eoi_image = eoi_images.last().expect("EOI should render an image");
+        assert!(eoi_image.complete);
+        assert_eq!(eoi_image.missing_packets, 1);
+
+        // The missing packet arrives after EOI; it must trigger a rebuild.
+        let mut images = Vec::new();
+        collect_images(
+            session.process_dslwp_packet(&make_dslwp_image_packet(21, 1, 0x55, false)),
+            &mut images,
+        );
+        let image = images
+            .last()
+            .expect("late gap fill should re-render the complete image");
+        assert!(image.complete);
+        assert_eq!(image.received_packets, 3);
+        assert_eq!(image.missing_packets, 0);
+        assert!(
+            image.png_path.as_ref().is_some_and(|path| path.exists()),
+            "the PNG on disk should be rewritten"
+        );
+
+        let _ = std::fs::remove_dir_all(out_dir);
+    }
+
+    #[test]
+    fn evicting_unrendered_image_emits_final_preview() {
+        let mut session = SsdvSession::with_crc_inits(None, vec![TEST_CRC_INIT]);
+        session.set_preview_interval(Duration::from_secs(3600));
+
+        // Each image renders its first packet, but the second is throttled.
+        for image_id in 1..=8u8 {
+            session.process_dslwp_packet(&make_dslwp_image_packet(image_id, 0, image_id, false));
+            let events = session
+                .process_dslwp_packet(&make_dslwp_image_packet(image_id, 1, image_id, false));
+            assert!(
+                events
+                    .iter()
+                    .all(|event| !matches!(event, SessionEvent::Image(_))),
+                "the second packet should be throttled"
+            );
+        }
+
+        let mut images = Vec::new();
+        collect_images(
+            session.process_dslwp_packet(&make_dslwp_image_packet(9, 0, 9, false)),
+            &mut images,
+        );
+        assert_eq!(session.images.len(), MAX_IMAGES);
+
+        let evicted = images
+            .iter()
+            .find(|image| image.image_id == 1)
+            .expect("evicting an image with unrendered packets must emit its preview");
+        assert!(!evicted.complete);
+        assert_eq!(evicted.received_packets, 2);
+    }
+
+    #[test]
+    fn session_flush_renders_pending_packets() {
+        let mut session = SsdvSession::with_crc_inits(None, vec![TEST_CRC_INIT]);
+        session.set_preview_interval(Duration::from_secs(3600));
+
+        session.process_dslwp_packet(&make_dslwp_image_packet(5, 0, 0x66, false));
+        session.process_dslwp_packet(&make_dslwp_image_packet(5, 1, 0x66, false));
+
+        let mut images = Vec::new();
+        collect_images(session.flush(), &mut images);
+        let image = images.last().expect("flush should render pending packets");
+        assert_eq!(image.received_packets, 2);
+        assert!(!image.complete);
+
+        assert!(
+            session.flush().is_empty(),
+            "a second flush has nothing left to render"
+        );
     }
 }

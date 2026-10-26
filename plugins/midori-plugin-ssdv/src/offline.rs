@@ -345,7 +345,7 @@ fn decode_raw(args: &Args, mode: InputMode) -> Result<usize> {
         mode => mode,
     };
 
-    let events = match mode {
+    let mut events = match mode {
         InputMode::Frames => {
             let mut events = Vec::new();
             for frame in bytes.chunks_exact(223) {
@@ -374,6 +374,7 @@ fn decode_raw(args: &Args, mode: InputMode) -> Result<usize> {
         InputMode::Auto => session.process_bytes(&bytes)?,
         InputMode::Iq => unreachable!(),
     };
+    events.extend(session.flush());
     let images = report(events)?;
     eprintln!(
         "{} packet rejects, {} non-SSDV frames",
