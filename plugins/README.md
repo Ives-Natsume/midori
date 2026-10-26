@@ -286,18 +286,91 @@ Midori can remain MIT/Apache-2.0. See `midori-plugin-ssdv/NOTICE.md`.
 
 ## Writing a plugin
 
-The minimal Rust implementation uses `midori-plugin`:
+Rust plugins should use `midori-plugin-sdk`. It owns the handshake, control
+loop, frame decoding, error reporting, and shutdown flush so the plugin only
+contains decoder logic:
+
+```rust
+use anyhow::Result;
+use midori_plugin_sdk::{
+    Emitter, FrameInfo, Plugin, StatusLevel, StreamInfo, run,
+};
+
+struct Tones {
+    sample_rate_hz: f64,
+}
+
+impl Plugin for Tones {
+    fn name(&self) -> &str {
+        "tones"
+    }
+
+    fn version(&self) -> &str {
+        env!("CARGO_PKG_VERSION")
+    }
+
+    fn configure(&mut self, params: &serde_json::Value) -> Result<()> {
+        let _ = params; // Read tone_hz, output_dir, ... here.
+        Ok(())
+    }
+
+    fn on_stream(&mut self, info: &StreamInfo, _out: &mut Emitter<'_>) -> Result<()> {
+        // Repeated stream messages are metadata updates. Reset decoder state
+        // only when info.kind or info.sample_rate_hz actually changed.
+        self.sample_rate_hz = info.sample_rate_hz;
+        Ok(())
+    }
+
+    fn on_audio(
+        &mut self,
+        meta: &FrameInfo,
+        samples: &[f32],
+        out: &mut Emitter<'_>,
+    ) -> Result<()> {
+        let _ = (meta.seq, meta.timestamp_ns, samples);
+        out.status(StatusLevel::Info, "decoding")?;
+        // out.text("Tones", vec!["...".to_string()])?;
+        Ok(())
+    }
+
+    fn on_shutdown(&mut self, out: &mut Emitter<'_>) -> Result<()> {
+        // Flush partial results. The SDK calls this exactly once on
+        // `shutdown` or stdin EOF.
+        let _ = out;
+        Ok(())
+    }
+}
+
+fn main() -> Result<()> {
+    run(Tones {
+        sample_rate_hz: 48_000.0,
+    })
+}
+```
+
+The crate dependencies are `midori-plugin-sdk`, `anyhow`, and `serde_json`
+(the SDK re-exports the event and stream types). Override `on_iq`,
+`on_bytes`, and `on_soft_bits` for the other data planes. `configure` errors
+are returned to the host as an `error` control message and the SDK waits for
+another `configure`; errors returned by frame handlers become non-fatal
+events and processing continues.
+
+The protocol underneath is language-neutral:
 
 1. Send `hello` with `protocol: 2` on stdout, then read `configure` and
    `stream` messages from stdin.
-2. Write `ready` after configuration.
+2. Write `ready` after configuration. If configuration fails, write
+   `{"type":"error","message":"..."}` and wait for another `configure` or
+   exit.
 3. Process `audio`, `iq`, soft-bit, or byte frames declared by the manifest.
    Frames carry an exact `u64` UTC timestamp or the "unknown" sentinel.
+   Frames received before a successful `configure` are ignored.
 4. Write JSON events with `kind = 1` frames.
+5. On `shutdown` or stdin EOF, flush any buffered final output, then exit.
 
 Treat `stream` messages as idempotent metadata updates: repeated messages and
 frequency-only changes must not reset the decoder. Only `kind` or
 `sample_rate_hz` changes require reinitialising decoder state.
 
-Any language can implement the same framing. Keep the data plane binary and
-the control plane JSON; do not send audio through JSON.
+Keep the data plane binary and the control plane JSON; do not send audio
+through JSON.

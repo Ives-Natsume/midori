@@ -15,6 +15,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use midori_core::{Frame, FrameMeta, StreamKind};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 pub const PROTOCOL_VERSION: u32 = 2;
 
@@ -22,6 +23,84 @@ pub mod sidecar;
 pub mod wire;
 
 pub use sidecar::SidecarPlugin;
+
+/// Stream metadata carried by the host's `stream` control message.
+///
+/// The JSON field names are part of the protocol; they are intentionally
+/// identical to the previous ad-hoc `json!` objects built by the host.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct StreamInfo {
+    pub kind: StreamKind,
+    pub sample_rate_hz: f64,
+    /// Audio channel count. The current engine always sends mono.
+    pub channels: u32,
+    pub center_freq_hz: f64,
+    /// Nominal (un-Doppler-shifted) frequency the user/preset asked for.
+    pub nominal_freq_hz: f64,
+    pub bandwidth_hz: f64,
+    /// Doppler correction currently applied to the VFO.
+    pub doppler_hz: f64,
+    /// Doppler rate, Hz/s.
+    pub doppler_rate_hz_s: f64,
+    pub vfo_id: Option<u32>,
+}
+
+/// Human-readable name for a stream kind, matching the `stream` JSON.
+pub fn stream_kind_name(kind: StreamKind) -> &'static str {
+    match kind {
+        StreamKind::Iq => "iq",
+        StreamKind::Audio => "audio",
+        StreamKind::SoftBits => "soft_bits",
+        StreamKind::Bytes => "bytes",
+    }
+}
+
+impl StreamInfo {
+    /// Build the stream metadata for a frame. `channels` is always 1 because
+    /// sidecar audio and IQ streams are mono.
+    pub fn from_meta(kind: StreamKind, meta: &FrameMeta) -> Self {
+        Self {
+            kind,
+            sample_rate_hz: meta.sample_rate_hz,
+            channels: 1,
+            center_freq_hz: meta.center_freq_hz,
+            nominal_freq_hz: meta.nominal_freq_hz,
+            bandwidth_hz: meta.bandwidth_hz,
+            doppler_hz: meta.doppler_hz,
+            doppler_rate_hz_s: meta.doppler_rate_hz_s,
+            vfo_id: meta.vfo_id,
+        }
+    }
+}
+
+/// JSON control messages exchanged with a sidecar (protocol version 2).
+///
+/// This is the typed counterpart of the ad-hoc `json!` objects the host used
+/// to build and inspect. Plugins written in Rust can use it through
+/// `midori-plugin-sdk`; other languages see the same JSON.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ControlMessage {
+    Hello {
+        /// Missing fields default to zero/empty so a malformed handshake can
+        /// still be reported as a protocol mismatch rather than a JSON error.
+        #[serde(default)]
+        protocol: u32,
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        version: String,
+    },
+    Configure {
+        params: Value,
+    },
+    Ready,
+    Error {
+        message: String,
+    },
+    Stream(StreamInfo),
+    Shutdown,
+}
 
 /// What a plugin wants to receive from the engine.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -284,6 +363,75 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         let decoded: PluginEvent = serde_json::from_str(&json).unwrap();
         assert!(matches!(decoded, PluginEvent::Display { .. }));
+    }
+
+    #[test]
+    fn stream_control_json_matches_host_output() {
+        let info = StreamInfo {
+            kind: StreamKind::Audio,
+            sample_rate_hz: 48_000.0,
+            channels: 1,
+            center_freq_hz: 145_960_000.0,
+            nominal_freq_hz: 145_955_000.0,
+            bandwidth_hz: 15_000.0,
+            doppler_hz: 12.5,
+            doppler_rate_hz_s: -0.25,
+            vfo_id: Some(0),
+        };
+        let value = serde_json::to_value(ControlMessage::Stream(info)).unwrap();
+        // Keys and values must stay byte-for-byte compatible with the JSON the
+        // host built before the typed messages existed.
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "stream",
+                "kind": "audio",
+                "sample_rate_hz": 48_000.0,
+                "channels": 1,
+                "center_freq_hz": 145_960_000.0,
+                "nominal_freq_hz": 145_955_000.0,
+                "bandwidth_hz": 15_000.0,
+                "doppler_hz": 12.5,
+                "doppler_rate_hz_s": -0.25,
+                "vfo_id": 0
+            })
+        );
+    }
+
+    #[test]
+    fn control_messages_roundtrip() {
+        let messages = vec![
+            ControlMessage::Hello {
+                protocol: PROTOCOL_VERSION,
+                name: "cw".to_string(),
+                version: "0.1.0".to_string(),
+            },
+            ControlMessage::Configure {
+                params: serde_json::json!({"tone_hz": 700.0}),
+            },
+            ControlMessage::Ready,
+            ControlMessage::Error {
+                message: "bad params".to_string(),
+            },
+            ControlMessage::Shutdown,
+        ];
+        for message in messages {
+            let json = serde_json::to_string(&message).unwrap();
+            let decoded: ControlMessage = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, message);
+        }
+    }
+
+    #[test]
+    fn error_control_omits_fatal_flag() {
+        let value = serde_json::to_value(ControlMessage::Error {
+            message: "boom".to_string(),
+        })
+        .unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"type": "error", "message": "boom"})
+        );
     }
 
     #[test]

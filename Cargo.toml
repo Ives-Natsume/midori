@@ -7,6 +7,7 @@ members = [
     "crates/midori-dsp",
     "crates/midori-sigmf",
     "crates/midori-plugin",
+    "crates/midori-plugin-sdk",
     "crates/midori-engine",
     "crates/midori-orbit",
     "crates/midori-config",
@@ -47,6 +48,7 @@ midori-dsp = { path = "crates/midori-dsp" }
 midori-engine = { path = "crates/midori-engine" }
 midori-orbit = { path = "crates/midori-orbit" }
 midori-plugin = { path = "crates/midori-plugin" }
+midori-plugin-sdk = { path = "crates/midori-plugin-sdk" }
 midori-sigmf = { path = "crates/midori-sigmf" }
 midori-source-libiio = { path = "crates/midori-source-libiio" }
 midori-source-file = { path = "crates/midori-source-file" }

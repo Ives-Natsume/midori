@@ -9,6 +9,7 @@ repository.workspace = true
 anyhow.workspace = true
 hound.workspace = true
 midori-plugin = { path = "../../crates/midori-plugin" }
+midori-plugin-sdk.workspace = true
 png.workspace = true
 serde_json.workspace = true
 slowrx.workspace = true

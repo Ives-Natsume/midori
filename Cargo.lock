@@ -2107,9 +2107,20 @@ dependencies = [
  "midori-dsp",
  "midori-engine",
  "midori-plugin",
+ "midori-plugin-sdk",
  "midori-source-file",
  "num-complex",
  "rustfft",
+ "serde_json",
+]
+
+[[package]]
+name = "midori-plugin-sdk"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "midori-core",
+ "midori-plugin",
  "serde_json",
 ]
 
@@ -2123,6 +2134,7 @@ dependencies = [
  "midori-core",
  "midori-dsp",
  "midori-plugin",
+ "midori-plugin-sdk",
  "midori-source-file",
  "openhoshimi-codec",
  "openhoshimi-soundmodem",
@@ -2139,6 +2151,7 @@ dependencies = [
  "midori-core",
  "midori-dsp",
  "midori-plugin",
+ "midori-plugin-sdk",
  "png",
  "rasterwave",
  "serde_json",

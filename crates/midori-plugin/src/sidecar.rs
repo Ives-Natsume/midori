@@ -30,12 +30,15 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError, bounded};
 use midori_core::{Frame, FrameMeta, StreamData, StreamKind};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::wire::{
     WireMessage, read_message, write_audio, write_bytes, write_iq, write_json, write_soft_bits,
 };
-use crate::{Manifest, PROTOCOL_VERSION, PluginEvent, PluginHost};
+use crate::{
+    ControlMessage, Manifest, PROTOCOL_VERSION, PluginEvent, PluginHost, StreamInfo,
+    stream_kind_name,
+};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
 const CONFIGURE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -100,17 +103,8 @@ fn stream_update_due(prev: Option<&StreamState>, next: &StreamKey, now: Instant)
     now.saturating_duration_since(prev.sent_at) >= STREAM_METADATA_INTERVAL
 }
 
-fn stream_kind_name(kind: StreamKind) -> &'static str {
-    match kind {
-        StreamKind::Iq => "iq",
-        StreamKind::Audio => "audio",
-        StreamKind::SoftBits => "soft_bits",
-        StreamKind::Bytes => "bytes",
-    }
-}
-
 enum Outbound {
-    Json(Value),
+    Control(ControlMessage),
     Audio {
         seq: u64,
         timestamp_ns: Option<u64>,
@@ -169,7 +163,9 @@ impl SidecarPlugin {
                 let mut writer = BufWriter::new(stdin);
                 while let Ok(message) = rx.recv() {
                     let result = match message {
-                        Outbound::Json(value) => write_json(&mut writer, &value),
+                        Outbound::Control(control) => serde_json::to_value(&control)
+                            .map_err(anyhow::Error::from)
+                            .and_then(|value| write_json(&mut writer, &value)),
                         Outbound::Audio {
                             seq,
                             timestamp_ns,
@@ -238,19 +234,9 @@ impl SidecarPlugin {
             return Ok(());
         }
 
-        let message = json!({
-            "type": "stream",
-            "kind": stream_kind_name(kind),
-            "sample_rate_hz": meta.sample_rate_hz,
-            "channels": 1,
-            "center_freq_hz": meta.center_freq_hz,
-            "nominal_freq_hz": meta.nominal_freq_hz,
-            "bandwidth_hz": meta.bandwidth_hz,
-            "doppler_hz": meta.doppler_hz,
-            "doppler_rate_hz_s": meta.doppler_rate_hz_s,
-            "vfo_id": meta.vfo_id,
-        });
-        self.enqueue(Outbound::Json(message))?;
+        self.enqueue(Outbound::Control(ControlMessage::Stream(
+            StreamInfo::from_meta(kind, meta),
+        )))?;
         self.stream = Some(StreamState { key, sent_at: now });
         Ok(())
     }
@@ -335,11 +321,17 @@ impl PluginHost for SidecarPlugin {
             }
         };
 
-        if hello.get("type").and_then(Value::as_str) != Some("hello") {
-            let _ = self.stop();
-            bail!("plugin handshake did not start with hello");
-        }
-        let protocol = hello.get("protocol").and_then(Value::as_u64).unwrap_or(0) as u32;
+        let (protocol, name) = match serde_json::from_value::<ControlMessage>(hello) {
+            Ok(ControlMessage::Hello { protocol, name, .. }) => (protocol, name),
+            Ok(_) => {
+                let _ = self.stop();
+                bail!("plugin handshake did not start with hello");
+            }
+            Err(error) => {
+                let _ = self.stop();
+                return Err(error).context("parsing plugin hello");
+            }
+        };
         if protocol != PROTOCOL_VERSION {
             let _ = self.stop();
             bail!(
@@ -347,10 +339,11 @@ impl PluginHost for SidecarPlugin {
                 self.manifest.name
             );
         }
-        let name = hello
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or(&self.manifest.name);
+        let name = if name.is_empty() {
+            self.manifest.name.as_str()
+        } else {
+            name.as_str()
+        };
         if name != self.manifest.name {
             eprintln!(
                 "[plugin] warning: manifest name '{}' differs from hello name '{name}'",
@@ -370,8 +363,10 @@ impl PluginHost for SidecarPlugin {
             .outbound
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("plugin is not started"))?;
-        let message = json!({"type": "configure", "params": params});
-        match outbound.send_timeout(Outbound::Json(message), WRITE_TIMEOUT) {
+        let message = ControlMessage::Configure {
+            params: params.clone(),
+        };
+        match outbound.send_timeout(Outbound::Control(message), WRITE_TIMEOUT) {
             Ok(()) => {}
             Err(_) => {
                 let _ = self.stop();
@@ -387,22 +382,19 @@ impl PluginHost for SidecarPlugin {
                 bail!("plugin did not acknowledge configuration");
             }
             match self.recv_message(remaining) {
-                Ok(WireMessage::Json(value)) => match value.get("type").and_then(Value::as_str) {
-                    Some("ready") => break,
-                    Some("error") => {
-                        let message = value
-                            .get("message")
-                            .and_then(Value::as_str)
-                            .unwrap_or("unknown error")
-                            .to_string();
-                        let _ = self.stop();
-                        bail!(
-                            "plugin '{}' rejected configuration: {message}",
-                            self.manifest.name
-                        );
+                Ok(WireMessage::Json(value)) => {
+                    match serde_json::from_value::<ControlMessage>(value) {
+                        Ok(ControlMessage::Ready) => break,
+                        Ok(ControlMessage::Error { message }) => {
+                            let _ = self.stop();
+                            bail!(
+                                "plugin '{}' rejected configuration: {message}",
+                                self.manifest.name
+                            );
+                        }
+                        _ => continue,
                     }
-                    _ => continue,
-                },
+                }
                 Ok(_) => continue,
                 Err(error) => {
                     let _ = self.stop();
@@ -488,7 +480,7 @@ impl PluginHost for SidecarPlugin {
         // its buffer, and closes the child's stdin so it sees EOF and exits.
         if let Some(outbound) = self.outbound.as_ref() {
             let _ = outbound.send_timeout(
-                Outbound::Json(json!({"type": "shutdown"})),
+                Outbound::Control(ControlMessage::Shutdown),
                 Duration::from_millis(200),
             );
         }
@@ -620,7 +612,7 @@ mod tests {
 
     fn recv_stream(rx: &Receiver<Outbound>) -> Value {
         match rx.try_recv() {
-            Ok(Outbound::Json(value)) => value,
+            Ok(Outbound::Control(control)) => serde_json::to_value(control).unwrap(),
             Ok(_) => panic!("expected a stream JSON message"),
             Err(error) => panic!("missing stream message: {error}"),
         }

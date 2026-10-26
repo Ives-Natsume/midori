@@ -23,6 +23,7 @@ jpeg-decoder = "0.3"
 midori-core.workspace = true
 midori-dsp.workspace = true
 midori-plugin.workspace = true
+midori-plugin-sdk.workspace = true
 midori-source-file.workspace = true
 openhoshimi-codec = { git = "https://github.com/IzumiChino/OpenHoshimi", rev = "8cbd3f646731bcde8eb1b55b042ce9c74f225455" }
 openhoshimi-soundmodem = { git = "https://github.com/IzumiChino/OpenHoshimi", rev = "8cbd3f646731bcde8eb1b55b042ce9c74f225455" }

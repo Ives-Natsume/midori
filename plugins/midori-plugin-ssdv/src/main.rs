@@ -1,17 +1,22 @@
 //! SSDV sidecar: 9k6 BPSK IQ or raw packets in, PNG image events out.
 
-use std::io::{BufReader, BufWriter, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
-use midori_plugin::wire::{WireMessage, read_message, write_json};
-use midori_plugin::{DisplayUpdate, ImageFormat, PROTOCOL_VERSION, PluginEvent, StatusLevel};
+use midori_plugin_sdk::{
+    DisplayUpdate, Emitter, FrameInfo, ImageFormat, Plugin, PluginEvent, Sample, StatusLevel,
+    StreamInfo, StreamKind, default_output_dir, run, stream_kind_name,
+};
 use midori_plugin_ssdv::{
     Bpsk9600AudioReceiver, Bpsk9600Receiver, DEFAULT_CRC_INIT, SessionEvent, SsdvSession,
     parse_crc_inits,
 };
-use serde_json::{Value, json};
+use serde_json::Value;
+
+fn main() -> Result<()> {
+    run(SsdvPlugin::new()?)
+}
 
 enum Pipeline {
     Iq(Bpsk9600Receiver),
@@ -47,7 +52,7 @@ impl Pipeline {
         }
     }
 
-    fn process_iq(&mut self, samples: &[midori_core::Sample]) -> Result<Vec<SessionEvent>> {
+    fn process_iq(&mut self, samples: &[Sample]) -> Result<Vec<SessionEvent>> {
         match self {
             Self::Iq(receiver) => Ok(receiver.process_iq(samples)),
             Self::AudioIf(_) | Self::Bytes(_) => Ok(Vec::new()),
@@ -97,192 +102,199 @@ impl Pipeline {
     }
 }
 
-fn main() -> Result<()> {
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    let mut reader = BufReader::new(stdin.lock());
-    let mut writer = BufWriter::new(stdout.lock());
+struct SsdvPlugin {
+    output_dir: Option<PathBuf>,
+    input: String,
+    crc_inits: Vec<u32>,
+    frame_header_len: usize,
+    pipeline: Pipeline,
+    iq_warned: bool,
+    stream_rate_ok: bool,
+}
 
-    write_json(
-        &mut writer,
-        &json!({
-            "type": "hello",
-            "protocol": PROTOCOL_VERSION,
-            "name": "ssdv",
-            "version": env!("CARGO_PKG_VERSION"),
-        }),
-    )?;
+impl SsdvPlugin {
+    fn new() -> Result<Self> {
+        let output_dir = default_output_dir();
+        let input = "iq".to_string();
+        let crc_inits = vec![DEFAULT_CRC_INIT];
+        let frame_header_len = 5usize;
+        let pipeline = Pipeline::new(
+            &input,
+            output_dir.clone(),
+            crc_inits.clone(),
+            frame_header_len,
+        )?;
+        Ok(Self {
+            output_dir,
+            input,
+            crc_inits,
+            frame_header_len,
+            pipeline,
+            iq_warned: false,
+            stream_rate_ok: true,
+        })
+    }
+}
 
-    let mut output_dir = default_output_dir();
-    let mut input = "iq".to_string();
-    let mut crc_inits = vec![DEFAULT_CRC_INIT];
-    let mut frame_header_len = 5usize;
-    let mut pipeline = Pipeline::new(
-        &input,
-        output_dir.clone(),
-        crc_inits.clone(),
-        frame_header_len,
-    )?;
-    let mut configured = false;
-    let mut iq_warned = false;
-    let mut stream_rate_ok = true;
+impl Plugin for SsdvPlugin {
+    fn name(&self) -> &str {
+        "ssdv"
+    }
 
-    loop {
-        let message = match read_message(&mut reader) {
-            Ok(message) => message,
-            Err(_) => {
-                // stdin EOF means the host closed the pipe: flush partial
-                // images just like an explicit shutdown request.
-                for event in pipeline.flush() {
-                    send_event(&mut writer, event)?;
-                }
-                break;
-            }
-        };
+    fn version(&self) -> &str {
+        env!("CARGO_PKG_VERSION")
+    }
 
-        match message {
-            WireMessage::Json(value) => match value.get("type").and_then(Value::as_str) {
-                Some("configure") => {
-                    let params = value.get("params").cloned().unwrap_or(Value::Null);
-                    if let Some(dir) = params.get("output_dir").and_then(Value::as_str) {
-                        output_dir = if dir.is_empty() {
-                            None
-                        } else {
-                            Some(PathBuf::from(dir))
-                        };
-                    }
-                    if let Some(mode) = params.get("input").and_then(Value::as_str) {
-                        input = mode.to_string();
-                    }
-                    if let Some(values) = params.get("crc_inits").and_then(Value::as_array) {
-                        let values: Vec<String> = values
-                            .iter()
-                            .map(|value| match value {
-                                Value::String(text) => text.clone(),
-                                other => other.to_string(),
-                            })
-                            .collect();
-                        crc_inits = parse_crc_inits(&values);
-                    }
-                    if let Some(len) = params.get("frame_header_len").and_then(Value::as_u64) {
-                        frame_header_len = len as usize;
-                    }
-                    pipeline = Pipeline::new(
-                        &input,
-                        output_dir.clone(),
-                        crc_inits.clone(),
-                        frame_header_len,
-                    )?;
-                    if let Some(ms) = params.get("preview_interval_ms").and_then(Value::as_u64)
-                        && let Pipeline::Bytes(session) = &mut pipeline
-                    {
-                        session.set_preview_interval(Duration::from_millis(ms.max(50)));
-                    }
-                    configured = true;
-                    stream_rate_ok = true;
-                    iq_warned = false;
-                    write_json(&mut writer, &json!({ "type": "ready" }))?;
-                    let crc_text: Vec<String> = crc_inits
-                        .iter()
-                        .map(|init| format!("0x{init:08X}"))
-                        .collect();
-                    send_status(
-                        &mut writer,
-                        StatusLevel::Info,
-                        &format!(
-                            "SSDV CRC init [{}], frame header {} bytes",
-                            crc_text.join(", "),
-                            frame_header_len
-                        ),
-                    )?;
-                }
-                Some("stream") => {
-                    if let Some(rate) = value.get("sample_rate_hz").and_then(Value::as_f64) {
-                        stream_rate_ok = (rate - 48_000.0).abs() <= 1.0;
-                        if !stream_rate_ok && !iq_warned {
-                            iq_warned = true;
-                            send_status(
-                                &mut writer,
-                                StatusLevel::Warning,
-                                &format!(
-                                    "SSDV expects 48 kHz; got {rate:.0} Hz. \
-                                     Use the BPSK demod, BPSK IF for mono 12 kHz \
-                                     audio, and a 48 kHz channel rate."
-                                ),
-                            )?;
-                        }
-                    }
-                    if let Some(kind) = value.get("kind").and_then(Value::as_str)
-                        && !iq_warned
-                    {
-                        let mismatch = (input == "iq" && kind != "iq")
-                            || ((input == "audio-if" || input == "audio") && kind != "audio");
-                        if mismatch {
-                            iq_warned = true;
-                            send_status(
-                                &mut writer,
-                                StatusLevel::Warning,
-                                &format!("SSDV sidecar expects {input}, received {kind}"),
-                            )?;
-                        }
-                    }
-                }
-                Some("shutdown") => {
-                    for event in pipeline.flush() {
-                        send_event(&mut writer, event)?;
-                    }
-                    break;
-                }
-                _ => {}
-            },
-            WireMessage::Iq { samples, .. } => {
-                if !configured || !stream_rate_ok {
-                    continue;
-                }
-                for event in pipeline.process_iq(&samples)? {
-                    send_event(&mut writer, event)?;
-                }
-            }
-            WireMessage::Bytes { bytes, .. } => {
-                if !configured {
-                    continue;
-                }
-                match pipeline.process_bytes(&bytes) {
-                    Ok(events) => {
-                        for event in events {
-                            send_event(&mut writer, event)?;
-                        }
-                    }
-                    Err(error) => send_error(&mut writer, &format!("SSDV input: {error}"))?,
-                }
-            }
-            WireMessage::Audio { samples, .. } => {
-                if !configured || !stream_rate_ok {
-                    continue;
-                }
-                for event in pipeline.process_audio(&samples)? {
-                    send_event(&mut writer, event)?;
-                }
-            }
-            WireMessage::SoftBits { .. } => {}
+    fn configure(&mut self, params: &Value) -> Result<()> {
+        if let Some(dir) = params.get("output_dir").and_then(Value::as_str) {
+            self.output_dir = if dir.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(dir))
+            };
         }
+        if let Some(mode) = params.get("input").and_then(Value::as_str) {
+            self.input = mode.to_string();
+        }
+        if let Some(values) = params.get("crc_inits").and_then(Value::as_array) {
+            let values: Vec<String> = values
+                .iter()
+                .map(|value| match value {
+                    Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                })
+                .collect();
+            self.crc_inits = parse_crc_inits(&values);
+        }
+        if let Some(len) = params.get("frame_header_len").and_then(Value::as_u64) {
+            self.frame_header_len = len as usize;
+        }
+        self.pipeline = Pipeline::new(
+            &self.input,
+            self.output_dir.clone(),
+            self.crc_inits.clone(),
+            self.frame_header_len,
+        )?;
+        if let Some(ms) = params.get("preview_interval_ms").and_then(Value::as_u64)
+            && let Pipeline::Bytes(session) = &mut self.pipeline
+        {
+            session.set_preview_interval(Duration::from_millis(ms.max(50)));
+        }
+        self.stream_rate_ok = true;
+        self.iq_warned = false;
+        Ok(())
     }
 
-    let summary = pipeline.summary();
-    if !summary.is_empty() {
-        eprintln!("[ssdv] {summary}");
+    fn on_ready(&mut self, out: &mut Emitter<'_>) -> Result<()> {
+        let crc_text: Vec<String> = self
+            .crc_inits
+            .iter()
+            .map(|init| format!("0x{init:08X}"))
+            .collect();
+        out.status(
+            StatusLevel::Info,
+            format!(
+                "SSDV CRC init [{}], frame header {} bytes",
+                crc_text.join(", "),
+                self.frame_header_len
+            ),
+        )
     }
-    Ok(())
+
+    fn on_stream(&mut self, info: &StreamInfo, out: &mut Emitter<'_>) -> Result<()> {
+        let rate = info.sample_rate_hz;
+        self.stream_rate_ok = (rate - 48_000.0).abs() <= 1.0;
+        if !self.stream_rate_ok && !self.iq_warned {
+            self.iq_warned = true;
+            out.status(
+                StatusLevel::Warning,
+                format!(
+                    "SSDV expects 48 kHz; got {rate:.0} Hz. \
+                     Use the BPSK demod, BPSK IF for mono 12 kHz \
+                     audio, and a 48 kHz channel rate."
+                ),
+            )?;
+        }
+        if !self.iq_warned {
+            let expected = match self.input.as_str() {
+                "iq" => Some(StreamKind::Iq),
+                "audio-if" | "audio" => Some(StreamKind::Audio),
+                _ => None,
+            };
+            if let Some(expected) = expected
+                && info.kind != expected
+            {
+                self.iq_warned = true;
+                out.status(
+                    StatusLevel::Warning,
+                    format!(
+                        "SSDV sidecar expects {}, received {}",
+                        self.input,
+                        stream_kind_name(info.kind)
+                    ),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn on_iq(
+        &mut self,
+        _meta: &FrameInfo,
+        samples: &[Sample],
+        out: &mut Emitter<'_>,
+    ) -> Result<()> {
+        if !self.stream_rate_ok {
+            return Ok(());
+        }
+        for event in self.pipeline.process_iq(samples)? {
+            send_event(event, out)?;
+        }
+        Ok(())
+    }
+
+    fn on_audio(
+        &mut self,
+        _meta: &FrameInfo,
+        samples: &[f32],
+        out: &mut Emitter<'_>,
+    ) -> Result<()> {
+        if !self.stream_rate_ok {
+            return Ok(());
+        }
+        for event in self.pipeline.process_audio(samples)? {
+            send_event(event, out)?;
+        }
+        Ok(())
+    }
+
+    fn on_bytes(&mut self, _meta: &FrameInfo, bytes: &[u8], out: &mut Emitter<'_>) -> Result<()> {
+        match self.pipeline.process_bytes(bytes) {
+            Ok(events) => {
+                for event in events {
+                    send_event(event, out)?;
+                }
+            }
+            Err(error) => out.error(format!("SSDV input: {error}"), false)?,
+        }
+        Ok(())
+    }
+
+    fn on_shutdown(&mut self, out: &mut Emitter<'_>) -> Result<()> {
+        for event in self.pipeline.flush() {
+            send_event(event, out)?;
+        }
+        let summary = self.pipeline.summary();
+        if !summary.is_empty() {
+            eprintln!("[ssdv] {summary}");
+        }
+        Ok(())
+    }
 }
 
-fn default_output_dir() -> Option<PathBuf> {
-    let dir = std::env::current_dir().ok()?.join("captures");
-    Some(dir)
-}
-
-fn send_event<W: Write>(writer: &mut W, event: SessionEvent) -> Result<()> {
+fn send_event(event: SessionEvent, out: &mut Emitter<'_>) -> Result<()> {
     match event {
-        SessionEvent::Status { level, message } => send_status(writer, level, &message),
+        SessionEvent::Status { level, message } => out.status(level, message),
         SessionEvent::Progress {
             title,
             received,
@@ -302,10 +314,7 @@ fn send_event<W: Write>(writer: &mut W, event: SessionEvent) -> Result<()> {
                 format!("{title} · {received}/{total_hint} estimated packets{missing}")
             };
             let update = DisplayUpdate::Progress { title, fraction };
-            write_json(
-                writer,
-                &serde_json::to_value(PluginEvent::Display { update })?,
-            )
+            out.event(PluginEvent::Display { update })
         }
         SessionEvent::Image(image) => {
             let location = image
@@ -321,10 +330,9 @@ fn send_event<W: Write>(writer: &mut W, event: SessionEvent) -> Result<()> {
             } else {
                 "preview"
             };
-            send_status(
-                writer,
+            out.status(
                 StatusLevel::Info,
-                &format!(
+                format!(
                     "SSDV ID {} {}x{} q{}: {} packets, {} missing, {state} -> {location}",
                     image.image_id,
                     image.width,
@@ -341,36 +349,16 @@ fn send_event<W: Write>(writer: &mut W, event: SessionEvent) -> Result<()> {
             } else {
                 " (preview)".to_string()
             };
-            let update = DisplayUpdate::Image {
-                title: format!(
+            out.image(
+                format!(
                     "SSDV ID {} {}x{}{}",
                     image.image_id, image.width, image.height, suffix
                 ),
-                format: ImageFormat::Png,
-                width: image.width.into(),
-                height: image.height.into(),
-                bytes: image.png,
-            };
-            write_json(
-                writer,
-                &serde_json::to_value(PluginEvent::Display { update })?,
+                ImageFormat::Png,
+                image.width.into(),
+                image.height.into(),
+                image.png,
             )
         }
     }
-}
-
-fn send_status<W: Write>(writer: &mut W, level: StatusLevel, message: &str) -> Result<()> {
-    let event = PluginEvent::Status {
-        level,
-        message: message.to_string(),
-    };
-    write_json(writer, &serde_json::to_value(event)?)
-}
-
-fn send_error<W: Write>(writer: &mut W, message: &str) -> Result<()> {
-    let event = PluginEvent::Error {
-        message: message.to_string(),
-        fatal: false,
-    };
-    write_json(writer, &serde_json::to_value(event)?)
 }

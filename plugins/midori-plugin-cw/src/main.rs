@@ -1,114 +1,128 @@
-use std::io::{BufReader, BufWriter, Write};
+//! CW sidecar: audio in, decoded text events out.
 
 use anyhow::Result;
-use midori_plugin::wire::{WireMessage, read_message, write_json};
-use midori_plugin::{DisplayUpdate, PROTOCOL_VERSION, PluginEvent, StatusLevel};
 use midori_plugin_cw::{MorseDecoder, MorseEvent};
-use serde_json::{Value, json};
+use midori_plugin_sdk::{Emitter, FrameInfo, Plugin, StatusLevel, StreamInfo, run};
+use serde_json::Value;
 
 fn main() -> Result<()> {
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    let mut reader = BufReader::new(stdin.lock());
-    let mut writer = BufWriter::new(stdout.lock());
-
-    write_json(
-        &mut writer,
-        &json!({
-            "type": "hello",
-            "protocol": PROTOCOL_VERSION,
-            "name": "cw",
-            "version": env!("CARGO_PKG_VERSION"),
-        }),
-    )?;
-
-    let mut sample_rate = 48_000.0;
-    let mut tone_hz = 700.0;
-    let mut envelope_hz = 50.0;
-    let mut start_at_signal = false;
-    let mut decoder = MorseDecoder::new_with_envelope(sample_rate, tone_hz, envelope_hz);
-    let mut line = String::new();
-    let mut configured = false;
-    let mut samples_since_status = 0u64;
-
-    loop {
-        let message = match read_message(&mut reader) {
-            Ok(message) => message,
-            Err(_) => break,
-        };
-
-        match message {
-            WireMessage::Json(value) => match value.get("type").and_then(Value::as_str) {
-                Some("configure") => {
-                    let params = value.get("params").cloned().unwrap_or(Value::Null);
-                    if let Some(value) = params.get("tone_hz").and_then(Value::as_f64) {
-                        tone_hz = value;
-                    }
-                    if let Some(value) = params.get("envelope_hz").and_then(Value::as_f64) {
-                        envelope_hz = value;
-                    }
-                    start_at_signal = params
-                        .get("start_at_signal")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false);
-                    decoder = MorseDecoder::new_with_envelope(sample_rate, tone_hz, envelope_hz);
-                    if start_at_signal {
-                        decoder.assume_signal();
-                    }
-                    configured = true;
-                    write_json(&mut writer, &json!({ "type": "ready" }))?;
-                }
-                Some("stream") => {
-                    if let Some(value) = value.get("sample_rate_hz").and_then(Value::as_f64)
-                        && (value - sample_rate).abs() > 1.0
-                    {
-                        sample_rate = value;
-                        decoder =
-                            MorseDecoder::new_with_envelope(sample_rate, tone_hz, envelope_hz);
-                        if start_at_signal {
-                            decoder.assume_signal();
-                        }
-                    }
-                }
-                Some("shutdown") => break,
-                _ => {}
-            },
-            WireMessage::Audio { samples, .. } => {
-                if !configured {
-                    continue;
-                }
-                samples_since_status += samples.len() as u64;
-                send_events(&mut writer, &mut line, decoder.process(&samples))?;
-                if samples_since_status >= sample_rate as u64 {
-                    samples_since_status = 0;
-                    send_status(&mut writer, decoder.wpm(), decoder.tone_hz())?;
-                }
-            }
-            WireMessage::SoftBits { .. } | WireMessage::Bytes { .. } | WireMessage::Iq { .. } => {}
-        }
-    }
-
-    send_events(&mut writer, &mut line, decoder.flush())?;
-
-    Ok(())
+    run(CwPlugin::new())
 }
 
-fn send_events<W: Write>(writer: &mut W, line: &mut String, events: Vec<MorseEvent>) -> Result<()> {
-    for event in events {
-        match event {
-            MorseEvent::Char(character) => {
-                line.push(character);
-                trim_line(line);
-                send_text(writer, line)?;
-            }
-            MorseEvent::Word => {
-                line.push(' ');
-                trim_line(line);
-                send_text(writer, line)?;
-            }
+struct CwPlugin {
+    sample_rate: f64,
+    tone_hz: f64,
+    envelope_hz: f64,
+    start_at_signal: bool,
+    decoder: MorseDecoder,
+    line: String,
+    samples_since_status: u64,
+}
+
+impl CwPlugin {
+    fn new() -> Self {
+        let sample_rate = 48_000.0;
+        let tone_hz = 700.0;
+        let envelope_hz = 50.0;
+        Self {
+            sample_rate,
+            tone_hz,
+            envelope_hz,
+            start_at_signal: false,
+            decoder: MorseDecoder::new_with_envelope(sample_rate, tone_hz, envelope_hz),
+            line: String::new(),
+            samples_since_status: 0,
         }
     }
-    Ok(())
+
+    fn reset_decoder(&mut self) {
+        self.decoder =
+            MorseDecoder::new_with_envelope(self.sample_rate, self.tone_hz, self.envelope_hz);
+        if self.start_at_signal {
+            self.decoder.assume_signal();
+        }
+    }
+
+    fn send_events(&mut self, events: Vec<MorseEvent>, out: &mut Emitter<'_>) -> Result<()> {
+        for event in events {
+            match event {
+                MorseEvent::Char(character) => {
+                    self.line.push(character);
+                    trim_line(&mut self.line);
+                    out.text("CW", vec![self.line.clone()])?;
+                }
+                MorseEvent::Word => {
+                    self.line.push(' ');
+                    trim_line(&mut self.line);
+                    out.text("CW", vec![self.line.clone()])?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Plugin for CwPlugin {
+    fn name(&self) -> &str {
+        "cw"
+    }
+
+    fn version(&self) -> &str {
+        env!("CARGO_PKG_VERSION")
+    }
+
+    fn configure(&mut self, params: &Value) -> Result<()> {
+        if let Some(value) = params.get("tone_hz").and_then(Value::as_f64) {
+            self.tone_hz = value;
+        }
+        if let Some(value) = params.get("envelope_hz").and_then(Value::as_f64) {
+            self.envelope_hz = value;
+        }
+        self.start_at_signal = params
+            .get("start_at_signal")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        self.reset_decoder();
+        Ok(())
+    }
+
+    fn on_stream(&mut self, info: &StreamInfo, _out: &mut Emitter<'_>) -> Result<()> {
+        // Repeated stream messages are usual; only a rate change rebuilds the
+        // decoder.
+        if (info.sample_rate_hz - self.sample_rate).abs() > 1.0 {
+            self.sample_rate = info.sample_rate_hz;
+            self.reset_decoder();
+        }
+        Ok(())
+    }
+
+    fn on_audio(
+        &mut self,
+        _meta: &FrameInfo,
+        samples: &[f32],
+        out: &mut Emitter<'_>,
+    ) -> Result<()> {
+        self.samples_since_status += samples.len() as u64;
+        let events = self.decoder.process(samples);
+        self.send_events(events, out)?;
+        if self.samples_since_status >= self.sample_rate as u64 {
+            self.samples_since_status = 0;
+            out.status(
+                StatusLevel::Info,
+                format!(
+                    "{:.0} WPM · {:.0} Hz",
+                    self.decoder.wpm(),
+                    self.decoder.tone_hz()
+                ),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn on_shutdown(&mut self, out: &mut Emitter<'_>) -> Result<()> {
+        let events = self.decoder.flush();
+        self.send_events(events, out)
+    }
 }
 
 fn trim_line(line: &mut String) {
@@ -117,22 +131,4 @@ fn trim_line(line: &mut String) {
         let cut = line.len() - MAX;
         line.drain(..cut);
     }
-}
-
-fn send_text<W: Write>(writer: &mut W, line: &str) -> Result<()> {
-    let event = PluginEvent::Display {
-        update: DisplayUpdate::Text {
-            title: "CW".to_string(),
-            lines: vec![line.to_string()],
-        },
-    };
-    write_json(writer, &serde_json::to_value(event)?)
-}
-
-fn send_status<W: Write>(writer: &mut W, wpm: f32, tone_hz: f32) -> Result<()> {
-    let event = PluginEvent::Status {
-        level: StatusLevel::Info,
-        message: format!("{wpm:.0} WPM · {tone_hz:.0} Hz"),
-    };
-    write_json(writer, &serde_json::to_value(event)?)
 }
