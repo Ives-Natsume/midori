@@ -27,6 +27,8 @@ pub struct WavIqSource {
     buffer_samples: usize,
     start_sample: u64,
     first_timestamp_ns: Option<u64>,
+    pace_anchor: Option<Instant>,
+    paced_samples: u64,
 }
 
 impl WavIqSource {
@@ -42,11 +44,16 @@ impl WavIqSource {
             buffer_samples: 32_768,
             start_sample: 0,
             first_timestamp_ns: None,
+            pace_anchor: None,
+            paced_samples: 0,
         })
     }
 
     pub fn set_realtime(&mut self, realtime: bool) {
-        self.realtime = realtime;
+        if self.realtime != realtime {
+            self.realtime = realtime;
+            self.reset_pacing();
+        }
     }
 
     pub fn loop_file(&self) -> bool {
@@ -67,6 +74,12 @@ impl WavIqSource {
 
     pub fn is_finished(&self) -> bool {
         self.finished
+    }
+
+    /// Restart the realtime playback schedule from the next block.
+    fn reset_pacing(&mut self) {
+        self.pace_anchor = None;
+        self.paced_samples = 0;
     }
 }
 
@@ -90,6 +103,7 @@ impl IqSource for WavIqSource {
         self.start_sample = 0;
         self.first_timestamp_ns = None;
         self.finished = false;
+        self.reset_pacing();
         let file = self.reader.spec();
         let spec = StreamSpec {
             sample_rate_hz: file.sample_rate_hz,
@@ -107,6 +121,7 @@ impl IqSource for WavIqSource {
         self.start_sample = 0;
         self.first_timestamp_ns = None;
         self.finished = false;
+        self.reset_pacing();
         Ok(())
     }
 
@@ -118,11 +133,18 @@ impl IqSource for WavIqSource {
             .spec
             .ok_or_else(|| anyhow!("source is not configured"))?;
         let started = Instant::now();
+        if self.realtime && self.pace_anchor.is_none() {
+            self.pace_anchor = Some(started);
+        }
         let mut samples = self.reader.read_iq(self.buffer_samples)?;
 
         if samples.is_empty() {
             if self.loop_file {
                 self.reader.rewind()?;
+                self.reset_pacing();
+                if self.realtime {
+                    self.pace_anchor = Some(Instant::now());
+                }
                 samples = self.reader.read_iq(self.buffer_samples)?;
             }
             if samples.is_empty() {
@@ -150,10 +172,23 @@ impl IqSource for WavIqSource {
         self.start_sample += frames as u64;
 
         if self.realtime {
-            let duration = Duration::from_secs_f64(frames as f64 / spec.sample_rate_hz);
-            let elapsed = started.elapsed();
-            if duration > elapsed {
-                std::thread::sleep(duration - elapsed);
+            // Pace against an absolute schedule rather than sleeping for one
+            // block at a time: consumer work between reads must not stretch
+            // playback beyond real time.
+            self.paced_samples += frames as u64;
+            let anchor = self.pace_anchor.unwrap_or(started);
+            let target =
+                anchor + Duration::from_secs_f64(self.paced_samples as f64 / spec.sample_rate_hz);
+            let now = Instant::now();
+            if let Some(late) = now.checked_duration_since(target) {
+                if late > MAX_PACING_LAG {
+                    // The consumer stalled; restart the schedule instead of
+                    // bursting back-to-back blocks to catch up.
+                    self.pace_anchor = Some(now);
+                    self.paced_samples = frames as u64;
+                }
+            } else {
+                std::thread::sleep(target - now);
             }
         }
 
@@ -179,6 +214,10 @@ impl IqSource for WavIqSource {
         self.finished
     }
 }
+
+/// Maximum amount a realtime playback schedule may slip before it is restarted
+/// instead of trying to catch up with a burst of blocks.
+const MAX_PACING_LAG: Duration = Duration::from_secs(1);
 
 fn now_ns() -> u64 {
     SystemTime::now()
@@ -255,6 +294,44 @@ mod tests {
             assert_eq!(source.read_block().unwrap().len(), 4);
         }
         assert!(!source.is_finished());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn realtime_playback_tracks_an_absolute_schedule() {
+        let sample_rate = 8_000u32;
+        let frames_per_block = 400usize;
+        let blocks = 10usize;
+        let path = temp_wav(frames_per_block * blocks, sample_rate);
+
+        let mut source = WavIqSource::open(&path, false).unwrap();
+        source.set_realtime(true);
+        source
+            .configure(SourceConfig {
+                buffer_samples: frames_per_block,
+                ..SourceConfig::default()
+            })
+            .unwrap();
+
+        let started = Instant::now();
+        for index in 0..blocks {
+            let block = source.read_block().unwrap();
+            assert_eq!(block.len(), frames_per_block);
+            if index + 1 < blocks {
+                // Simulate consumer work between reads.
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        let elapsed = started.elapsed();
+
+        let expected =
+            Duration::from_secs_f64((frames_per_block * blocks) as f64 / sample_rate as f64);
+        let tolerance = expected.mul_f64(0.15);
+        assert!(
+            elapsed >= expected - tolerance && elapsed <= expected + tolerance,
+            "elapsed {elapsed:?}, expected about {expected:?}; \
+             consumer time must not accumulate into playback drift"
+        );
         let _ = std::fs::remove_file(path);
     }
 }
