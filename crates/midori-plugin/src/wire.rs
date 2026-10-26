@@ -1,14 +1,19 @@
 //! Length-prefixed binary framing for plugin sidecars.
 //!
-//! Header:
+//! Header (protocol version 2):
 //!
 //! ```text
 //! u32 payload_len (LE)
 //! u8  kind
 //! u64 seq (LE)
-//! f64 timestamp_ns (LE)
+//! u64 timestamp_ns (LE, UTC nanoseconds or [`NO_TIMESTAMP`])
 //! payload
 //! ```
+//!
+//! The timestamp is an exact `u64` so it can carry `midori_core`'s UTC
+//! nanosecond clock without the precision loss of a `f64`. An unknown timestamp
+//! is encoded as [`NO_TIMESTAMP`] (`u64::MAX`); the Rust API uses
+//! `Option<u64>` and only applies the sentinel on the wire.
 //!
 //! Control and event messages are JSON payloads (`kind = 1`). Audio is
 //! interleaved f32 LE samples (`kind = 2`); soft bits and bytes use kinds 3
@@ -23,6 +28,8 @@ use num_complex::Complex32;
 use serde_json::Value;
 
 pub const HEADER_LEN: usize = 21;
+/// Wire sentinel for "timestamp unknown". Never a valid UTC nanosecond value.
+pub const NO_TIMESTAMP: u64 = u64::MAX;
 const MAX_PAYLOAD: usize = 64 * 1024 * 1024;
 
 pub const KIND_JSON: u8 = 1;
@@ -36,35 +43,35 @@ pub enum WireMessage {
     Json(Value),
     Audio {
         seq: u64,
-        timestamp_ns: f64,
+        timestamp_ns: Option<u64>,
         samples: Vec<f32>,
     },
     SoftBits {
         seq: u64,
-        timestamp_ns: f64,
+        timestamp_ns: Option<u64>,
         bits: Vec<u8>,
     },
     Bytes {
         seq: u64,
-        timestamp_ns: f64,
+        timestamp_ns: Option<u64>,
         bytes: Vec<u8>,
     },
     Iq {
         seq: u64,
-        timestamp_ns: f64,
+        timestamp_ns: Option<u64>,
         samples: Vec<Sample>,
     },
 }
 
 pub fn write_json<W: Write>(writer: &mut W, value: &Value) -> Result<()> {
     let payload = serde_json::to_vec(value)?;
-    write_frame(writer, KIND_JSON, 0, 0.0, &payload)
+    write_frame(writer, KIND_JSON, 0, None, &payload)
 }
 
 pub fn write_audio<W: Write>(
     writer: &mut W,
     seq: u64,
-    timestamp_ns: f64,
+    timestamp_ns: Option<u64>,
     samples: &[f32],
 ) -> Result<()> {
     let mut payload = Vec::with_capacity(samples.len() * 4);
@@ -77,7 +84,7 @@ pub fn write_audio<W: Write>(
 pub fn write_soft_bits<W: Write>(
     writer: &mut W,
     seq: u64,
-    timestamp_ns: f64,
+    timestamp_ns: Option<u64>,
     bits: &[u8],
 ) -> Result<()> {
     write_frame(writer, KIND_SOFTBITS, seq, timestamp_ns, bits)
@@ -86,7 +93,7 @@ pub fn write_soft_bits<W: Write>(
 pub fn write_bytes<W: Write>(
     writer: &mut W,
     seq: u64,
-    timestamp_ns: f64,
+    timestamp_ns: Option<u64>,
     bytes: &[u8],
 ) -> Result<()> {
     write_frame(writer, KIND_BYTES, seq, timestamp_ns, bytes)
@@ -98,7 +105,7 @@ pub fn write_bytes<W: Write>(
 pub fn write_iq<W: Write>(
     writer: &mut W,
     seq: u64,
-    timestamp_ns: f64,
+    timestamp_ns: Option<u64>,
     samples: &[Sample],
 ) -> Result<()> {
     let mut payload = Vec::with_capacity(samples.len() * 8);
@@ -113,7 +120,7 @@ fn write_frame<W: Write>(
     writer: &mut W,
     kind: u8,
     seq: u64,
-    timestamp_ns: f64,
+    timestamp_ns: Option<u64>,
     payload: &[u8],
 ) -> Result<()> {
     let len = u32::try_from(payload.len()).map_err(|_| anyhow::anyhow!("frame too large"))?;
@@ -121,7 +128,7 @@ fn write_frame<W: Write>(
     header[0..4].copy_from_slice(&len.to_le_bytes());
     header[4] = kind;
     header[5..13].copy_from_slice(&seq.to_le_bytes());
-    header[13..21].copy_from_slice(&timestamp_ns.to_le_bytes());
+    header[13..21].copy_from_slice(&timestamp_ns.unwrap_or(NO_TIMESTAMP).to_le_bytes());
 
     writer.write_all(&header)?;
     writer.write_all(payload)?;
@@ -139,7 +146,10 @@ pub fn read_message<R: Read>(reader: &mut R) -> Result<WireMessage> {
     }
     let kind = header[4];
     let seq = u64::from_le_bytes(header[5..13].try_into().unwrap());
-    let timestamp_ns = f64::from_le_bytes(header[13..21].try_into().unwrap());
+    let timestamp_ns = match u64::from_le_bytes(header[13..21].try_into().unwrap()) {
+        NO_TIMESTAMP => None,
+        timestamp_ns => Some(timestamp_ns),
+    };
 
     let mut payload = vec![0u8; len];
     reader.read_exact(&mut payload)?;
@@ -210,10 +220,20 @@ mod tests {
         }
     }
 
+    const TIMESTAMP_NS: u64 = 1_792_466_014_123_456_789;
+
+    #[test]
+    fn header_length_is_stable() {
+        assert_eq!(HEADER_LEN, 21);
+        let mut buffer = Vec::new();
+        write_audio(&mut buffer, 1, Some(TIMESTAMP_NS), &[0.0, 1.0]).unwrap();
+        assert_eq!(buffer.len(), HEADER_LEN + 8);
+    }
+
     #[test]
     fn audio_roundtrip() {
         let mut buffer = Vec::new();
-        write_audio(&mut buffer, 7, 1234.5, &[0.25, -0.5, 0.0]).unwrap();
+        write_audio(&mut buffer, 7, Some(1234), &[0.25, -0.5, 0.0]).unwrap();
         let message = read_message(&mut Cursor::new(buffer)).unwrap();
         match message {
             WireMessage::Audio {
@@ -222,9 +242,41 @@ mod tests {
                 samples,
             } => {
                 assert_eq!(seq, 7);
-                assert_eq!(timestamp_ns, 1234.5);
+                assert_eq!(timestamp_ns, Some(1234));
                 assert_eq!(samples, vec![0.25, -0.5, 0.0]);
             }
+            _ => panic!("expected audio"),
+        }
+    }
+
+    #[test]
+    fn timestamp_roundtrip_is_exact() {
+        let mut buffer = Vec::new();
+        write_audio(&mut buffer, 1, Some(TIMESTAMP_NS), &[0.0]).unwrap();
+        match read_message(&mut Cursor::new(buffer)).unwrap() {
+            WireMessage::Audio { timestamp_ns, .. } => {
+                assert_eq!(timestamp_ns, Some(TIMESTAMP_NS));
+            }
+            _ => panic!("expected audio"),
+        }
+    }
+
+    #[test]
+    fn missing_timestamp_roundtrips_as_none() {
+        let mut buffer = Vec::new();
+        write_audio(&mut buffer, 1, None, &[0.0]).unwrap();
+        match read_message(&mut Cursor::new(buffer)).unwrap() {
+            WireMessage::Audio { timestamp_ns, .. } => assert_eq!(timestamp_ns, None),
+            _ => panic!("expected audio"),
+        }
+    }
+
+    #[test]
+    fn zero_timestamp_is_not_the_sentinel() {
+        let mut buffer = Vec::new();
+        write_audio(&mut buffer, 1, Some(0), &[0.0]).unwrap();
+        match read_message(&mut Cursor::new(buffer)).unwrap() {
+            WireMessage::Audio { timestamp_ns, .. } => assert_eq!(timestamp_ns, Some(0)),
             _ => panic!("expected audio"),
         }
     }
@@ -233,7 +285,7 @@ mod tests {
     fn iq_roundtrip() {
         let samples = [Complex32::new(0.5, -0.25), Complex32::new(-1.0, 0.0)];
         let mut buffer = Vec::new();
-        write_iq(&mut buffer, 9, 42.0, &samples).unwrap();
+        write_iq(&mut buffer, 9, Some(TIMESTAMP_NS), &samples).unwrap();
         let message = read_message(&mut Cursor::new(buffer)).unwrap();
         match message {
             WireMessage::Iq {
@@ -242,7 +294,7 @@ mod tests {
                 samples: decoded,
             } => {
                 assert_eq!(seq, 9);
-                assert_eq!(timestamp_ns, 42.0);
+                assert_eq!(timestamp_ns, Some(TIMESTAMP_NS));
                 assert_eq!(decoded, samples.to_vec());
             }
             _ => panic!("expected IQ"),

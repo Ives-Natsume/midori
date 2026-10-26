@@ -53,7 +53,7 @@ fn sidecar_decodes_raw_ccsds_frames() {
 
     eprintln!("test: sending {} frames", frames.len() / 223);
     for (seq, frame) in frames.chunks_exact(223).enumerate() {
-        write_bytes(&mut writer, seq as u64, 0.0, frame).unwrap();
+        write_bytes(&mut writer, seq as u64, None, frame).unwrap();
     }
 
     eprintln!("test: reading events");

@@ -1,14 +1,21 @@
 //! Out-of-process plugin supervisor with handshake and I/O timeouts.
 //!
-//! The sidecar handshake is deliberately small:
+//! The sidecar handshake is deliberately small (protocol version 2):
 //!
-//! 1. plugin → host: `{"type":"hello","protocol":1,"name":"...","version":"..."}`
+//! 1. plugin → host: `{"type":"hello","protocol":2,"name":"...","version":"..."}`
 //! 2. host → plugin: `{"type":"configure","params":{...}}`
 //! 3. plugin → host: `{"type":"ready"}`
 //! 4. host → plugin: `{"type":"stream", ...}` before the first data frame
 //! 5. host → plugin: audio / soft-bit / byte frames
 //! 6. plugin → host: JSON `PluginEvent`s
 //! 7. host → plugin: `{"type":"shutdown"}`
+//!
+//! A `stream` message is sent immediately when the stream kind, sample rate,
+//! or VFO id changes. Frequency metadata (centre/nominal frequency, bandwidth,
+//! Doppler) can move every block, so updates that only change those fields are
+//! rate-limited to one message per second. Plugins must therefore tolerate
+//! repeated `stream` messages and must not reset decoder state unless the kind
+//! or sample rate actually changed.
 //!
 //! Both directions run on dedicated threads with bounded queues. A plugin that
 //! stops reading, stops responding, or dies cannot block the SDR worker; the
@@ -35,35 +42,93 @@ const CONFIGURE_TIMEOUT: Duration = Duration::from_secs(3);
 const WRITE_TIMEOUT: Duration = Duration::from_millis(500);
 const STOP_TIMEOUT: Duration = Duration::from_secs(1);
 const OUTBOUND_QUEUE: usize = 32;
+/// Minimum spacing between `stream` messages that only update frequency
+/// metadata. Kind, sample-rate and VFO changes bypass this limit.
+const STREAM_METADATA_INTERVAL: Duration = Duration::from_secs(1);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct StreamKey {
-    kind: String,
+    kind: StreamKind,
     sample_rate_bits: u64,
     center_freq_bits: u64,
+    nominal_freq_bits: u64,
+    bandwidth_bits: u64,
+    doppler_bits: u64,
+    doppler_rate_bits: u64,
     vfo_id: Option<u32>,
+}
+
+impl StreamKey {
+    fn new(kind: StreamKind, meta: &FrameMeta) -> Self {
+        Self {
+            kind,
+            sample_rate_bits: meta.sample_rate_hz.to_bits(),
+            center_freq_bits: meta.center_freq_hz.to_bits(),
+            nominal_freq_bits: meta.nominal_freq_hz.to_bits(),
+            bandwidth_bits: meta.bandwidth_hz.to_bits(),
+            doppler_bits: meta.doppler_hz.to_bits(),
+            doppler_rate_bits: meta.doppler_rate_hz_s.to_bits(),
+            vfo_id: meta.vfo_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StreamState {
+    key: StreamKey,
+    sent_at: Instant,
+}
+
+/// Decide whether a `stream` message is due.
+///
+/// Kind, sample rate and VFO changes are structural and always resend
+/// immediately. Frequency-only metadata changes are coalesced so live
+/// Doppler/AFC updates cannot fill the outbound queue.
+fn stream_update_due(prev: Option<&StreamState>, next: &StreamKey, now: Instant) -> bool {
+    let Some(prev) = prev else {
+        return true;
+    };
+    if prev.key.kind != next.kind
+        || prev.key.sample_rate_bits != next.sample_rate_bits
+        || prev.key.vfo_id != next.vfo_id
+    {
+        return true;
+    }
+    if prev.key == *next {
+        return false;
+    }
+    now.saturating_duration_since(prev.sent_at) >= STREAM_METADATA_INTERVAL
+}
+
+fn stream_kind_name(kind: StreamKind) -> &'static str {
+    match kind {
+        StreamKind::Iq => "iq",
+        StreamKind::Audio => "audio",
+        StreamKind::SoftBits => "soft_bits",
+        StreamKind::Bytes => "bytes",
+    }
 }
 
 enum Outbound {
     Json(Value),
     Audio {
         seq: u64,
-        timestamp_ns: f64,
+        timestamp_ns: Option<u64>,
         samples: Arc<[f32]>,
     },
     SoftBits {
         seq: u64,
-        timestamp_ns: f64,
+        timestamp_ns: Option<u64>,
         bits: Arc<[u8]>,
     },
     Bytes {
         seq: u64,
-        timestamp_ns: f64,
+        timestamp_ns: Option<u64>,
         bytes: Arc<[u8]>,
     },
     Iq {
         seq: u64,
-        timestamp_ns: f64,
+        timestamp_ns: Option<u64>,
         samples: Arc<[midori_core::Sample]>,
     },
 }
@@ -75,7 +140,7 @@ pub struct SidecarPlugin {
     inbound: Option<Receiver<WireMessage>>,
     writer_thread: Option<JoinHandle<()>>,
     reader_thread: Option<JoinHandle<()>>,
-    stream: Option<StreamKey>,
+    stream: Option<StreamState>,
     configured: bool,
     closed_reported: bool,
 }
@@ -166,24 +231,16 @@ impl SidecarPlugin {
         }
     }
 
-    fn ensure_stream(&mut self, kind: &str, meta: &FrameMeta) -> Result<()> {
-        let key = StreamKey {
-            kind: kind.to_string(),
-            sample_rate_bits: meta.sample_rate_hz.to_bits(),
-            center_freq_bits: meta.center_freq_hz.to_bits(),
-            vfo_id: meta.vfo_id,
-        };
-        if self.stream.as_ref() == Some(&key) {
+    fn ensure_stream(&mut self, kind: StreamKind, meta: &FrameMeta) -> Result<()> {
+        let now = Instant::now();
+        let key = StreamKey::new(kind, meta);
+        if !stream_update_due(self.stream.as_ref(), &key, now) {
             return Ok(());
         }
 
-        let outbound = self
-            .outbound
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("plugin is not started"))?;
         let message = json!({
             "type": "stream",
-            "kind": kind,
+            "kind": stream_kind_name(kind),
             "sample_rate_hz": meta.sample_rate_hz,
             "channels": 1,
             "center_freq_hz": meta.center_freq_hz,
@@ -193,18 +250,21 @@ impl SidecarPlugin {
             "doppler_rate_hz_s": meta.doppler_rate_hz_s,
             "vfo_id": meta.vfo_id,
         });
-        match outbound.try_send(Outbound::Json(message)) {
-            Ok(()) => {
-                self.stream = Some(key);
-                Ok(())
-            }
+        self.enqueue(Outbound::Json(message))?;
+        self.stream = Some(StreamState { key, sent_at: now });
+        Ok(())
+    }
+
+    fn enqueue(&self, message: Outbound) -> Result<()> {
+        let outbound = self
+            .outbound
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("plugin is not started"))?;
+        match outbound.try_send(message) {
+            Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => bail!("plugin outbound queue is full"),
             Err(TrySendError::Disconnected(_)) => bail!("plugin writer has stopped"),
         }
-    }
-
-    fn timestamp(meta: &FrameMeta) -> f64 {
-        meta.timestamp_ns.unwrap_or(0) as f64
     }
 }
 
@@ -359,69 +419,41 @@ impl PluginHost for SidecarPlugin {
 
     fn send_frame(&mut self, frame: Frame) -> Result<()> {
         let meta = frame.meta;
-        let outbound = self
-            .outbound
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("plugin is not started"))?;
-
-        match frame.data {
-            StreamData::Audio(samples) => {
-                self.ensure_stream("audio", &meta)?;
-                let message = Outbound::Audio {
-                    seq: meta.seq,
-                    timestamp_ns: Self::timestamp(&meta),
-                    samples,
-                };
-                match outbound.try_send(message) {
-                    Ok(()) => Ok(()),
-                    Err(TrySendError::Full(_)) => bail!("plugin outbound queue is full"),
-                    Err(TrySendError::Disconnected(_)) => bail!("plugin writer has stopped"),
-                }
-            }
-            StreamData::SoftBits(bits) => {
-                self.ensure_stream("soft_bits", &meta)?;
-                let message = Outbound::SoftBits {
-                    seq: meta.seq,
-                    timestamp_ns: Self::timestamp(&meta),
-                    bits,
-                };
-                match outbound.try_send(message) {
-                    Ok(()) => Ok(()),
-                    Err(TrySendError::Full(_)) => bail!("plugin outbound queue is full"),
-                    Err(TrySendError::Disconnected(_)) => bail!("plugin writer has stopped"),
-                }
-            }
-            StreamData::Bytes(bytes) => {
-                self.ensure_stream("bytes", &meta)?;
-                let message = Outbound::Bytes {
-                    seq: meta.seq,
-                    timestamp_ns: Self::timestamp(&meta),
-                    bytes,
-                };
-                match outbound.try_send(message) {
-                    Ok(()) => Ok(()),
-                    Err(TrySendError::Full(_)) => bail!("plugin outbound queue is full"),
-                    Err(TrySendError::Disconnected(_)) => bail!("plugin writer has stopped"),
-                }
-            }
-            StreamData::Iq(samples) => {
-                if !matches!(&self.manifest.input, crate::InputSpec::Iq { .. }) {
-                    bail!("plugin '{}' does not accept IQ", self.manifest.name);
-                }
-                self.ensure_stream("iq", &meta)?;
-                let message = Outbound::Iq {
-                    seq: meta.seq,
-                    timestamp_ns: Self::timestamp(&meta),
-                    samples,
-                };
-                match outbound.try_send(message) {
-                    Ok(()) => Ok(()),
-                    Err(TrySendError::Full(_)) => bail!("plugin outbound queue is full"),
-                    Err(TrySendError::Disconnected(_)) => bail!("plugin writer has stopped"),
-                }
-            }
+        let kind = frame.data.kind();
+        let expected = self.input_kind();
+        if kind != expected {
+            bail!(
+                "plugin '{}' expects {} input, received {}",
+                self.manifest.name,
+                stream_kind_name(expected),
+                stream_kind_name(kind)
+            );
         }
+
+        self.ensure_stream(kind, &meta)?;
+        let message = match frame.data {
+            StreamData::Audio(samples) => Outbound::Audio {
+                seq: meta.seq,
+                timestamp_ns: meta.timestamp_ns,
+                samples,
+            },
+            StreamData::SoftBits(bits) => Outbound::SoftBits {
+                seq: meta.seq,
+                timestamp_ns: meta.timestamp_ns,
+                bits,
+            },
+            StreamData::Bytes(bytes) => Outbound::Bytes {
+                seq: meta.seq,
+                timestamp_ns: meta.timestamp_ns,
+                bytes,
+            },
+            StreamData::Iq(samples) => Outbound::Iq {
+                seq: meta.seq,
+                timestamp_ns: meta.timestamp_ns,
+                samples,
+            },
+        };
+        self.enqueue(message)
     }
 
     fn try_recv(&mut self) -> Result<Option<PluginEvent>> {
@@ -553,6 +585,149 @@ impl Drop for SidecarPlugin {
 mod tests {
     use super::*;
     use crate::{InputSpec, OutputKind};
+    use midori_core::BlockFlags;
+
+    fn audio_manifest() -> Manifest {
+        Manifest {
+            name: "test".to_string(),
+            version: "0.1.0".to_string(),
+            protocol: PROTOCOL_VERSION,
+            command: vec!["true".to_string()],
+            input: InputSpec::Audio {
+                sample_rate_hz: 48_000.0,
+                channels: 1,
+            },
+            outputs: vec![OutputKind::Display],
+            params: vec![],
+        }
+    }
+
+    fn frame_meta(center_freq_hz: f64, sample_rate_hz: f64) -> FrameMeta {
+        FrameMeta {
+            seq: 0,
+            start_sample: 0,
+            timestamp_ns: Some(1),
+            sample_rate_hz,
+            center_freq_hz,
+            nominal_freq_hz: center_freq_hz,
+            bandwidth_hz: 3_000.0,
+            vfo_id: Some(0),
+            doppler_hz: 0.0,
+            doppler_rate_hz_s: 0.0,
+            flags: BlockFlags::default(),
+        }
+    }
+
+    fn recv_stream(rx: &Receiver<Outbound>) -> Value {
+        match rx.try_recv() {
+            Ok(Outbound::Json(value)) => value,
+            Ok(_) => panic!("expected a stream JSON message"),
+            Err(error) => panic!("missing stream message: {error}"),
+        }
+    }
+
+    #[test]
+    fn frequency_only_updates_are_rate_limited() {
+        let start = Instant::now();
+        let mut meta = frame_meta(144_000_000.0, 48_000.0);
+        let key = StreamKey::new(StreamKind::Audio, &meta);
+        assert!(stream_update_due(None, &key, start));
+        let state = StreamState {
+            key,
+            sent_at: start,
+        };
+
+        // A VFO whose Doppler/AFC moves every block must not resend more than
+        // once per second.
+        for step in 1..=9 {
+            meta.center_freq_hz += 10.0;
+            meta.doppler_hz += 1.0;
+            let next = StreamKey::new(StreamKind::Audio, &meta);
+            let now = start + Duration::from_millis(step * 100);
+            assert!(!stream_update_due(Some(&state), &next, now));
+        }
+
+        meta.center_freq_hz += 10.0;
+        let next = StreamKey::new(StreamKind::Audio, &meta);
+        assert!(stream_update_due(
+            Some(&state),
+            &next,
+            start + STREAM_METADATA_INTERVAL
+        ));
+    }
+
+    #[test]
+    fn structural_changes_resend_immediately() {
+        let start = Instant::now();
+        let meta = frame_meta(144_000_000.0, 48_000.0);
+        let key = StreamKey::new(StreamKind::Audio, &meta);
+        let state = StreamState {
+            key,
+            sent_at: start,
+        };
+        let now = start + Duration::from_millis(1);
+
+        let mut rate_changed = meta;
+        rate_changed.sample_rate_hz = 96_000.0;
+        assert!(stream_update_due(
+            Some(&state),
+            &StreamKey::new(StreamKind::Audio, &rate_changed),
+            now
+        ));
+
+        assert!(stream_update_due(
+            Some(&state),
+            &StreamKey::new(StreamKind::Iq, &meta),
+            now
+        ));
+
+        let mut vfo_changed = meta;
+        vfo_changed.vfo_id = Some(3);
+        assert!(stream_update_due(
+            Some(&state),
+            &StreamKey::new(StreamKind::Audio, &vfo_changed),
+            now
+        ));
+    }
+
+    #[test]
+    fn ensure_stream_coalesces_frequency_updates() {
+        let mut plugin = SidecarPlugin::new(audio_manifest()).unwrap();
+        let (tx, rx) = bounded(OUTBOUND_QUEUE);
+        plugin.outbound = Some(tx);
+
+        let mut meta = frame_meta(144_000_000.0, 48_000.0);
+        plugin.ensure_stream(StreamKind::Audio, &meta).unwrap();
+        assert_eq!(recv_stream(&rx)["kind"], "audio");
+
+        for _ in 0..32 {
+            meta.center_freq_hz += 10.0;
+            meta.doppler_hz += 1.0;
+            plugin.ensure_stream(StreamKind::Audio, &meta).unwrap();
+        }
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+
+        // A sample-rate change bypasses the metadata rate limit.
+        meta.sample_rate_hz = 96_000.0;
+        plugin.ensure_stream(StreamKind::Audio, &meta).unwrap();
+        assert_eq!(recv_stream(&rx)["sample_rate_hz"], 96_000.0);
+    }
+
+    #[test]
+    fn send_frame_rejects_mismatched_input_kind() {
+        let mut plugin = SidecarPlugin::new(audio_manifest()).unwrap();
+        let bytes: Arc<[u8]> = Arc::from(vec![1u8, 2, 3].into_boxed_slice());
+        let frame = Frame::new(
+            frame_meta(144_000_000.0, 48_000.0),
+            StreamData::Bytes(bytes),
+        );
+
+        let error = plugin.send_frame(frame).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("expects audio input, received bytes"),
+            "unexpected error: {error:#}"
+        );
+    }
 
     #[test]
     #[cfg(unix)]

@@ -2,8 +2,13 @@
 //!
 //! Decoders run out of process so they can be written in any language, carry
 //! their own license, and crash without taking the engine down. This crate
-//! defines the language-neutral manifest and event types plus the host trait.
-//! The wire format and supervisor implementation will live alongside it.
+//! defines the language-neutral manifest and event types, the binary wire
+//! framing, and the sidecar supervisor.
+//!
+//! Protocol version 2 carries timestamps as exact `u64` UTC nanoseconds (with
+//! [`wire::NO_TIMESTAMP`] for "unknown") and rate-limits `stream` messages
+//! that only update frequency metadata. See [`wire`] and [`sidecar`] for the
+//! framing and handshake details.
 
 use std::path::Path;
 
@@ -11,7 +16,7 @@ use anyhow::{Context, Result, bail};
 use midori_core::{Frame, FrameMeta, StreamKind};
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 pub mod sidecar;
 pub mod wire;
@@ -238,7 +243,7 @@ mod tests {
     {
       "name": "example",
       "version": "0.1.0",
-      "protocol": 1,
+      "protocol": 2,
       "command": ["example-plugin"],
       "input": { "type": "audio", "sample_rate_hz": 48000, "channels": 1 },
       "outputs": ["packets", "display"],
@@ -264,7 +269,7 @@ mod tests {
 
     #[test]
     fn rejects_wrong_protocol() {
-        let bad = MANIFEST.replace("\"protocol\": 1", "\"protocol\": 2");
+        let bad = MANIFEST.replace("\"protocol\": 2", "\"protocol\": 1");
         assert!(Manifest::from_json(&bad).is_err());
     }
 

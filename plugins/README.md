@@ -12,7 +12,8 @@ engine                          plugin
   |<--------- hello --------------|
   |---------- configure --------->|
   |<--------- ready --------------|
-  |---------- stream ------------>|   (once per rate/frequency change)
+  |---------- stream ------------>|   (immediately on kind/rate/VFO changes;
+  |                               |    frequency-only updates rate-limited)
   |---------- audio frames ------>|
   |<--------- events -------------|
   |---------- shutdown ---------->|
@@ -28,7 +29,7 @@ Example manifest:
 {
   "name": "cw",
   "version": "0.1.0",
-  "protocol": 1,
+  "protocol": 2,
   "command": ["midori-plugin-cw"],
   "input": { "type": "audio", "sample_rate_hz": 48000, "channels": 1 },
   "outputs": ["display", "packets"],
@@ -38,15 +39,21 @@ Example manifest:
 
 ## Wire format
 
-Every message has a 21-byte header:
+Every message has a 21-byte header (protocol version 2):
 
 ```text
 u32 payload_len (little-endian)
 u8  kind
 u64 seq (little-endian)
-f64 timestamp_ns (little-endian)
+u64 timestamp_ns (little-endian, UTC nanoseconds)
 payload
 ```
+
+`timestamp_ns` is an exact unsigned nanosecond count. The sentinel
+`0xFFFFFFFFFFFFFFFF` (`u64::MAX`) means "timestamp unknown"; the Rust API uses
+`Option<u64>` and only applies the sentinel on the wire. Protocol v1 used an
+`f64` here, which lost precision at epoch scale and could not distinguish an
+unknown timestamp from zero.
 
 Kinds:
 
@@ -63,8 +70,11 @@ Control messages are JSON objects with a `type` field:
 - plugin → host: `hello`, `ready`, `display`, `status`, `error`, `packet`
 - host → plugin: `configure`, `stream`, `shutdown`
 
-`stream` is sent before the first data frame and whenever the sample rate,
-centre frequency, or VFO changes:
+`stream` is sent before the first data frame. It is resent immediately when
+the stream kind, sample rate, or VFO id changes. Live Doppler/AFC can move the
+centre frequency on every block, so messages where only frequency metadata
+(`center_freq_hz`, `nominal_freq_hz`, `doppler_hz`, `doppler_rate_hz_s`,
+`bandwidth_hz`) changes are rate-limited to at most one per second:
 
 ```json
 {
@@ -80,6 +90,10 @@ centre frequency, or VFO changes:
   "vfo_id": 0
 }
 ```
+
+Plugins must tolerate repeated `stream` messages. Treat them as metadata
+updates: do not reset decoder state unless `kind` or `sample_rate_hz` actually
+changed. Frequency and Doppler fields can move during a single transmission.
 
 The `doppler_hz` field is the correction currently applied to the VFO. The
 plugin receives a stream that is already corrected; it may implement residual
@@ -274,10 +288,16 @@ Midori can remain MIT/Apache-2.0. See `midori-plugin-ssdv/NOTICE.md`.
 
 The minimal Rust implementation uses `midori-plugin`:
 
-1. Read the `hello`/`configure`/`stream` messages from stdin.
+1. Send `hello` with `protocol: 2` on stdout, then read `configure` and
+   `stream` messages from stdin.
 2. Write `ready` after configuration.
 3. Process `audio`, `iq`, soft-bit, or byte frames declared by the manifest.
+   Frames carry an exact `u64` UTC timestamp or the "unknown" sentinel.
 4. Write JSON events with `kind = 1` frames.
+
+Treat `stream` messages as idempotent metadata updates: repeated messages and
+frequency-only changes must not reset the decoder. Only `kind` or
+`sample_rate_hz` changes require reinitialising decoder state.
 
 Any language can implement the same framing. Keep the data plane binary and
 the control plane JSON; do not send audio through JSON.
